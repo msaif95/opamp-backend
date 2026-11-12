@@ -16,14 +16,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/registry"
+	"github.com/msaif95/opamp-backend/internal/rollout"
 )
 
 // Server holds the API dependencies.
 type Server struct {
 	DB       *pgxpool.Pool
 	Registry *registry.Registry
+	Configs  *agentconfig.Service
+	Rollouts *rollout.Service
 	Agents   *auth.AgentAuthenticator
 	Sessions *auth.Sessions
 	Events   http.Handler
@@ -53,8 +57,34 @@ func (s *Server) Router() http.Handler {
 			r.Get("/auth/me", s.me)
 			r.Get("/summary", s.summary)
 			r.Get("/agents", s.listAgents)
+			r.Get("/agents/facets", s.agentFacets)
+			r.Get("/rollouts", s.listRollouts)
+			r.Post("/rollouts/preview", s.previewRollout)
+			r.Get("/rollouts/{id}", s.getRollout)
 			r.Get("/agents/{uid}", s.getAgent)
 			r.Method(http.MethodGet, "/events", s.Events)
+			r.Get("/configs", s.listConfigs)
+			r.Post("/configs/validate", s.validateConfig)
+			r.Get("/configs/{id}", s.getConfig)
+			r.Get("/configs/{id}/versions/{version}", s.getConfigVersion)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.Sessions.Require(auth.RoleOperator))
+			r.Post("/configs", s.createConfig)
+			r.Post("/configs/{id}/versions", s.addConfigVersion)
+			r.Delete("/configs/{id}", s.deleteConfig)
+			r.Put("/agents/{uid}/config", s.assignConfig)
+			r.Post("/rollouts", s.createRollout)
+			r.Post("/rollouts/{id}/pause", s.rolloutAction("pause", func(s *Server, r *http.Request, id uuid.UUID) error {
+				return s.Rollouts.Pause(r.Context(), id)
+			}))
+			r.Post("/rollouts/{id}/resume", s.rolloutAction("resume", func(s *Server, r *http.Request, id uuid.UUID) error {
+				return s.Rollouts.Resume(r.Context(), id)
+			}))
+			r.Post("/rollouts/{id}/abort", s.rolloutAction("abort", func(s *Server, r *http.Request, id uuid.UUID) error {
+				return s.Rollouts.Abort(r.Context(), id)
+			}))
 		})
 
 		r.Group(func(r chi.Router) {

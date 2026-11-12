@@ -1,6 +1,7 @@
 package connection_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/open-telemetry/opamp-go/client/types"
 	"github.com/open-telemetry/opamp-go/protobufs"
 
+	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/connection"
 	"github.com/msaif95/opamp-backend/internal/protocol"
@@ -36,13 +38,16 @@ type report struct {
 	attrs map[string]string
 }
 
+// fakeRegistry also acts as the config source: it serves a single version.
 type fakeRegistry struct {
 	mu           sync.Mutex
 	reports      []report
 	disconnected []uuid.UUID
+	state        registry.ConfigState
+	version      *agentconfig.Version
 }
 
-func (f *fakeRegistry) Report(_ context.Context, uid uuid.UUID, id registry.Identity, msg *protobufs.AgentToServer) error {
+func (f *fakeRegistry) Report(_ context.Context, uid uuid.UUID, id registry.Identity, msg *protobufs.AgentToServer) (registry.ConfigState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r := report{uid: uid, id: id}
@@ -50,7 +55,31 @@ func (f *fakeRegistry) Report(_ context.Context, uid uuid.UUID, id registry.Iden
 		r.attrs = registry.FlattenAttributes(d)
 	}
 	f.reports = append(f.reports, r)
-	return nil
+	f.state.Capabilities = msg.Capabilities
+	if s := msg.GetRemoteConfigStatus(); s != nil {
+		f.state.RemoteConfigHash = s.LastRemoteConfigHash
+	}
+	return f.state, nil
+}
+
+func (f *fakeRegistry) ConfigState(context.Context, uuid.UUID) (registry.ConfigState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state, nil
+}
+
+func (f *fakeRegistry) Version(context.Context, uuid.UUID) (*agentconfig.Version, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.version, nil
+}
+
+func (f *fakeRegistry) assign(body string, hash []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := uuid.New()
+	f.version = &agentconfig.Version{ID: id, Body: body, BodyHash: hash}
+	f.state.DesiredConfigVersionID = &id
 }
 
 func (f *fakeRegistry) Disconnected(_ context.Context, uid uuid.UUID) error {
@@ -77,7 +106,7 @@ func startManager(t *testing.T) (*connection.Manager, *fakeRegistry, string) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := &fakeRegistry{}
-	m := connection.NewManager(fakeAuth{}, protocol.NewHandler(reg, log), reg, log)
+	m := connection.NewManager(fakeAuth{}, protocol.NewHandler(reg, reg, log), reg, log)
 	if err := m.Start(addr, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +114,7 @@ func startManager(t *testing.T) (*connection.Manager, *fakeRegistry, string) {
 	return m, reg, "ws://" + addr + connection.OpAMPPath
 }
 
-func startAgent(t *testing.T, url, token string, uid uuid.UUID, cb types.Callbacks) client.OpAMPClient {
+func startAgent(t *testing.T, url, token string, uid uuid.UUID, cb types.Callbacks, extraCaps ...protobufs.AgentCapabilities) client.OpAMPClient {
 	t.Helper()
 	c := client.NewWebSocket(nil)
 	err := c.SetAgentDescription(&protobufs.AgentDescription{IdentifyingAttributes: []*protobufs.KeyValue{{
@@ -96,6 +125,9 @@ func startAgent(t *testing.T, url, token string, uid uuid.UUID, cb types.Callbac
 		t.Fatal(err)
 	}
 	caps := protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus
+	for _, c := range extraCaps {
+		caps |= c
+	}
 	if err := c.SetCapabilities(&caps); err != nil {
 		t.Fatal(err)
 	}
@@ -164,5 +196,79 @@ func TestUnauthenticatedAgentRejected(t *testing.T) {
 	}
 	if r, _ := reg.snapshot(); len(r) != 0 || m.ConnectionCount() != 0 {
 		t.Fatalf("unauthenticated agent reached the registry: %+v", r)
+	}
+}
+
+func TestRemoteConfigPushedAndNotReoffered(t *testing.T) {
+	m, reg, url := startManager(t)
+	uid := uuid.New()
+	hash := []byte("hash-v1")
+
+	received := make(chan *protobufs.AgentRemoteConfig, 8)
+	var c client.OpAMPClient
+	c = startAgent(t, url, "good", uid, types.Callbacks{
+		OnMessage: func(_ context.Context, msg *types.MessageData) {
+			if msg.RemoteConfig == nil {
+				return
+			}
+			received <- msg.RemoteConfig
+			_ = c.SetRemoteConfigStatus(&protobufs.RemoteConfigStatus{
+				LastRemoteConfigHash: msg.RemoteConfig.ConfigHash,
+				Status:               protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED,
+			})
+		},
+	}, protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig,
+		protobufs.AgentCapabilities_AgentCapabilities_ReportsRemoteConfig)
+	defer c.Stop(context.Background())
+	eventually(t, "agent report", func() bool { r, _ := reg.snapshot(); return len(r) > 0 })
+
+	// Nothing assigned yet: a push is a no-op.
+	m.Push(context.Background(), uid)
+
+	reg.assign("receivers: {}\n", hash)
+	m.Push(context.Background(), uid)
+	select {
+	case cfg := <-received:
+		if !bytes.Equal(cfg.ConfigHash, hash) || string(cfg.Config.ConfigMap[""].Body) != "receivers: {}\n" {
+			t.Fatalf("unexpected remote config: %+v", cfg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not receive pushed config")
+	}
+
+	// Once the agent acknowledges the hash, neither a push nor its own
+	// status report may trigger a re-offer.
+	eventually(t, "status ack", func() bool {
+		st, _ := reg.ConfigState(context.Background(), uid)
+		return bytes.Equal(st.RemoteConfigHash, hash)
+	})
+	m.Push(context.Background(), uid)
+	select {
+	case cfg := <-received:
+		t.Fatalf("config re-offered after ack: %+v", cfg)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestRemoteConfigNotOfferedWithoutCapability(t *testing.T) {
+	m, reg, url := startManager(t)
+	uid := uuid.New()
+	reg.assign("receivers: {}\n", []byte("hash-v1"))
+
+	received := make(chan struct{}, 1)
+	c := startAgent(t, url, "good", uid, types.Callbacks{
+		OnMessage: func(_ context.Context, msg *types.MessageData) {
+			if msg.RemoteConfig != nil {
+				received <- struct{}{}
+			}
+		},
+	})
+	defer c.Stop(context.Background())
+	eventually(t, "agent report", func() bool { r, _ := reg.snapshot(); return len(r) > 0 })
+	m.Push(context.Background(), uid)
+	select {
+	case <-received:
+		t.Fatal("config offered to an agent that does not accept remote config")
+	case <-time.After(300 * time.Millisecond):
 	}
 }

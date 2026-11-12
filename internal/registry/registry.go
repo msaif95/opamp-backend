@@ -383,6 +383,51 @@ FROM agents`).Scan(&s.Total, &s.Connected, &s.Healthy, &s.Unhealthy, &s.ConfigFa
 	return s, err
 }
 
+// maxFacetValues excludes high-cardinality attributes (host names, instance
+// IDs) that are useless for targeting groups of agents.
+const maxFacetValues = 50
+
+// Facet is one attribute key with the values agents report for it.
+type Facet struct {
+	Key    string       `json:"key"`
+	Values []FacetValue `json:"values"`
+}
+
+// FacetValue is one attribute value and the number of agents reporting it.
+type FacetValue struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+// Facets returns the low-cardinality attributes present in the fleet, for
+// building selectors (region, cloud, datacenter, env, team, ...).
+func (r *Registry) Facets(ctx context.Context) ([]Facet, error) {
+	rows, err := r.db.Query(ctx, `
+SELECT key, value, n FROM (
+    SELECT key, value, count(*) AS n, count(*) OVER (PARTITION BY key) AS distinct_values
+    FROM agents, jsonb_each_text(attributes) GROUP BY key, value) t
+WHERE distinct_values <= $1 ORDER BY key, n DESC, value`, maxFacetValues)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var facets []Facet
+	for rows.Next() {
+		var (
+			key string
+			v   FacetValue
+		)
+		if err := rows.Scan(&key, &v.Value, &v.Count); err != nil {
+			return nil, err
+		}
+		if n := len(facets); n == 0 || facets[n-1].Key != key {
+			facets = append(facets, Facet{Key: key})
+		}
+		facets[len(facets)-1].Values = append(facets[len(facets)-1].Values, v)
+	}
+	return facets, rows.Err()
+}
+
 func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	var (
 		a        Agent

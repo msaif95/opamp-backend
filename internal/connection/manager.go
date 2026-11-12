@@ -35,6 +35,8 @@ type Authenticator interface {
 // MessageHandler processes one OpAMP message.
 type MessageHandler interface {
 	Handle(ctx context.Context, id registry.Identity, msg *protobufs.AgentToServer, needFullState bool) (uuid.UUID, *protobufs.ServerToAgent)
+	// Offer returns an unsolicited message for the agent, or nil if there is nothing to send.
+	Offer(ctx context.Context, uid uuid.UUID) *protobufs.ServerToAgent
 }
 
 // Disconnector is notified when a persistent agent connection closes.
@@ -60,6 +62,7 @@ type Manager struct {
 
 	mu    sync.Mutex
 	conns map[types.Connection]*connState
+	byUID map[uuid.UUID]types.Connection
 }
 
 // NewManager creates a Manager.
@@ -68,6 +71,7 @@ func NewManager(auth Authenticator, handler MessageHandler, reg Disconnector, lo
 		auth: auth, handler: handler, reg: reg, log: log,
 		opamp: server.New(opampLogger{log}),
 		conns: make(map[types.Connection]*connState),
+		byUID: make(map[uuid.UUID]types.Connection),
 	}
 }
 
@@ -163,6 +167,7 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 				m.mu.Lock()
 				if st := m.conns[conn]; st != nil {
 					st.uid = uid
+					m.byUID[uid] = conn
 				}
 				m.mu.Unlock()
 			}
@@ -175,6 +180,10 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 			m.mu.Lock()
 			st := m.conns[conn]
 			delete(m.conns, conn)
+			// The agent may already have reconnected on a newer connection.
+			if st != nil && m.byUID[st.uid] == conn {
+				delete(m.byUID, st.uid)
+			}
 			m.mu.Unlock()
 			if st == nil || st.uid == uuid.Nil {
 				return
@@ -186,6 +195,25 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 			}
 		},
 	}}
+}
+
+// Push sends the agent its pending server-initiated message (currently its
+// desired remote config), if it is connected to this replica over WebSocket.
+func (m *Manager) Push(ctx context.Context, uid uuid.UUID) {
+	m.mu.Lock()
+	conn := m.byUID[uid]
+	m.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	msg := m.handler.Offer(ctx, uid)
+	if msg == nil {
+		return
+	}
+	if err := conn.Send(ctx, msg); err != nil {
+		// Not fatal: the config is offered again on the agent's next message.
+		m.log.WarnContext(ctx, "push to agent failed", "instance_uid", uid, "err", err)
+	}
 }
 
 // sequenceGap records the message's sequence number and reports whether the

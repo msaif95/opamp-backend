@@ -4,33 +4,45 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/open-telemetry/opamp-go/protobufs"
 
+	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/registry"
 )
 
 // ServerCapabilities advertised to every agent.
 const ServerCapabilities = uint64(protobufs.ServerCapabilities_ServerCapabilities_AcceptsStatus |
-	protobufs.ServerCapabilities_ServerCapabilities_AcceptsEffectiveConfig)
+	protobufs.ServerCapabilities_ServerCapabilities_AcceptsEffectiveConfig |
+	protobufs.ServerCapabilities_ServerCapabilities_OffersRemoteConfig)
 
-// Reporter is the slice of the registry the handler needs.
-type Reporter interface {
-	Report(ctx context.Context, uid uuid.UUID, id registry.Identity, msg *protobufs.AgentToServer) error
+const configContentType = "text/yaml"
+
+// Registry is the slice of the agent registry the handler needs.
+type Registry interface {
+	Report(ctx context.Context, uid uuid.UUID, id registry.Identity, msg *protobufs.AgentToServer) (registry.ConfigState, error)
+	ConfigState(ctx context.Context, uid uuid.UUID) (registry.ConfigState, error)
+}
+
+// ConfigSource resolves config versions.
+type ConfigSource interface {
+	Version(ctx context.Context, id uuid.UUID) (*agentconfig.Version, error)
 }
 
 // Handler processes OpAMP messages.
 type Handler struct {
-	reg Reporter
-	log *slog.Logger
+	reg     Registry
+	configs ConfigSource
+	log     *slog.Logger
 }
 
 // NewHandler creates a Handler.
-func NewHandler(reg Reporter, log *slog.Logger) *Handler {
-	return &Handler{reg: reg, log: log}
+func NewHandler(reg Registry, configs ConfigSource, log *slog.Logger) *Handler {
+	return &Handler{reg: reg, configs: configs, log: log}
 }
 
 // Handle processes one message. needFullState asks the agent to resend its
@@ -48,7 +60,8 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 		return uuid.Nil, resp
 	}
 
-	if err := h.reg.Report(ctx, uid, id, msg); err != nil {
+	state, err := h.reg.Report(ctx, uid, id, msg)
+	if err != nil {
 		h.log.ErrorContext(ctx, "agent report failed", "instance_uid", uid, "err", err)
 		resp.ErrorResponse = &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable,
@@ -57,8 +70,49 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 		return uid, resp
 	}
 
+	resp.RemoteConfig = h.pendingConfig(ctx, uid, state)
 	if needFullState {
 		resp.Flags = uint64(protobufs.ServerToAgentFlags_ServerToAgentFlags_ReportFullState)
 	}
 	return uid, resp
+}
+
+// Offer builds an unsolicited ServerToAgent carrying the agent's desired
+// config, or nil if the agent already has it (or has none assigned).
+func (h *Handler) Offer(ctx context.Context, uid uuid.UUID) *protobufs.ServerToAgent {
+	state, err := h.reg.ConfigState(ctx, uid)
+	if err != nil {
+		h.log.ErrorContext(ctx, "load agent config state", "instance_uid", uid, "err", err)
+		return nil
+	}
+	cfg := h.pendingConfig(ctx, uid, state)
+	if cfg == nil {
+		return nil
+	}
+	return &protobufs.ServerToAgent{InstanceUid: uid[:], Capabilities: ServerCapabilities, RemoteConfig: cfg}
+}
+
+// pendingConfig returns the desired config if the agent accepts remote
+// config and has not yet acknowledged this exact version. An agent that
+// reported the same hash as APPLYING or FAILED is not re-offered it: retry
+// policy belongs to the rollout engine, not the transport.
+func (h *Handler) pendingConfig(ctx context.Context, uid uuid.UUID, st registry.ConfigState) *protobufs.AgentRemoteConfig {
+	if st.DesiredConfigVersionID == nil ||
+		st.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig) == 0 {
+		return nil
+	}
+	v, err := h.configs.Version(ctx, *st.DesiredConfigVersionID)
+	if err != nil {
+		h.log.ErrorContext(ctx, "load desired config", "instance_uid", uid, "version_id", *st.DesiredConfigVersionID, "err", err)
+		return nil
+	}
+	if bytes.Equal(v.BodyHash, st.RemoteConfigHash) {
+		return nil
+	}
+	return &protobufs.AgentRemoteConfig{
+		ConfigHash: v.BodyHash,
+		Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
+			"": {Body: []byte(v.Body), ContentType: configContentType},
+		}},
+	}
 }

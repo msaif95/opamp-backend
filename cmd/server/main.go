@@ -13,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/config"
@@ -22,6 +24,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/events"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
+	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/store"
 )
 
@@ -64,7 +67,8 @@ func run() error {
 
 	reg := registry.New(db, rdb, cfg.ReplicaID, cfg.AgentOfflineAfter)
 	agentAuth := auth.NewAgentAuthenticator(db)
-	conns := connection.NewManager(agentAuth, protocol.NewHandler(reg, log), reg, log)
+	configs := agentconfig.NewService(db)
+	conns := connection.NewManager(agentAuth, protocol.NewHandler(reg, configs, log), reg, log)
 
 	var tlsCfg *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -78,6 +82,15 @@ func run() error {
 		return err
 	}
 	log.Info("opamp listener started", "addr", cfg.OpAMPListenAddr, "tls", tlsCfg != nil, "mtls", cfg.MTLSEnabled())
+
+	go reg.SubscribePush(ctx, func(uid uuid.UUID) {
+		pushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		conns.Push(pushCtx, uid)
+	})
+
+	rollouts := rollout.NewService(db, reg, log)
+	go rollouts.Run(ctx)
 
 	hub := events.NewHub(log)
 	go hub.Run(ctx, rdb, registry.EventsChannel)
@@ -102,7 +115,7 @@ func run() error {
 	apiSrv := &http.Server{
 		Addr: cfg.APIListenAddr,
 		Handler: (&api.Server{
-			DB: db, Registry: reg, Agents: agentAuth, Events: hub, Log: log,
+			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth, Events: hub, Log: log,
 			Sessions: auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword),
 			Ready: func(ctx context.Context) error {
 				return errors.Join(db.Ping(ctx), rdb.Ping(ctx).Err())

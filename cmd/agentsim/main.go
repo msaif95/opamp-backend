@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +42,7 @@ func main() {
 	n := flag.Int("n", 1, "number of simulated agents")
 	heartbeat := flag.Duration("heartbeat", 30*time.Second, "heartbeat interval")
 	unhealthyPct := flag.Int("unhealthy-pct", 0, "percentage of agents reporting unhealthy")
+	applyFailPct := flag.Int("apply-fail-pct", 0, "percentage of agents that fail to apply remote config")
 	caFile := flag.String("ca", "", "CA bundle to verify the server (wss only)")
 	certFile := flag.String("cert", "", "client certificate for mTLS")
 	keyFile := flag.String("key", "", "client key for mTLS")
@@ -70,6 +72,12 @@ func main() {
 
 	regions := []string{"us-east-1", "us-west-2", "eu-west-1", "ap-south-1"}
 	envs := []string{"prod", "staging", "dev"}
+	teams := []string{"sre", "platform", "payments", "search", "data"}
+	// region -> cloud provider and datacenters
+	clouds := map[string]string{"us-east-1": "aws", "us-west-2": "aws", "eu-west-1": "azure", "ap-south-1": "gcp"}
+	dcs := map[string][]string{
+		"us-east-1": {"iad1", "iad2"}, "us-west-2": {"pdx1"}, "eu-west-1": {"dub1", "dub2"}, "ap-south-1": {"bom1"},
+	}
 
 	clients := make([]client.OpAMPClient, 0, *n)
 	for i := range *n {
@@ -78,6 +86,7 @@ func main() {
 			log.Fatal(err)
 		}
 		c := client.NewWebSocket(nil)
+		region := regions[i%len(regions)]
 		must(c.SetAgentDescription(&protobufs.AgentDescription{
 			IdentifyingAttributes: []*protobufs.KeyValue{
 				kv("service.name", "otelcol-sim"),
@@ -87,12 +96,17 @@ func main() {
 			NonIdentifyingAttributes: []*protobufs.KeyValue{
 				kv("host.name", fmt.Sprintf("sim-host-%05d", i)),
 				kv("os.type", "linux"),
-				kv("region", regions[i%len(regions)]),
+				kv("region", region),
+				kv("cloud.provider", clouds[region]),
+				kv("dc", dcs[region][i%len(dcs[region])]),
 				kv("env", envs[i%len(envs)]),
+				kv("team", teams[i%len(teams)]),
 			},
 		}))
 		caps := protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus |
 			protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig |
+			protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig |
+			protobufs.AgentCapabilities_AgentCapabilities_ReportsRemoteConfig |
 			protobufs.AgentCapabilities_AgentCapabilities_ReportsHealth |
 			protobufs.AgentCapabilities_AgentCapabilities_ReportsHeartbeat
 		must(c.SetCapabilities(&caps))
@@ -103,6 +117,12 @@ func main() {
 		}
 		must(c.SetHealth(health))
 
+		var (
+			mu        sync.Mutex
+			effective = []byte(effectiveConfig)
+		)
+		failsApply := rand.IntN(100) < *applyFailPct
+
 		must(c.Start(context.Background(), types.StartSettings{
 			OpAMPServerURL:    *url,
 			Header:            header,
@@ -112,11 +132,40 @@ func main() {
 			Callbacks: types.Callbacks{
 				OnConnectFailed: func(_ context.Context, err error) { log.Printf("agent %s connect failed: %v", uid, err) },
 				GetEffectiveConfig: func(context.Context) (*protobufs.EffectiveConfig, error) {
+					mu.Lock()
+					defer mu.Unlock()
 					return &protobufs.EffectiveConfig{ConfigMap: &protobufs.AgentConfigMap{
 						ConfigMap: map[string]*protobufs.AgentConfigObject{
-							"": {Body: []byte(effectiveConfig), ContentType: "text/yaml"},
+							"": {Body: effective, ContentType: "text/yaml"},
 						},
 					}}, nil
+				},
+				// Mimics the Supervisor: report APPLYING, "restart" the
+				// collector, then report APPLIED with the new effective
+				// config, or FAILED and keep the old one.
+				OnMessage: func(_ context.Context, msg *types.MessageData) {
+					rc := msg.RemoteConfig
+					if rc == nil {
+						return
+					}
+					status := func(s protobufs.RemoteConfigStatuses, errMsg string) {
+						_ = c.SetRemoteConfigStatus(&protobufs.RemoteConfigStatus{
+							LastRemoteConfigHash: rc.ConfigHash, Status: s, ErrorMessage: errMsg})
+					}
+					status(protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLYING, "")
+					go func() {
+						time.Sleep(time.Duration(500+rand.IntN(1500)) * time.Millisecond)
+						if failsApply {
+							status(protobufs.RemoteConfigStatuses_RemoteConfigStatuses_FAILED,
+								"collector failed to start with new config: simulated failure")
+							return
+						}
+						mu.Lock()
+						effective = rc.Config.ConfigMap[""].Body
+						mu.Unlock()
+						status(protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED, "")
+						_ = c.UpdateEffectiveConfig(context.Background())
+					}()
 				},
 			},
 		}))
