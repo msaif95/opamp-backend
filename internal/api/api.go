@@ -1,0 +1,251 @@
+// Package api serves the REST API consumed by opamp-ui.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/registry"
+)
+
+// Server holds the API dependencies.
+type Server struct {
+	DB       *pgxpool.Pool
+	Registry *registry.Registry
+	Agents   *auth.AgentAuthenticator
+	Sessions *auth.Sessions
+	Events   http.Handler
+	Log      *slog.Logger
+	// Ready reports whether backing stores are reachable.
+	Ready func(ctx context.Context) error
+}
+
+// Router builds the HTTP handler.
+func (s *Server) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.Ready(r.Context()); err != nil {
+			s.Log.Warn("not ready", "err", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Post("/auth/login", s.login)
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.Sessions.Require(auth.RoleViewer))
+			r.Get("/auth/me", s.me)
+			r.Get("/summary", s.summary)
+			r.Get("/agents", s.listAgents)
+			r.Get("/agents/{uid}", s.getAgent)
+			r.Method(http.MethodGet, "/events", s.Events)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.Sessions.Require(auth.RoleAdmin))
+			r.Get("/credentials/api-keys", s.listAPIKeys)
+			r.Post("/credentials/api-keys", s.issueAPIKey)
+			r.Delete("/credentials/{id}", s.revokeCredential)
+		})
+	})
+	return r
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	token, user, err := s.Sessions.LocalLogin(req.Username, req.Password)
+	if err != nil {
+		s.audit(r.Context(), req.Username, "local", "auth.login_failed", "user", req.Username, nil)
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	s.audit(r.Context(), user.Subject, user.Provider, "auth.login", "user", user.Subject, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": user})
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	u, _ := auth.UserFrom(r.Context())
+	writeJSON(w, http.StatusOK, u)
+}
+
+func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
+	sum, err := s.Registry.Summarize(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
+}
+
+// listAgents supports ?limit=&offset=&connected=true|false and attribute
+// filters as repeated ?attr=key=value.
+func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := registry.ListFilter{Attributes: map[string]string{}}
+	f.Limit, _ = strconv.Atoi(q.Get("limit"))
+	f.Offset, _ = strconv.Atoi(q.Get("offset"))
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	if v := q.Get("connected"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "connected must be true or false")
+			return
+		}
+		f.Connected = &b
+	}
+	for _, kv := range q["attr"] {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			writeError(w, http.StatusBadRequest, "attr must be key=value")
+			return
+		}
+		f.Attributes[k] = v
+	}
+
+	agents, total, err := s.Registry.List(r.Context(), f)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if agents == nil {
+		agents = []registry.Agent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": agents, "total": total})
+}
+
+func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
+	uid, err := uuid.Parse(chi.URLParam(r, "uid"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid instance uid")
+		return
+	}
+	a, err := s.Registry.Get(r.Context(), uid)
+	if errors.Is(err, registry.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.Agents.ListAPIKeys(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if keys == nil {
+		keys = []auth.APIKey{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
+}
+
+func (s *Server) issueAPIKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name      string     `json:"name"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "expires_at must be in the future")
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	key, err := s.Agents.IssueAPIKey(r.Context(), req.Name, u.Subject, req.ExpiresAt)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "credential.issue", "credential", key.ID.String(),
+		map[string]any{"kind": "api_key", "name": key.Name})
+	writeJSON(w, http.StatusCreated, key)
+}
+
+func (s *Server) revokeCredential(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid credential id")
+		return
+	}
+	changed, err := s.Agents.Revoke(r.Context(), id)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if !changed {
+		writeError(w, http.StatusNotFound, "credential not found or already revoked")
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "credential.revoke", "credential", id.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) audit(ctx context.Context, actor, actorAuth, action, targetType, targetID string, details map[string]any) {
+	if details == nil {
+		details = map[string]any{}
+	}
+	b, _ := json.Marshal(details)
+	_, err := s.DB.Exec(ctx, `
+INSERT INTO audit_events (actor, actor_auth, action, target_type, target_id, details)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb)`, actor, actorAuth, action, targetType, targetID, b)
+	if err != nil {
+		s.Log.ErrorContext(ctx, "audit write failed", "action", action, "err", err)
+	}
+}
+
+func (s *Server) internal(w http.ResponseWriter, r *http.Request, err error) {
+	s.Log.ErrorContext(r.Context(), "request failed", "path", r.URL.Path, "err", err)
+	writeError(w, http.StatusInternalServerError, "internal error")
+}
+
+func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}

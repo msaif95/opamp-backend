@@ -1,0 +1,214 @@
+// Package connection hosts the OpAMP listener: it authenticates incoming
+// agent connections, tracks live connections on this replica and hands
+// messages to the protocol handler.
+package connection
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/open-telemetry/opamp-go/protobufs"
+	"github.com/open-telemetry/opamp-go/server"
+	"github.com/open-telemetry/opamp-go/server/types"
+
+	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/registry"
+)
+
+// OpAMPPath is the HTTP path agents connect to.
+const OpAMPPath = "/v1/opamp"
+
+// Authenticator resolves the identity of an incoming agent connection.
+type Authenticator interface {
+	Authenticate(ctx context.Context, r *http.Request) (registry.Identity, error)
+}
+
+// MessageHandler processes one OpAMP message.
+type MessageHandler interface {
+	Handle(ctx context.Context, id registry.Identity, msg *protobufs.AgentToServer, needFullState bool) (uuid.UUID, *protobufs.ServerToAgent)
+}
+
+// Disconnector is notified when a persistent agent connection closes.
+type Disconnector interface {
+	Disconnected(ctx context.Context, uid uuid.UUID) error
+}
+
+type connState struct {
+	uid     uuid.UUID
+	lastSeq uint64
+	seen    bool
+}
+
+// Manager owns the OpAMP server and the set of live connections on this replica.
+type Manager struct {
+	auth    Authenticator
+	handler MessageHandler
+	reg     Disconnector
+	log     *slog.Logger
+
+	opamp   server.OpAMPServer
+	httpSrv *http.Server
+
+	mu    sync.Mutex
+	conns map[types.Connection]*connState
+}
+
+// NewManager creates a Manager.
+func NewManager(auth Authenticator, handler MessageHandler, reg Disconnector, log *slog.Logger) *Manager {
+	return &Manager{
+		auth: auth, handler: handler, reg: reg, log: log,
+		opamp: server.New(opampLogger{log}),
+		conns: make(map[types.Connection]*connState),
+	}
+}
+
+// Start begins serving OpAMP on addr. tlsCfg may be nil for plaintext (dev only).
+func (m *Manager) Start(addr string, tlsCfg *tls.Config) error {
+	handler, connContext, err := m.opamp.Attach(server.Settings{
+		Callbacks:         types.Callbacks{OnConnecting: m.onConnecting},
+		EnableCompression: true,
+	})
+	if err != nil {
+		return fmt.Errorf("attach opamp server: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(OpAMPPath, handler)
+	m.httpSrv = &http.Server{
+		Handler:           mux,
+		ConnContext:       connContext,
+		TLSConfig:         tlsCfg,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	go func() {
+		var err error
+		if tlsCfg != nil {
+			err = m.httpSrv.ServeTLS(ln, "", "")
+		} else {
+			err = m.httpSrv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			m.log.Error("opamp listener stopped", "err", err)
+		}
+	}()
+	return nil
+}
+
+// Stop closes the listener and all agent connections.
+func (m *Manager) Stop(ctx context.Context) error {
+	m.mu.Lock()
+	conns := make([]types.Connection, 0, len(m.conns))
+	for c := range m.conns {
+		conns = append(conns, c)
+	}
+	m.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Disconnect()
+	}
+	if m.httpSrv == nil {
+		return nil
+	}
+	return m.httpSrv.Shutdown(ctx)
+}
+
+// ConnectionCount returns the number of live WebSocket connections on this replica.
+func (m *Manager) ConnectionCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.conns)
+}
+
+func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
+	id, err := m.auth.Authenticate(r.Context(), r)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, auth.ErrUnauthenticated) {
+			status = http.StatusUnauthorized
+		} else {
+			m.log.Error("agent authentication error", "remote", r.RemoteAddr, "err", err)
+		}
+		return types.ConnectionResponse{Accept: false, HTTPStatusCode: status}
+	}
+
+	// Plain HTTP polling "closes" after every message, so only WebSocket
+	// connections are tracked and trigger a disconnect on close. Polling
+	// agents are aged out by the registry's offline sweep.
+	persistent := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+
+	return types.ConnectionResponse{Accept: true, ConnectionCallbacks: types.ConnectionCallbacks{
+		OnConnected: func(_ context.Context, conn types.Connection) {
+			if persistent {
+				m.mu.Lock()
+				m.conns[conn] = &connState{}
+				m.mu.Unlock()
+			}
+		},
+		OnMessage: func(ctx context.Context, conn types.Connection, msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			needFull := persistent && m.sequenceGap(conn, msg)
+			uid, resp := m.handler.Handle(ctx, id, msg, needFull)
+			if persistent && uid != uuid.Nil {
+				m.mu.Lock()
+				if st := m.conns[conn]; st != nil {
+					st.uid = uid
+				}
+				m.mu.Unlock()
+			}
+			return resp
+		},
+		OnConnectionClose: func(conn types.Connection) {
+			if !persistent {
+				return
+			}
+			m.mu.Lock()
+			st := m.conns[conn]
+			delete(m.conns, conn)
+			m.mu.Unlock()
+			if st == nil || st.uid == uuid.Nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.reg.Disconnected(ctx, st.uid); err != nil {
+				m.log.Error("mark agent disconnected", "instance_uid", st.uid, "err", err)
+			}
+		},
+	}}
+}
+
+// sequenceGap records the message's sequence number and reports whether the
+// server may have missed state: a gap in sequence numbers, or a first
+// message on the connection that carries no agent description.
+func (m *Manager) sequenceGap(conn types.Connection, msg *protobufs.AgentToServer) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.conns[conn]
+	if st == nil {
+		return false
+	}
+	gap := msg.AgentDescription == nil && (!st.seen || msg.SequenceNum != st.lastSeq+1)
+	st.seen, st.lastSeq = true, msg.SequenceNum
+	return gap
+}
+
+type opampLogger struct{ log *slog.Logger }
+
+func (l opampLogger) Debugf(ctx context.Context, format string, v ...any) {
+	l.log.DebugContext(ctx, fmt.Sprintf(format, v...))
+}
+
+func (l opampLogger) Errorf(ctx context.Context, format string, v ...any) {
+	l.log.ErrorContext(ctx, fmt.Sprintf(format, v...))
+}
