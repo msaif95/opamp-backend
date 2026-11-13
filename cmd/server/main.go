@@ -27,6 +27,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/connection"
 	"github.com/msaif95/opamp-backend/internal/events"
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
+	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/retention"
@@ -293,7 +294,7 @@ func run() error {
 	apiSrv := &http.Server{
 		Addr: cfg.APIListenAddr,
 		Handler: otelhttp.NewHandler((&api.Server{
-			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth,
+			DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
 			Alerts: alertStore, Settings: switches,

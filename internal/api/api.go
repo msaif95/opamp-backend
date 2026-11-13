@@ -21,6 +21,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/settings"
@@ -32,6 +33,7 @@ type Server struct {
 	DB       *pgxpool.Pool
 	Registry *registry.Registry
 	Configs  *agentconfig.Service
+	Library  *pipeline.Library
 	Rollouts *rollout.Service
 	Agents   *auth.AgentAuthenticator
 	Sessions *auth.Sessions
@@ -99,6 +101,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/configs/validate", s.validateConfig)
 			r.Get("/configs/builder/catalog", s.builderCatalog)
 			r.Post("/configs/builder/render", s.builderRender)
+			r.Get("/configs/builder/library", s.listLibrary)
 			r.Get("/configs/{id}", s.getConfig)
 			r.Get("/configs/{id}/versions/{version}", s.getConfigVersion)
 		})
@@ -106,6 +109,9 @@ func (s *Server) Router() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleOperator))
 			r.Post("/configs", s.createConfig)
+			r.Post("/configs/builder/library", s.saveLibraryItem)
+			r.Put("/configs/builder/library/{id}", s.saveLibraryItem)
+			r.Delete("/configs/builder/library/{id}", s.deleteLibraryItem)
 			r.Post("/configs/{id}/versions", s.addConfigVersion)
 			r.Delete("/configs/{id}", s.deleteConfig)
 			r.Put("/agents/{uid}/config", s.assignConfig)

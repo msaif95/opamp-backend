@@ -94,3 +94,7 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `/configs/{id}/versions` accept `builder` instead of `body`. When adding a catalog type, render it and run
   `otelcol-contrib validate --config` on the result; all 15 current types passed that against contrib 0.164.0.
 - The second migration is `000002_runtime_additions` (settings, group config, builder spec).
+- Builder library (`internal/pipeline/library.go`, table `library_components`): saved sources/processors/destinations.
+  A spec component may carry `library: <id>`; `Library.Resolve` substitutes the item's current settings at render and
+  save time, and the stored spec keeps only the reference. Saved config versions are never rewritten when an item
+  changes: a config picks the change up the next time it is saved.

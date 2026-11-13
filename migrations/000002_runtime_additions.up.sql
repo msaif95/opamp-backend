@@ -16,3 +16,15 @@ ALTER TABLE agent_groups
 -- The pipeline as built in the console's config builder, when the version
 -- was made there; NULL for versions written as YAML.
 ALTER TABLE config_versions ADD COLUMN builder_spec JSONB;
+
+-- Sources, processors and destinations saved for reuse across configs in the builder.
+CREATE TABLE library_components (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    params     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (kind, name)
+);

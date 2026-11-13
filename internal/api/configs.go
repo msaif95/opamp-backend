@@ -80,7 +80,7 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	spec, ok := s.renderBuilder(w, req.Builder, &req.Body)
+	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
 	if !ok {
 		return
 	}
@@ -113,7 +113,7 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	spec, ok := s.renderBuilder(w, req.Builder, &req.Body)
+	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
 	if !ok {
 		return
 	}
@@ -219,18 +219,35 @@ func (s *Server) builderRender(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &spec) {
 		return
 	}
-	body, issues := pipeline.Render(spec)
+	resolved, issues, err := s.Library.Resolve(r.Context(), spec)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	body := ""
+	if !agentconfig.HasErrors(issues) {
+		body, issues = pipeline.Render(resolved)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"body": body, "issues": nonNil(issues)})
 }
 
 // renderBuilder replaces *body with the YAML rendered from a builder
 // pipeline, if one was sent, and returns the pipeline to store alongside
 // it. It reports false after writing an error response.
-func (s *Server) renderBuilder(w http.ResponseWriter, spec *pipeline.Spec, body *string) (json.RawMessage, bool) {
+func (s *Server) renderBuilder(w http.ResponseWriter, r *http.Request, spec *pipeline.Spec, body *string) (json.RawMessage, bool) {
 	if spec == nil {
 		return nil, true
 	}
-	rendered, issues := pipeline.Render(*spec)
+	// The stored spec keeps its library references; only the rendering uses the items' current settings.
+	resolved, issues, err := s.Library.Resolve(r.Context(), *spec)
+	if err != nil {
+		s.internal(w, r, err)
+		return nil, false
+	}
+	rendered := ""
+	if !agentconfig.HasErrors(issues) {
+		rendered, issues = pipeline.Render(resolved)
+	}
 	if agentconfig.HasErrors(issues) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "the pipeline is not complete", "issues": issues})
 		return nil, false
@@ -242,4 +259,72 @@ func (s *Server) renderBuilder(w http.ResponseWriter, spec *pipeline.Spec, body 
 		return nil, false
 	}
 	return raw, true
+}
+
+func (s *Server) listLibrary(w http.ResponseWriter, r *http.Request) {
+	items, err := s.Library.List(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": nonNil(items)})
+}
+
+// saveLibraryItem creates a library item, or with an ID in the path updates its name and settings.
+func (s *Server) saveLibraryItem(w http.ResponseWriter, r *http.Request) {
+	var id *uuid.UUID
+	if chi.URLParam(r, "id") != "" {
+		parsed, ok := pathUUID(w, r, "id")
+		if !ok {
+			return
+		}
+		id = &parsed
+	}
+	var req struct {
+		Kind   string         `json:"kind"`
+		Name   string         `json:"name"`
+		Type   string         `json:"type"`
+		Params map[string]any `json:"params"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	item, issues, err := s.Library.Save(r.Context(), id, req.Kind, req.Name, req.Type, req.Params, u.Subject)
+	switch {
+	case errors.Is(err, pipeline.ErrLibraryNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	case errors.Is(err, pipeline.ErrLibraryNameTaken):
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	case err != nil:
+		s.internal(w, r, err)
+		return
+	case len(issues) > 0:
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "the settings are not complete", "issues": issues})
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "library.save", "library_item", item.ID.String(),
+		map[string]any{"kind": item.Kind, "name": item.Name, "type": item.Type})
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) deleteLibraryItem(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	err := s.Library.Delete(r.Context(), id)
+	if errors.Is(err, pipeline.ErrLibraryNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "library.delete", "library_item", id.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
 }

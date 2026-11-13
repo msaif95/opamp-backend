@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
 	"go.yaml.in/yaml/v3"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
@@ -15,6 +16,9 @@ import (
 type Component struct {
 	Type   string         `json:"type"`
 	Params map[string]any `json:"params"`
+	// Library, if set, is the ID of a saved library item whose type and
+	// settings replace Type and Params (see Library.Resolve).
+	Library *uuid.UUID `json:"library,omitempty"`
 }
 
 // Spec is a pipeline as built in the console. Processors run in the order given.
