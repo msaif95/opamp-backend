@@ -31,7 +31,11 @@ const (
 	IntakePath = "/v1/metrics"
 	keyPrefix  = "opamp:throughput:"
 	sampleTTL  = 5 * time.Minute
-	maxBody    = 4 << 20
+	// History: collectors report about once a minute, so this is roughly three hours.
+	historyPrefix = "opamp:history:"
+	historyPoints = 180
+	historyTTL    = 4 * time.Hour
+	maxBody       = 4 << 20
 )
 
 // counters maps the collector's internal metric names (without the
@@ -49,6 +53,25 @@ var counters = map[string][2]string{
 	"exporter_send_failed_log_records":   {"failed", "logs"},
 	"exporter_send_failed_metric_points": {"failed", "metrics"},
 	"exporter_send_failed_spans":         {"failed", "traces"},
+}
+
+// processMetrics maps the collector's own process metrics to the names used here.
+var processMetrics = map[string]string{
+	"process_cpu_seconds":        "cpu", // cumulative CPU seconds; its rate is cores in use
+	"process_memory_rss":         "rss",
+	"process_runtime_heap_alloc": "heap",
+}
+
+// Point is one history sample for charts. CPU and memory are nil when the
+// collector did not report them.
+type Point struct {
+	At       time.Time `json:"at"`
+	CPUPct   *float64  `json:"cpu_pct"`
+	RSS      *float64  `json:"rss_bytes"`
+	Heap     *float64  `json:"heap_bytes"`
+	Received float64   `json:"received"`
+	Sent     float64   `json:"sent"`
+	Failed   float64   `json:"failed"`
 }
 
 // Sample is an agent's latest throughput. Rates are records per second,
@@ -147,9 +170,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	totals, delta := extract(&req)
+	totals, gauges, delta := extract(&req)
 	if len(totals) > 0 {
-		if err := s.record(r.Context(), uid, time.Now().UTC(), totals, delta); err != nil {
+		if err := s.record(r.Context(), uid, time.Now().UTC(), totals, gauges, delta); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -161,12 +184,24 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // extract sums the pipeline counters in a request by direction and signal.
 // delta reports whether the collector sent per-interval values rather than
 // running totals.
-func extract(req *collectormetrics.ExportMetricsServiceRequest) (totals map[string]map[string]float64, delta bool) {
-	totals = map[string]map[string]float64{}
+func extract(req *collectormetrics.ExportMetricsServiceRequest) (totals map[string]map[string]float64, gauges map[string]float64, delta bool) {
+	totals, gauges = map[string]map[string]float64{}, map[string]float64{}
 	for _, rm := range req.ResourceMetrics {
 		for _, sm := range rm.ScopeMetrics {
 			for _, m := range sm.Metrics {
 				name := strings.TrimSuffix(strings.TrimPrefix(m.Name, "otelcol_"), "_total")
+				if p, ok := processMetrics[strings.TrimSuffix(name, "_bytes")]; ok {
+					var v float64
+					for _, dp := range append(m.GetGauge().GetDataPoints(), m.GetSum().GetDataPoints()...) {
+						v += dp.GetAsDouble() + float64(dp.GetAsInt())
+					}
+					if p == "cpu" {
+						totals["process"] = map[string]float64{"cpu": v}
+					} else {
+						gauges[p] = v
+					}
+					continue
+				}
 				c, ok := counters[name]
 				sum := m.GetSum()
 				if !ok || sum == nil {
@@ -182,11 +217,11 @@ func extract(req *collectormetrics.ExportMetricsServiceRequest) (totals map[stri
 			}
 		}
 	}
-	return totals, delta
+	return totals, gauges, delta
 }
 
 // record stores the sample and derives rates from the previous one.
-func (s *Service) record(ctx context.Context, uid uuid.UUID, now time.Time, totals map[string]map[string]float64, delta bool) error {
+func (s *Service) record(ctx context.Context, uid uuid.UUID, now time.Time, totals map[string]map[string]float64, gauges map[string]float64, delta bool) error {
 	var prev stored
 	if raw, err := s.rdb.Get(ctx, keyPrefix+uid.String()).Bytes(); err == nil {
 		_ = json.Unmarshal(raw, &prev)
@@ -195,7 +230,50 @@ func (s *Service) record(ctx context.Context, uid uuid.UUID, now time.Time, tota
 	}
 	cur := stored{At: now, Totals: totals, Rates: rates(prev, now, totals, delta)}
 	raw, _ := json.Marshal(cur)
-	return s.rdb.Set(ctx, keyPrefix+uid.String(), raw, sampleTTL).Err()
+	point, _ := json.Marshal(point(now, cur.Rates, gauges))
+	pipe := s.rdb.TxPipeline()
+	pipe.Set(ctx, keyPrefix+uid.String(), raw, sampleTTL)
+	pipe.LPush(ctx, historyPrefix+uid.String(), point)
+	pipe.LTrim(ctx, historyPrefix+uid.String(), 0, historyPoints-1)
+	pipe.Expire(ctx, historyPrefix+uid.String(), historyTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func point(now time.Time, rates map[string]map[string]float64, gauges map[string]float64) Point {
+	p := Point{At: now}
+	if cores, ok := rates["process"]["cpu"]; ok {
+		pct := cores * 100
+		p.CPUPct = &pct
+	}
+	if v, ok := gauges["rss"]; ok {
+		p.RSS = &v
+	}
+	if v, ok := gauges["heap"]; ok {
+		p.Heap = &v
+	}
+	for dir, dst := range map[string]*float64{"received": &p.Received, "sent": &p.Sent, "failed": &p.Failed} {
+		for _, v := range rates[dir] {
+			*dst += v
+		}
+	}
+	return p
+}
+
+// History returns the agent's recent samples, oldest first.
+func (s *Service) History(ctx context.Context, uid uuid.UUID) ([]Point, error) {
+	raw, err := s.rdb.LRange(ctx, historyPrefix+uid.String(), 0, historyPoints-1).Result()
+	if err != nil {
+		return nil, err
+	}
+	points := make([]Point, 0, len(raw))
+	for i := len(raw) - 1; i >= 0; i-- {
+		var p Point
+		if json.Unmarshal([]byte(raw[i]), &p) == nil {
+			points = append(points, p)
+		}
+	}
+	return points, nil
 }
 
 func rates(prev stored, now time.Time, totals map[string]map[string]float64, delta bool) map[string]map[string]float64 {

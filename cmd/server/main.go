@@ -303,8 +303,8 @@ func run() error {
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
 			Alerts: alertStore, Settings: switches,
-			Throughput: tput.Latest,
-			Install:    api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
+			Throughput: tput.Latest, History: tput.History,
+			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
 			Status: api.SystemStatus{
 				SSOIssuer: cfg.OktaIssuer, Version: version, DevMode: cfg.DevMode,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,

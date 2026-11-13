@@ -103,3 +103,6 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   HMAC token per agent. The intake keeps only the latest sample per agent in Redis (5 min TTL) and derives rates
   from the collector's `otelcol_receiver_*` / `otelcol_exporter_*` counters. Shown on agent detail as `throughput`.
   Verified with opampsupervisor + otelcol-contrib 0.164.0; the collector reports about once a minute.
+- Collector charts: the same intake also reads `otelcol_process_cpu_seconds`, `process_memory_rss` and
+  `process_runtime_heap_alloc_bytes`, and keeps up to 180 points per agent in a Redis list (`opamp:history:<uid>`,
+  about 3 hours). `GET /api/v1/agents/{uid}/metrics` serves them; the UI charts them with recharts.

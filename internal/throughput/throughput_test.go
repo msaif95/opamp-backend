@@ -23,11 +23,21 @@ func TestExtractAndRates(t *testing.T) {
 		sum("otelcol_receiver_accepted_log_records", cum, 600, 400), // two receivers
 		sum("otelcol_exporter_sent_log_records_total", cum, 700),
 		sum("otelcol_exporter_send_failed_spans", cum, 5),
-		sum("otelcol_process_uptime", cum, 99), // not a pipeline counter
+		sum("otelcol_process_uptime", cum, 99), // not used
+		sum("otelcol_process_cpu_seconds_total", cum, 30),
+		{Name: "otelcol_process_memory_rss_bytes", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{
+			{Value: &metricspb.NumberDataPoint_AsInt{AsInt: 200 << 20}}}}}},
 	}}}}}}
-	totals, delta := extract(req)
-	if delta || totals["received"]["logs"] != 1000 || totals["sent"]["logs"] != 700 || totals["failed"]["traces"] != 5 || len(totals) != 3 {
-		t.Fatalf("totals = %v, delta %v", totals, delta)
+	totals, gauges, delta := extract(req)
+	if delta || totals["received"]["logs"] != 1000 || totals["sent"]["logs"] != 700 || totals["failed"]["traces"] != 5 ||
+		totals["process"]["cpu"] != 30 || gauges["rss"] != 200<<20 || len(totals) != 4 {
+		t.Fatalf("totals = %v, gauges = %v, delta %v", totals, gauges, delta)
+	}
+	// 3 CPU-seconds over 10 s is 30% of one core.
+	cpuPrev := stored{At: time.Now(), Totals: map[string]map[string]float64{"process": {"cpu": 27}, "received": {"logs": 900}}}
+	pt := point(cpuPrev.At.Add(10*time.Second), rates(cpuPrev, cpuPrev.At.Add(10*time.Second), totals, false), gauges)
+	if pt.CPUPct == nil || *pt.CPUPct < 29.9 || *pt.CPUPct > 30.1 || pt.RSS == nil || *pt.RSS != 200<<20 || pt.Heap != nil || pt.Received != 10 {
+		t.Fatalf("point = %+v", pt)
 	}
 
 	t0 := time.Now()

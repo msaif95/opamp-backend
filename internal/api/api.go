@@ -48,8 +48,10 @@ type Server struct {
 	Install InstallConfig
 	// Throughput returns an agent's latest pipeline rates, or nil.
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
-	Settings   *settings.Store
-	Alerts     *alert.Store
+	// History returns an agent's recent CPU, memory and throughput samples.
+	History  func(ctx context.Context, uid uuid.UUID) ([]throughput.Point, error)
+	Settings *settings.Store
+	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
 	// TrustProxyHeaders makes the client address come from X-Forwarded-For.
@@ -99,6 +101,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/rollouts/preview", s.previewRollout)
 			r.Get("/rollouts/{id}", s.getRollout)
 			r.Get("/agents/{uid}", s.getAgent)
+			r.Get("/agents/{uid}/metrics", s.agentMetrics)
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
@@ -311,6 +314,20 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 		*registry.Agent
 		Throughput *throughput.Sample `json:"throughput"`
 	}{a, sample})
+}
+
+// agentMetrics returns the agent's recent CPU, memory and throughput samples for charts.
+func (s *Server) agentMetrics(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	points, err := s.History(r.Context(), uid)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"points": points})
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
