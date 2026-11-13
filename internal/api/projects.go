@@ -13,6 +13,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/registry"
+	"github.com/msaif95/opamp-backend/internal/secrets"
 )
 
 // withScope resolves what the signed-in user may reach and stores it on the request.
@@ -144,6 +145,9 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subject": u.Subject, "provider": u.Provider, "role": u.Role, "admin": scope.Admin, "projects": list,
+		// The console signs the user out itself after this long without input; its
+		// background refreshes would otherwise keep the session alive for ever.
+		"session_idle_seconds": int(s.Sessions.IdleTimeout.Seconds()),
 	})
 }
 
@@ -362,4 +366,55 @@ func (s *Server) endUserSessions(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFrom(r.Context())
 	s.audit(r.Context(), u.Subject, u.Provider, "user.sessions.end", "user", strings.ToLower(subject), map[string]any{"sessions": n})
 	writeJSON(w, http.StatusOK, map[string]any{"sessions_ended": n})
+}
+
+func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request) {
+	list, err := s.Secrets.List(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"secrets": nonNil(list), "enabled": s.Secrets.Enabled()})
+}
+
+// setSecret creates or replaces a secret (admin). The value is never returned by any endpoint.
+func (s *Server) setSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name      string     `json:"name"`
+		Value     string     `json:"value"`
+		ProjectID *uuid.UUID `json:"project_id"`
+	}
+	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	err := s.Secrets.Set(r.Context(), req.ProjectID, strings.TrimSpace(req.Name), req.Value, u.Subject)
+	if errors.Is(err, secrets.ErrNoKey) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "secret.set", "secret", strings.TrimSpace(req.Name), map[string]any{"project_id": req.ProjectID})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteSecret(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	if err := s.Secrets.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, secrets.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "secret not found")
+		} else {
+			s.internal(w, r, err)
+		}
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "secret.delete", "secret", id.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
 }

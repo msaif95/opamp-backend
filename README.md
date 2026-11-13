@@ -185,8 +185,10 @@ Remove it with `scripts/deploy.sh dev delete`.
 
 | Key | Required | Purpose |
 |---|---|---|
-| `POSTGRES_DSN` | yes | Database connection string |
+| `POSTGRES_DSN` | yes | Database connection string; must use `sslmode=require` or stricter |
 | `JWT_SIGNING_KEY` | yes | Signs console sessions; 32+ random bytes |
+| `SECRETS_ENCRYPTION_KEY` | for config secrets | Encrypts secrets referenced from configs; 32+ random characters. Keep a copy: without it stored secrets are unreadable |
+| `REDIS_PASSWORD` | if Redis needs one | Redis authentication |
 | `OKTA_CLIENT_SECRET` | with Okta | Okta application secret |
 | `LOCAL_ADMIN_PASSWORD` | optional | Break-glass admin login; 16+ characters |
 | `ALERT_WEBHOOK_URL` | optional | Slack-compatible webhook for alerts |
@@ -293,12 +295,26 @@ Sign-in is through **Okta** (roles from groups), with an optional local administ
 | Page (under Admin) | What it is for |
 |---|---|
 | Projects, Users | Access, as above |
-| Agent credentials | Three tabs: agent API keys, revoked client certificates, console API tokens |
-| Audit log | Every sign-in and every change, with who made it |
+| Agent credentials | Four tabs: agent API keys, revoked client certificates, console API tokens, config secrets |
+| Audit log | Every sign-in and every change, with who made it. Events cannot be edited or deleted, and "Check integrity" detects tampering |
 | System | Which protections are on, with switches for most; backend replicas and their load; recent alerts |
 
 Alerts go to a Slack-compatible webhook: bulk pushes that pause, wait for approval, roll back or finish with
 failures, and fleet-wide trouble (a large share of collectors offline or unhealthy).
+
+### Security controls
+
+- **Config secrets:** store a value such as a destination API key under a name (Admin → Agent credentials → Config
+  secrets) and write `${secret:NAME}` in the config. It is stored encrypted, filled in only when the config goes to
+  a collector, and never shown again.
+- **Sessions:** signed out after 30 minutes without use and after 8 hours regardless (both configurable). Sign out
+  ends the session on the server; admins can sign a person out everywhere from Users.
+- **Second approver:** an optional switch on the System page so that whoever starts a bulk push cannot also resume
+  or approve it.
+- **Audit log:** append-only and hash-chained, with every event also written to the backend log for shipping to a
+  SIEM.
+- **Encrypted connections:** TLS to collectors, and outside development mode the backend refuses to start without
+  TLS to Postgres and Redis. Encryption of data on disk is configured in those stores.
 
 ### Command line and GitOps
 

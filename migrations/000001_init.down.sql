@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS secrets;
 DROP TRIGGER IF EXISTS agents_record_events_update ON agents;
 DROP TRIGGER IF EXISTS agents_record_events_insert ON agents;
 DROP FUNCTION IF EXISTS record_agent_events();

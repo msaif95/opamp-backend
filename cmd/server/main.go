@@ -33,6 +33,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/retention"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/secrets"
 	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/store"
 	"github.com/msaif95/opamp-backend/internal/targeting"
@@ -126,6 +127,32 @@ func run() error {
 	tput := throughput.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
 	handler := protocol.NewHandler(reg, configs, log)
 	handler.OwnMetrics = tput.Offer
+	secretStore, err := secrets.New(db, cfg.SecretsKey)
+	if err != nil {
+		return err
+	}
+	handler.ResolveSecrets = func(ctx context.Context, templateID uuid.UUID, body string) (string, error) {
+		if len(secrets.References(body)) == 0 {
+			return body, nil
+		}
+		project, err := configs.ProjectOf(ctx, templateID)
+		if err != nil {
+			return "", err
+		}
+		return secretStore.Resolve(ctx, project, body)
+	}
+	if secretStore.Enabled() {
+		handler.RedactSecrets = func(ctx context.Context, uid uuid.UUID, body string) (string, error) {
+			project, err := reg.ProjectOf(ctx, uid)
+			if errors.Is(err, registry.ErrNotFound) {
+				return body, nil // first contact: nothing has been sent to it yet
+			}
+			if err != nil {
+				return "", err
+			}
+			return secretStore.Redact(ctx, project, body)
+		}
+	}
 	conns := connection.NewManager(agentAuth, handler, reg, log)
 	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput}
 
@@ -338,7 +365,7 @@ func run() error {
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-			Sessions: sessions, Tokens: apiTokens, Projects: projects,
+			Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
 			// Postgres only. A Redis outage degrades pushes and live updates but
 			// agents and the console keep working, and marking every replica
 			// unready would turn that into a full outage.

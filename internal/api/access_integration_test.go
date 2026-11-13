@@ -21,6 +21,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/secrets"
 	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/testdb"
@@ -94,7 +95,12 @@ func TestProjectAccess(t *testing.T) {
 	tokens := auth.NewTokens(db)
 	sessions := auth.NewSessions([]byte("0123456789abcdef0123456789abcdef"), "")
 	sessions.APITokens = tokens.Authenticate
-	switches, err := settings.New(ctx, db, rdb, map[string]settings.Definition{}, log)
+	sessions.Store = auth.NewRedisSessions(rdb)
+	switches, err := settings.New(ctx, db, rdb, map[string]settings.Definition{settings.SecondApprover: {Available: true}}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretStore, err := secrets.New(db, "0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +108,7 @@ func TestProjectAccess(t *testing.T) {
 	h.srv = httptest.NewServer((&api.Server{
 		DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollout.NewService(db, reg, log),
 		Agents: agents, Sessions: sessions, Groups: targeting.NewGroups(db), Events: http.NotFoundHandler(), Log: log,
-		Tokens: tokens, Projects: projects, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
+		Tokens: tokens, Projects: projects, Secrets: secretStore, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
 		Throughput: func(context.Context, uuid.UUID) (*throughputSample, error) { return nil, nil },
 		History:    func(context.Context, uuid.UUID) ([]throughputPoint, error) { return nil, nil },
 		Ready:      func(context.Context) error { return nil },
@@ -286,6 +292,35 @@ func TestProjectAccess(t *testing.T) {
 	if !found {
 		t.Error("a person added before signing in is missing from the users page")
 	}
+
+	// --- Secrets: admins only, and the value never comes back out.
+	h.expect("admin sets a secret", first(h.call(admin, "PUT", "/secrets", map[string]any{"name": "vendor_key", "value": "s3cr3t-value", "project_id": A})), 204)
+	h.expect("operator sets a secret", first(h.call(alice, "PUT", "/secrets", map[string]any{"name": "x", "value": "s3cr3t-value", "project_id": A})), 403)
+	h.expect("operator lists secrets", first(h.call(alice, "GET", "/secrets", nil)), 403)
+	_, listed := h.call(admin, "GET", "/secrets", nil)
+	if raw, _ := json.Marshal(listed); len(listed["secrets"].([]any)) != 1 || bytes.Contains(raw, []byte("s3cr3t")) {
+		t.Errorf("secret list = %s", raw)
+	}
+
+	// --- Signing out ends the session on the server; an admin can end someone else's.
+	dave := h.session("dave@example.com", auth.RoleViewer)
+	h.expect("dave before sign-out", first(h.call(dave, "GET", "/auth/me", nil)), 200)
+	h.expect("dave signs out", first(h.call(dave, "POST", "/auth/logout", nil)), 204)
+	h.expect("dave's token after sign-out", first(h.call(dave, "GET", "/auth/me", nil)), 401)
+	erin := h.session("erin@example.com", auth.RoleViewer)
+	h.expect("non-admin ends sessions", first(h.call(alice, "DELETE", "/users/erin@example.com/sessions", nil)), 403)
+	h.expect("admin ends erin's sessions", first(h.call(admin, "DELETE", "/users/Erin@example.com/sessions", nil)), 200)
+	h.expect("erin's token afterwards", first(h.call(erin, "GET", "/auth/me", nil)), 401)
+
+	// --- Second approver: with the switch on, whoever started a push cannot continue it.
+	code, ro2 := h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vA, "project_id": A, "all_agents": true, "selector": map[string]any{}, "manual_approval": true})
+	h.expect("alice starts a push", code, 201)
+	h.expect("alice pauses it", first(h.call(alice, "POST", "/rollouts/"+ro2["id"].(string)+"/pause", nil)), 204)
+	if err := switches.Set(ctx, settings.SecondApprover, true, "root"); err != nil {
+		t.Fatal(err)
+	}
+	h.expect("alice resumes her own push", first(h.call(alice, "POST", "/rollouts/"+ro2["id"].(string)+"/resume", nil)), 403)
+	h.expect("alice can still abort it", first(h.call(alice, "POST", "/rollouts/"+ro2["id"].(string)+"/abort", nil)), 204)
 
 	// --- Admin-only housekeeping.
 	h.expect("delete a project that owns things", first(h.call(admin, "DELETE", "/projects/"+A, nil)), 409)

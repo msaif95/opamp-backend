@@ -4,6 +4,7 @@
 export JWT_SIGNING_KEY ?= dev-only-signing-key-do-not-use-in-prod
 export LOCAL_ADMIN_PASSWORD ?= admin
 export DEV_MODE ?= true
+export SECRETS_ENCRYPTION_KEY ?= dev-only-secrets-key-do-not-use-in-prod
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)

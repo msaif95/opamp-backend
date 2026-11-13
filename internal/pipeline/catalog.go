@@ -196,7 +196,7 @@ var catalog = []Type{
 		Fields: []Field{
 			{Key: "endpoint", Label: "Endpoint", Type: FieldString, Required: true, Help: "host:port, for example gateway.example.com:4317"},
 			{Key: "insecure", Label: "Plaintext (no TLS)", Type: FieldBool, Default: false},
-			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "For example an API key header. Stored in the config in clear text."},
+			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "For example an API key header. Write ${secret:NAME} as the value to keep it out of the config."},
 		},
 		build: func(p params) map[string]any {
 			out := map[string]any{"endpoint": p.str("endpoint"), "tls": map[string]any{"insecure": p.bool("insecure")}}
@@ -211,7 +211,7 @@ var catalog = []Type{
 		Description: "Send to any OTLP HTTP endpoint.",
 		Fields: []Field{
 			{Key: "endpoint", Label: "Endpoint URL", Type: FieldString, Required: true, Help: "For example https://otlp.example.com"},
-			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "For example an API key header. Stored in the config in clear text."},
+			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "For example an API key header. Write ${secret:NAME} as the value to keep it out of the config."},
 		},
 		build: func(p params) map[string]any {
 			out := map[string]any{"endpoint": p.str("endpoint")}
@@ -226,7 +226,7 @@ var catalog = []Type{
 		Description: "Send metrics to Prometheus, Mimir, Thanos or anything accepting remote write.",
 		Fields: []Field{
 			{Key: "endpoint", Label: "Remote write URL", Type: FieldString, Required: true},
-			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "Stored in the config in clear text."},
+			{Key: "headers", Label: "Headers", Type: FieldMap, Help: "Write ${secret:NAME} as a value to keep it out of the config."},
 		},
 		build: func(p params) map[string]any {
 			out := map[string]any{"endpoint": p.str("endpoint")}

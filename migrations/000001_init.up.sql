@@ -413,3 +413,16 @@ BEGIN
     END LOOP;
     RETURN NULL;
 END $$;
+
+-- Secrets referenced from configs as ${secret:NAME}. Values are encrypted
+-- with a key held outside the database and only decrypted when a config is
+-- sent to a collector.
+CREATE TABLE secrets (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID REFERENCES projects(id),
+    name       TEXT NOT NULL,
+    ciphertext BYTEA NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX secrets_project_name_key ON secrets (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), name);

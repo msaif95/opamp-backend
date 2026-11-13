@@ -61,6 +61,12 @@ type Handler struct {
 	// OwnMetrics, if set, returns where an agent should send its own
 	// metrics; it is offered to agents that report them.
 	OwnMetrics func(uid uuid.UUID) *protobufs.ConnectionSettingsOffers
+	// ResolveSecrets, if set, replaces ${secret:NAME} references in a config body just before it is sent.
+	ResolveSecrets func(ctx context.Context, templateID uuid.UUID, body string) (string, error)
+	// RedactSecrets, if set, hides secret values in the effective config an
+	// agent reports, before it is stored. On error the config is dropped
+	// rather than stored with secrets in it.
+	RedactSecrets func(ctx context.Context, uid uuid.UUID, body string) (string, error)
 	// During a database outage every agent message fails the same way.
 	reportErr *logthrottle.Throttle
 }
@@ -83,6 +89,18 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 			ErrorMessage: "instance_uid must be a non-zero 16-byte UUID",
 		}
 		return uuid.Nil, resp
+	}
+
+	if h.RedactSecrets != nil {
+		for name, obj := range msg.GetEffectiveConfig().GetConfigMap().GetConfigMap() {
+			redacted, err := h.RedactSecrets(ctx, uid, string(obj.Body))
+			if err != nil {
+				h.log.ErrorContext(ctx, "effective config not stored: its secrets could not be hidden", "instance_uid", uid, "file", name, "err", err)
+				msg.EffectiveConfig = nil
+				break
+			}
+			obj.Body = []byte(redacted)
+		}
 	}
 
 	state, err := h.reg.Report(ctx, uid, id, msg)
@@ -153,10 +171,19 @@ func (h *Handler) pendingConfig(ctx context.Context, uid uuid.UUID, st registry.
 	if bytes.Equal(v.BodyHash, st.RemoteConfigHash) {
 		return nil
 	}
+	body := v.Body
+	if h.ResolveSecrets != nil {
+		if body, err = h.ResolveSecrets(ctx, v.TemplateID, v.Body); err != nil {
+			// Never send a config with an unresolved placeholder: the collector keeps what it has.
+			h.log.ErrorContext(ctx, "config not sent: a secret it refers to could not be resolved", "instance_uid", uid, "err", err)
+			return nil
+		}
+	}
+	// The hash stays that of the stored body, so the secret's value never affects or leaks through it.
 	return &protobufs.AgentRemoteConfig{
 		ConfigHash: v.BodyHash,
 		Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
-			"": {Body: []byte(v.Body), ContentType: configContentType},
+			"": {Body: []byte(body), ContentType: configContentType},
 		}},
 	}
 }

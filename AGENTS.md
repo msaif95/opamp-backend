@@ -140,3 +140,16 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `AGENT_EVENT_RETENTION_DAYS` (90). A new tracked column needs the trigger's WHEN clause and body updated.
 - The SSE stream (`/api/v1/events`) sends only a generic "changed" cue, never agent IDs: any signed-in user can
   open it, so it must not reveal other projects' activity.
+- Sessions: the JWT carries a session ID tracked in Redis (`auth.SessionStore`); `Verify` touches it, so idle
+  timeout, sign-out (`POST /auth/logout`) and admin sign-out (`DELETE /users/{subject}/sessions`) work. If Redis is
+  unreachable a validly signed session is accepted (fail open, logged) so an outage cannot lock admins out. The
+  console enforces the idle timeout on user input itself because its background polling keeps the session alive.
+- Audit log: `audit_events` is hash-chained by a BEFORE INSERT trigger and refuses UPDATE/DELETE/TRUNCATE unless the
+  transaction sets `opamp.audit_prune = 'on'` (only the retention job and the test reset do). `audit_verify()`
+  checks the chain. `Server.audit` also logs each event with `audit=true` for export.
+- Config secrets (`internal/secrets`): `${secret:NAME}` in a config body is resolved per project only in
+  `protocol.Handler.pendingConfig`, never stored resolved; the config hash stays that of the stored body.
+  `RedactSecrets` puts references back into reported effective configs before they are stored. Values must be a
+  single YAML-safe token (`checkValue`). Any new path that sends or stores a config body must go through these.
+- Stores: outside dev mode `Validate` requires TLS to Postgres and Redis unless `ALLOW_UNENCRYPTED_STORES=true`.
+- `second_approver` switch: the starter of a rollout cannot `resume` it (checked in `rolloutAction`).

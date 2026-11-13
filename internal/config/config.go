@@ -26,6 +26,8 @@ type Config struct {
 	// activity; SessionMaxAge signs them out regardless.
 	SessionIdleTimeout time.Duration
 	SessionMaxAge      time.Duration
+	// SecretsKey encrypts secrets referenced from configs; empty disables them.
+	SecretsKey string
 	// AgentRetentionDays removes agents that have been offline this long.
 	AgentRetentionDays int
 	// AgentEventRetentionDays bounds each agent's history.
@@ -117,6 +119,7 @@ func Load() (*Config, error) {
 		RedisAddr:              env("REDIS_ADDR", "localhost:6379"),
 		RedisTLS:               env("REDIS_TLS", "false") == "true",
 		RedisPassword:          env("REDIS_PASSWORD", ""),
+		SecretsKey:             env("SECRETS_ENCRYPTION_KEY", ""),
 		AllowUnencryptedStores: env("ALLOW_UNENCRYPTED_STORES", "false") == "true",
 		JWTSigningKey:          []byte(env("JWT_SIGNING_KEY", "")),
 		LocalAdminPassword:     env("LOCAL_ADMIN_PASSWORD", ""),
@@ -215,6 +218,9 @@ func (c *Config) validateProduction() error {
 	}
 	if strings.Contains(strings.ToLower(string(c.JWTSigningKey)), "dev-only") {
 		problems = append(problems, "JWT_SIGNING_KEY is the development key")
+	}
+	if strings.Contains(strings.ToLower(c.SecretsKey), "dev-only") {
+		problems = append(problems, "SECRETS_ENCRYPTION_KEY is the development key")
 	}
 	if c.LocalAdminPassword != "" && len(c.LocalAdminPassword) < minAdminPasswordLen {
 		problems = append(problems, fmt.Sprintf("LOCAL_ADMIN_PASSWORD is shorter than %d characters", minAdminPasswordLen))

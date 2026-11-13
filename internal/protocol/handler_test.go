@@ -3,6 +3,10 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -41,5 +45,25 @@ func TestPausedAgentGetsEmptyPipelineThenItsConfigBack(t *testing.T) {
 	st.Paused = false
 	if back := h.pendingConfig(context.Background(), uuid.New(), st); back == nil || !bytes.Equal(back.ConfigHash, v.BodyHash) {
 		t.Fatalf("resume did not restore the assigned config: %+v", back)
+	}
+}
+
+func TestSecretsAreResolvedOnlyOnTheWayOut(t *testing.T) {
+	v := &agentconfig.Version{ID: uuid.New(), Body: "key: ${secret:k}", BodyHash: []byte("stored-hash")}
+	h := &Handler{configs: oneVersion{v}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	st := registry.ConfigState{Capabilities: uint64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig), DesiredConfigVersionID: &v.ID}
+
+	h.ResolveSecrets = func(_ context.Context, _ uuid.UUID, body string) (string, error) {
+		return strings.ReplaceAll(body, "${secret:k}", "the-value"), nil
+	}
+	got := h.pendingConfig(context.Background(), uuid.New(), st)
+	// The collector gets the value; the hash stays that of the stored body.
+	if got == nil || string(got.Config.ConfigMap[""].Body) != "key: the-value" || !bytes.Equal(got.ConfigHash, v.BodyHash) {
+		t.Fatalf("resolved config = %+v", got)
+	}
+	// A secret that cannot be resolved means nothing is sent, not a config with a placeholder in it.
+	h.ResolveSecrets = func(context.Context, uuid.UUID, string) (string, error) { return "", errors.New("missing") }
+	if got := h.pendingConfig(context.Background(), uuid.New(), st); got != nil {
+		t.Fatalf("config sent despite an unresolved secret: %s", got.Config.ConfigMap[""].Body)
 	}
 }

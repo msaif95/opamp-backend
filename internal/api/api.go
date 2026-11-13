@@ -25,6 +25,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/secrets"
 	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/throughput"
@@ -48,6 +49,7 @@ type Server struct {
 	Status   SystemStatus
 	Install  InstallConfig
 	Tokens   *auth.Tokens
+	Secrets  *secrets.Store
 	Projects *access.Projects
 	// Throughput returns an agent's latest pipeline rates, or nil.
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
@@ -154,6 +156,9 @@ func (s *Server) Router() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleAdmin), s.withScope)
+			r.Get("/secrets", s.listSecrets)
+			r.Put("/secrets", s.setSecret)
+			r.Delete("/secrets/{id}", s.deleteSecret)
 			r.Get("/users", s.listUsers)
 			r.Delete("/users/{subject}/sessions", s.endUserSessions)
 			r.Post("/projects", s.createProject)
