@@ -32,5 +32,5 @@ jobs:
           git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v${{ inputs.version }}" -m "opamp-backend ${{ inputs.version }}"
           git push origin "v${{ inputs.version }}"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with: { tag_name: 'v${{ inputs.version }}', name: 'opamp-backend ${{ inputs.version }}', body_path: digests.md, generate_release_notes: true, files: 'dist/*' }
