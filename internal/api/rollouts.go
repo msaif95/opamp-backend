@@ -12,7 +12,11 @@ import (
 )
 
 func (s *Server) agentFacets(w http.ResponseWriter, r *http.Request) {
-	facets, err := s.Registry.Facets(r.Context())
+	project, ok := projectFilter(w, r)
+	if !ok {
+		return
+	}
+	facets, err := s.Registry.Facets(r.Context(), scopeOf(r.Context()), project)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -23,6 +27,8 @@ func (s *Server) agentFacets(w http.ResponseWriter, r *http.Request) {
 func (s *Server) previewRollout(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Selector targeting.Selector `json:"selector"`
+		// ProjectID is the project whose agents are counted; omit for unassigned agents.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -31,7 +37,12 @@ func (s *Server) previewRollout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	p, err := s.Rollouts.Preview(r.Context(), req.Selector)
+	// Someone with no access to that project simply sees no matches.
+	if !scopeOf(r.Context()).Can(req.ProjectID, auth.RoleViewer) {
+		writeJSON(w, http.StatusOK, rollout.Preview{})
+		return
+	}
+	p, err := s.Rollouts.Preview(r.Context(), req.Selector, req.ProjectID)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -53,6 +64,9 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 		AutoRollback  bool       `json:"auto_rollback"`
 		// ManualApproval pauses after every batch until someone resumes.
 		ManualApproval bool `json:"manual_approval"`
+		// ProjectID is the project whose agents are targeted; omit for unassigned
+		// agents. A group's project takes precedence.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}{BatchSize: rollout.DefaultBatchSize, MaxFailurePct: rollout.DefaultMaxFailurePct}
 	if !decode(w, r, &req) {
 		return
@@ -67,7 +81,10 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 			s.internal(w, r, err)
 			return
 		}
-		req.Selector = grp.Selector
+		req.Selector, req.ProjectID = grp.Selector, grp.ProjectID
+	}
+	if !s.targetProject(w, r, req.ProjectID, auth.RoleOperator) {
+		return
 	}
 	if err := req.Selector.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -82,9 +99,18 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 		s.configError(w, r, err)
 		return
 	}
+	configProject, ok := s.allowConfig(w, r, v.TemplateID, auth.RoleViewer)
+	if !ok {
+		return
+	}
+	// Only a global admin may push a config from one project to collectors in another.
+	if !sameProject(req.ProjectID, configProject) && !scopeOf(r.Context()).Admin {
+		writeError(w, http.StatusConflict, "the config and the collectors are in different projects")
+		return
+	}
 	u, _ := auth.UserFrom(r.Context())
 	ro, err := s.Rollouts.Create(r.Context(), rollout.Params{
-		VersionID: v.ID, Selector: req.Selector, GroupID: req.GroupID, BatchSize: req.BatchSize,
+		VersionID: v.ID, Selector: req.Selector, ProjectID: req.ProjectID, GroupID: req.GroupID, BatchSize: req.BatchSize,
 		CanarySteps: req.CanarySteps, MaxFailurePct: req.MaxFailurePct, AutoRollback: req.AutoRollback, CreatedBy: u.Subject,
 		ManualApproval: req.ManualApproval,
 	})
@@ -108,7 +134,7 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRollouts(w http.ResponseWriter, r *http.Request) {
-	rollouts, err := s.Rollouts.List(r.Context())
+	rollouts, err := s.Rollouts.List(r.Context(), scopeOf(r.Context()))
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -126,6 +152,9 @@ func (s *Server) getRollout(w http.ResponseWriter, r *http.Request) {
 		s.rolloutError(w, r, err)
 		return
 	}
+	if !s.allow(w, r, ro.ProjectID, auth.RoleViewer) {
+		return
+	}
 	problems, err := s.Rollouts.Problems(r.Context(), id)
 	if err != nil {
 		s.internal(w, r, err)
@@ -138,6 +167,14 @@ func (s *Server) rolloutAction(action string, do func(*Server, *http.Request, uu
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := pathUUID(w, r, "id")
 		if !ok {
+			return
+		}
+		ro, err := s.Rollouts.Get(r.Context(), id)
+		if err != nil {
+			s.rolloutError(w, r, err)
+			return
+		}
+		if !s.allow(w, r, ro.ProjectID, auth.RoleOperator) {
 			return
 		}
 		if err := do(s, r, id); err != nil {

@@ -26,9 +26,11 @@ var (
 // APIToken is a long-lived credential for the CLI and automation. It acts
 // with a fixed role; the secret is shown once, when it is created.
 type APIToken struct {
-	ID         uuid.UUID  `json:"id"`
-	Name       string     `json:"name"`
-	Role       Role       `json:"role"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	Role Role      `json:"role"`
+	// ProjectID is the project a non-admin token acts in; nil means unassigned resources.
+	ProjectID  *uuid.UUID `json:"project_id"`
 	CreatedBy  string     `json:"created_by"`
 	CreatedAt  time.Time  `json:"created_at"`
 	ExpiresAt  *time.Time `json:"expires_at"`
@@ -44,16 +46,16 @@ type Tokens struct{ db *pgxpool.Pool }
 // NewTokens creates a Tokens store.
 func NewTokens(db *pgxpool.Pool) *Tokens { return &Tokens{db: db} }
 
-const tokenColumns = `id, name, role::text, created_by, created_at, expires_at, revoked_at, last_used_at`
+const tokenColumns = `id, name, role::text, project_id, created_by, created_at, expires_at, revoked_at, last_used_at`
 
 func scanToken(row pgx.CollectableRow) (APIToken, error) {
 	var t APIToken
-	err := row.Scan(&t.ID, &t.Name, &t.Role, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt)
+	err := row.Scan(&t.ID, &t.Name, &t.Role, &t.ProjectID, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.RevokedAt, &t.LastUsedAt)
 	return t, err
 }
 
 // Create issues a token. Only its hash is stored.
-func (t *Tokens) Create(ctx context.Context, name string, role Role, createdBy string, expiresAt *time.Time) (*APIToken, error) {
+func (t *Tokens) Create(ctx context.Context, name string, role Role, project *uuid.UUID, createdBy string, expiresAt *time.Time) (*APIToken, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, err
@@ -61,8 +63,8 @@ func (t *Tokens) Create(ctx context.Context, name string, role Role, createdBy s
 	secret := TokenPrefix + base64.RawURLEncoding.EncodeToString(raw)
 	sum := sha256.Sum256([]byte(secret))
 	rows, err := t.db.Query(ctx, `
-INSERT INTO api_tokens (name, role, token_hash, created_by, expires_at) VALUES ($1, $2::rbac_role, $3, $4, $5)
-RETURNING `+tokenColumns, strings.TrimSpace(name), string(role), sum[:], createdBy, expiresAt)
+INSERT INTO api_tokens (name, role, token_hash, created_by, expires_at, project_id) VALUES ($1, $2::rbac_role, $3, $4, $5, $6)
+RETURNING `+tokenColumns, strings.TrimSpace(name), string(role), sum[:], createdBy, expiresAt, project)
 	if err != nil {
 		return nil, err
 	}
@@ -104,16 +106,17 @@ func (t *Tokens) Revoke(ctx context.Context, id uuid.UUID) error {
 func (t *Tokens) Authenticate(ctx context.Context, secret string) (User, error) {
 	sum := sha256.Sum256([]byte(secret))
 	var (
-		name string
-		role Role
+		name    string
+		role    Role
+		project *uuid.UUID
 	)
 	// last_used_at is refreshed at most once a minute to keep this a cheap read most of the time.
 	err := t.db.QueryRow(ctx, `
 UPDATE api_tokens SET last_used_at = CASE WHEN last_used_at IS NULL OR last_used_at < now() - interval '1 minute' THEN now() ELSE last_used_at END
 WHERE token_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-RETURNING name, role::text`, sum[:]).Scan(&name, &role)
+RETURNING name, role::text, project_id`, sum[:]).Scan(&name, &role, &project)
 	if err != nil {
 		return User{}, ErrInvalidCredentials
 	}
-	return User{Subject: "token:" + name, Provider: "token", Role: role}, nil
+	return User{Subject: "token:" + name, Provider: "token", Role: role, TokenProject: project}, nil
 }

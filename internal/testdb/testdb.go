@@ -37,7 +37,7 @@ func Open(t *testing.T) (*pgxpool.Pool, *redis.Client) {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	_, err = db.Exec(ctx, `TRUNCATE agents, config_templates, agent_groups, rollouts, credentials, users, audit_events, settings, library_components, api_tokens CASCADE`)
+	_, err = db.Exec(ctx, `TRUNCATE agents, config_templates, agent_groups, rollouts, credentials, users, audit_events, settings, library_components, api_tokens, projects CASCADE`)
 	if err != nil {
 		t.Fatal(err)
 	}

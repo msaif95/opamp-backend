@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/settings"
 )
@@ -158,8 +160,10 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		Name        string    `json:"name"`
 		Role        auth.Role `json:"role"`
 		ExpiresDays int       `json:"expires_days"`
+		// ProjectID binds a viewer or operator token to one project; omit to act on unassigned resources.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
-	if !decode(w, r, &req) {
+	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
 		return
 	}
 	switch {
@@ -172,6 +176,9 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	case req.ExpiresDays < 0:
 		writeError(w, http.StatusBadRequest, "expires_days must be 0 or more")
 		return
+	case req.Role == auth.RoleAdmin && req.ProjectID != nil:
+		writeError(w, http.StatusBadRequest, "an admin token is global; give a project token the viewer or operator role")
+		return
 	}
 	var expires *time.Time
 	if req.ExpiresDays > 0 {
@@ -179,7 +186,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		expires = &t
 	}
 	u, _ := auth.UserFrom(r.Context())
-	tok, err := s.Tokens.Create(r.Context(), req.Name, req.Role, u.Subject, expires)
+	tok, err := s.Tokens.Create(r.Context(), req.Name, req.Role, req.ProjectID, u.Subject, expires)
 	if errors.Is(err, auth.ErrTokenNameTaken) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -189,7 +196,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), u.Subject, u.Provider, "api_token.create", "api_token", tok.ID.String(),
-		map[string]any{"name": tok.Name, "role": tok.Role})
+		map[string]any{"name": tok.Name, "role": tok.Role, "project_id": tok.ProjectID})
 	writeJSON(w, http.StatusCreated, tok)
 }
 

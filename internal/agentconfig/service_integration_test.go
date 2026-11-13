@@ -17,15 +17,15 @@ func TestConfigVersioning(t *testing.T) {
 	s := agentconfig.NewService(db)
 	ctx := context.Background()
 
-	tmpl, v1, err := s.Create(ctx, "prod", "", body, "alice", nil)
+	tmpl, v1, err := s.Create(ctx, nil, "prod", "", body, "alice", nil)
 	if err != nil || v1.Version != 1 {
 		t.Fatalf("create: %v", err)
 	}
-	if _, _, err := s.Create(ctx, "prod", "", body, "alice", nil); !errors.Is(err, agentconfig.ErrNameTaken) {
+	if _, _, err := s.Create(ctx, nil, "prod", "", body, "alice", nil); !errors.Is(err, agentconfig.ErrNameTaken) {
 		t.Errorf("duplicate name: err = %v", err)
 	}
 	var invalid *agentconfig.InvalidError
-	if _, _, err := s.Create(ctx, "bad", "", "receivers: [", "alice", nil); !errors.As(err, &invalid) {
+	if _, _, err := s.Create(ctx, nil, "bad", "", "receivers: [", "alice", nil); !errors.As(err, &invalid) {
 		t.Errorf("invalid body: err = %v", err)
 	}
 	if _, err := s.AddVersion(ctx, tmpl.ID, body, "", "bob", nil); !errors.Is(err, agentconfig.ErrUnchanged) {
@@ -57,7 +57,7 @@ func TestDeleteRefusedWhileAssigned(t *testing.T) {
 	db, _ := testdb.Open(t)
 	s := agentconfig.NewService(db)
 	ctx := context.Background()
-	tmpl, v1, err := s.Create(ctx, "prod", "", body, "alice", nil)
+	tmpl, v1, err := s.Create(ctx, nil, "prod", "", body, "alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestBuilderSpecIsStoredWithTheVersion(t *testing.T) {
 	s := agentconfig.NewService(db)
 	ctx := context.Background()
 	spec := []byte(`{"sources": [{"type": "otlp"}]}`)
-	tmpl, v1, err := s.Create(ctx, "built", "", body, "alice", spec)
+	tmpl, v1, err := s.Create(ctx, nil, "built", "", body, "alice", spec)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/msaif95/opamp-backend/internal/auth"
 )
 
@@ -42,6 +44,8 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 		Labels      map[string]string `json:"labels"`
 		KeyName     string            `json:"key_name"`
 		ExpiresDays int               `json:"expires_days"`
+		// ProjectID is the project the installed collectors will join; omit for unassigned.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}{Version: DefaultCollectorVersion}
 	if !decode(w, r, &req) {
 		return
@@ -71,6 +75,9 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
+		return
+	}
 	var ca []byte
 	if s.Install.CAFile != "" {
 		var err error
@@ -86,7 +93,7 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 		t := time.Now().AddDate(0, 0, req.ExpiresDays)
 		expires = &t
 	}
-	key, err := s.Agents.IssueAPIKey(r.Context(), strings.TrimSpace(req.KeyName), u.Subject, expires)
+	key, err := s.Agents.IssueAPIKey(r.Context(), strings.TrimSpace(req.KeyName), req.ProjectID, u.Subject, expires)
 	if err != nil {
 		s.internal(w, r, err)
 		return

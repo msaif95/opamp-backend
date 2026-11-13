@@ -15,7 +15,9 @@ import (
 type client struct {
 	base  string
 	token string
-	http  *http.Client
+	// project is the ID of the project commands act in; empty means unassigned resources.
+	project string
+	http    *http.Client
 }
 
 func newClient(base, token string) *client {
@@ -92,11 +94,12 @@ func (c *client) do(method, path string, body, out any) error {
 // API shapes: only the fields the CLI uses.
 
 type configSummary struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Origin        string `json:"origin"`
-	LatestVersion int    `json:"latest_version"`
-	Assigned      int    `json:"assigned_agents"`
+	ID            string  `json:"id"`
+	ProjectID     *string `json:"project_id"`
+	Name          string  `json:"name"`
+	Origin        string  `json:"origin"`
+	LatestVersion int     `json:"latest_version"`
+	Assigned      int     `json:"assigned_agents"`
 }
 
 type configVersion struct {
@@ -110,6 +113,7 @@ type configVersion struct {
 
 type group struct {
 	ID          string              `json:"id"`
+	ProjectID   *string             `json:"project_id"`
 	Name        string              `json:"name"`
 	Description string              `json:"description"`
 	Selector    map[string][]string `json:"selector"`
@@ -156,11 +160,47 @@ func (c *client) configByName(name string) (*configSummary, error) {
 		return nil, err
 	}
 	for i := range all {
-		if all[i].Name == name {
+		if all[i].Name == name && c.inProject(all[i].ProjectID) {
 			return &all[i], nil
 		}
 	}
 	return nil, nil
+}
+
+// inProject reports whether a resource's project is the one the client acts in.
+func (c *client) inProject(id *string) bool {
+	if id == nil {
+		return c.project == ""
+	}
+	return *id == c.project
+}
+
+// projectField adds project_id to a request body when a project is selected.
+func (c *client) projectField(body map[string]any) map[string]any {
+	if c.project != "" {
+		body["project_id"] = c.project
+	}
+	return body
+}
+
+// useProject selects the project with the given name.
+func (c *client) useProject(name string) error {
+	var out struct {
+		Projects []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"projects"`
+	}
+	if err := c.do("GET", "/projects", nil, &out); err != nil {
+		return err
+	}
+	for _, p := range out.Projects {
+		if p.Name == name {
+			c.project = p.ID
+			return nil
+		}
+	}
+	return fmt.Errorf("no project named %q that this token can see", name)
 }
 
 func (c *client) version(configID string, n int) (*configVersion, error) {
@@ -177,6 +217,9 @@ func (c *client) groups() ([]group, error) {
 
 func (c *client) agents(selector map[string]string, limit int) ([]agent, int, error) {
 	q := url.Values{"limit": {fmt.Sprint(limit)}, "sort": {"name"}}
+	if c.project != "" {
+		q.Set("project_id", c.project)
+	}
 	for k, v := range selector {
 		q.Add("attr", k+"="+v)
 	}

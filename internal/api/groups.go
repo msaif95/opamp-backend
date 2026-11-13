@@ -13,7 +13,7 @@ import (
 )
 
 func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
-	groups, err := s.Groups.List(r.Context())
+	groups, err := s.Groups.List(r.Context(), scopeOf(r.Context()))
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -26,8 +26,10 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 		Name        string             `json:"name"`
 		Description string             `json:"description"`
 		Selector    targeting.Selector `json:"selector"`
+		// ProjectID is the project the group belongs to; omit for unassigned.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
-	if !decode(w, r, &req) {
+	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleOperator) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
@@ -43,7 +45,7 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	grp, err := s.Groups.Create(r.Context(), req.Name, req.Description, req.Selector)
+	grp, err := s.Groups.Create(r.Context(), req.ProjectID, req.Name, req.Description, req.Selector)
 	if errors.Is(err, targeting.ErrGroupNameTaken) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -80,6 +82,9 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if _, ok := s.allowGroup(w, r, id); !ok {
+		return
+	}
 	grp, err := s.Groups.Update(r.Context(), id, req.Name, req.Description, req.Selector)
 	switch {
 	case errors.Is(err, targeting.ErrGroupNotFound):
@@ -101,6 +106,9 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r, "id")
 	if !ok {
+		return
+	}
+	if _, ok := s.allowGroup(w, r, id); !ok {
 		return
 	}
 	err := s.Groups.Delete(r.Context(), id)
@@ -135,13 +143,8 @@ func (s *Server) setGroupConfig(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	grp, err := s.Groups.Get(r.Context(), id)
-	if errors.Is(err, targeting.ErrGroupNotFound) {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	if err != nil {
-		s.internal(w, r, err)
+	grp, ok := s.allowGroup(w, r, id)
+	if !ok {
 		return
 	}
 	v, err := s.Configs.Version(r.Context(), req.ConfigVersionID)
@@ -149,10 +152,18 @@ func (s *Server) setGroupConfig(w http.ResponseWriter, r *http.Request) {
 		s.configError(w, r, err)
 		return
 	}
+	configProject, ok := s.allowConfig(w, r, v.TemplateID, auth.RoleViewer)
+	if !ok {
+		return
+	}
+	if !sameProject(grp.ProjectID, configProject) && !scopeOf(r.Context()).Admin {
+		writeError(w, http.StatusConflict, "the config and the group are in different projects")
+		return
+	}
 	u, _ := auth.UserFrom(r.Context())
 	// The rollout is created first: if its parameters are rejected the group is left untouched.
 	ro, err := s.Rollouts.Create(r.Context(), rollout.Params{
-		VersionID: v.ID, Selector: grp.Selector, GroupID: &id, BatchSize: req.BatchSize,
+		VersionID: v.ID, Selector: grp.Selector, ProjectID: grp.ProjectID, GroupID: &id, BatchSize: req.BatchSize,
 		CanarySteps: req.CanarySteps, MaxFailurePct: req.MaxFailurePct, AutoRollback: req.AutoRollback, CreatedBy: u.Subject,
 	})
 	switch {
@@ -184,6 +195,9 @@ func (s *Server) clearGroupConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := s.allowGroup(w, r, id); !ok {
+		return
+	}
 	err := s.Groups.SetConfig(r.Context(), id, nil)
 	if errors.Is(err, targeting.ErrGroupNotFound) {
 		writeError(w, http.StatusNotFound, err.Error())
@@ -196,4 +210,18 @@ func (s *Server) clearGroupConfig(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFrom(r.Context())
 	s.audit(r.Context(), u.Subject, u.Provider, "group.config.clear", "group", id.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// allowGroup loads a group and checks the caller may change it.
+func (s *Server) allowGroup(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*targeting.Group, bool) {
+	grp, err := s.Groups.Get(r.Context(), id)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return nil, false
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return nil, false
+	}
+	return grp, s.allow(w, r, grp.ProjectID, auth.RoleOperator)
 }

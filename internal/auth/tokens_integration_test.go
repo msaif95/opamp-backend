@@ -18,11 +18,11 @@ func TestAPITokens(t *testing.T) {
 	ctx := context.Background()
 	tokens := auth.NewTokens(db)
 
-	tok, err := tokens.Create(ctx, "ci", auth.RoleOperator, "alice", nil)
+	tok, err := tokens.Create(ctx, "ci", auth.RoleOperator, nil, "alice", nil)
 	if err != nil || !strings.HasPrefix(tok.Secret, auth.TokenPrefix) {
 		t.Fatalf("create: %v %+v", err, tok)
 	}
-	if _, err := tokens.Create(ctx, "ci", auth.RoleViewer, "alice", nil); !errors.Is(err, auth.ErrTokenNameTaken) {
+	if _, err := tokens.Create(ctx, "ci", auth.RoleViewer, nil, "alice", nil); !errors.Is(err, auth.ErrTokenNameTaken) {
 		t.Fatalf("duplicate name: %v", err)
 	}
 	u, err := tokens.Authenticate(ctx, tok.Secret)
@@ -49,7 +49,7 @@ func TestAPITokens(t *testing.T) {
 
 	// Expired and revoked tokens stop working at once.
 	past := time.Now().Add(-time.Hour)
-	old, _ := tokens.Create(ctx, "old", auth.RoleAdmin, "alice", &past)
+	old, _ := tokens.Create(ctx, "old", auth.RoleAdmin, nil, "alice", &past)
 	if _, err := tokens.Authenticate(ctx, old.Secret); err == nil {
 		t.Fatal("expired token accepted")
 	}

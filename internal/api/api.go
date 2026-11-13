@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/msaif95/opamp-backend/internal/access"
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/auth"
@@ -44,9 +45,10 @@ type Server struct {
 	Events http.Handler
 	Log    *slog.Logger
 	// Status describes how this deployment is configured, for the System page.
-	Status  SystemStatus
-	Install InstallConfig
-	Tokens  *auth.Tokens
+	Status   SystemStatus
+	Install  InstallConfig
+	Tokens   *auth.Tokens
+	Projects *access.Projects
 	// Throughput returns an agent's latest pipeline rates, or nil.
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
 	// History returns an agent's recent CPU, memory and throughput samples.
@@ -92,8 +94,10 @@ func (s *Server) Router() http.Handler {
 		r.Get("/auth/okta/callback", s.oktaCallback)
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.Sessions.Require(auth.RoleViewer))
+			// Any signed-in user; handlers filter and check by project.
+			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
 			r.Get("/auth/me", s.me)
+			r.Get("/projects", s.listProjects)
 			r.Get("/summary", s.summary)
 			r.Get("/agents", s.listAgents)
 			r.Get("/agents/facets", s.agentFacets)
@@ -114,7 +118,8 @@ func (s *Server) Router() http.Handler {
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.Sessions.Require(auth.RoleOperator))
+			// Changes: each handler checks the operator role in the resource's project.
+			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
 			r.Post("/configs", s.createConfig)
 			r.Post("/configs/builder/library", s.saveLibraryItem)
 			r.Put("/configs/builder/library/{id}", s.saveLibraryItem)
@@ -146,7 +151,14 @@ func (s *Server) Router() http.Handler {
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.Sessions.Require(auth.RoleAdmin))
+			r.Use(s.Sessions.Require(auth.RoleAdmin), s.withScope)
+			r.Post("/projects", s.createProject)
+			r.Delete("/projects/{id}", s.deleteProject)
+			r.Get("/projects/{id}/members", s.listProjectMembers)
+			r.Put("/projects/{id}/members", s.setProjectMember)
+			r.Delete("/projects/{id}/members/{subject}", s.removeProjectMember)
+			r.Put("/agents/{uid}/project", s.setAgentProject)
+			r.Put("/credentials/api-keys/{id}/project", s.setAPIKeyProject)
 			r.Get("/audit", s.listAudit)
 			r.Get("/system", s.system)
 			r.Get("/auth/tokens", s.listTokens)
@@ -207,13 +219,12 @@ func (s *Server) clientAddr(r *http.Request) string {
 	return host
 }
 
-func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	u, _ := auth.UserFrom(r.Context())
-	writeJSON(w, http.StatusOK, u)
-}
-
 func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
-	sum, err := s.Registry.Summarize(r.Context())
+	project, ok := projectFilter(w, r)
+	if !ok {
+		return
+	}
+	sum, err := s.Registry.Summarize(r.Context(), scopeOf(r.Context()), project)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -226,7 +237,11 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 // with ?sort=name|last_seen and ?order=asc|desc.
 func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f := registry.ListFilter{Attributes: map[string]string{}}
+	f := registry.ListFilter{Attributes: map[string]string{}, Scope: scopeOf(r.Context())}
+	var ok bool
+	if f.Project, ok = projectFilter(w, r); !ok {
+		return
+	}
 	f.Limit, _ = strconv.Atoi(q.Get("limit"))
 	f.Offset, _ = strconv.Atoi(q.Get("offset"))
 	if f.Offset < 0 {
@@ -278,7 +293,11 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 			s.internal(w, r, err)
 			return
 		}
-		f.Selector = grp.Selector
+		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
+			return
+		}
+		// A group only ever matches its own project's agents.
+		f.Selector, f.Project = grp.Selector, &registry.ProjectRef{ID: grp.ProjectID}
 	}
 	for _, kv := range q["attr"] {
 		k, v, ok := strings.Cut(kv, "=")
@@ -315,6 +334,9 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, r, err)
 		return
 	}
+	if !s.allow(w, r, a.ProjectID, auth.RoleViewer) {
+		return
+	}
 	// Best effort: a Redis problem must not hide the agent.
 	sample, _ := s.Throughput(r.Context(), uid)
 	writeJSON(w, http.StatusOK, struct {
@@ -336,6 +358,9 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		s.internal(w, r, err)
+		return
+	}
+	if !s.allow(w, r, a.ProjectID, auth.RoleOperator) {
 		return
 	}
 	if a.Capabilities&capAcceptsRestart == 0 {
@@ -361,6 +386,9 @@ func (s *Server) pauseAgent(paused bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, ok := pathUUID(w, r, "uid")
 		if !ok {
+			return
+		}
+		if _, ok := s.allowAgent(w, r, uid, auth.RoleOperator); !ok {
 			return
 		}
 		err := s.Registry.SetPaused(r.Context(), uid, paused)
@@ -391,6 +419,9 @@ func (s *Server) agentMetrics(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := s.allowAgent(w, r, uid, auth.RoleViewer); !ok {
+		return
+	}
 	points, err := s.History(r.Context(), uid)
 	if err != nil {
 		s.internal(w, r, err)
@@ -415,8 +446,10 @@ func (s *Server) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name      string     `json:"name"`
 		ExpiresAt *time.Time `json:"expires_at"`
+		// ProjectID is the project collectors using this key will join; omit for unassigned.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
-	if !decode(w, r, &req) {
+	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
 		return
 	}
 	if strings.TrimSpace(req.Name) == "" {
@@ -428,13 +461,13 @@ func (s *Server) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := auth.UserFrom(r.Context())
-	key, err := s.Agents.IssueAPIKey(r.Context(), req.Name, u.Subject, req.ExpiresAt)
+	key, err := s.Agents.IssueAPIKey(r.Context(), req.Name, req.ProjectID, u.Subject, req.ExpiresAt)
 	if err != nil {
 		s.internal(w, r, err)
 		return
 	}
 	s.audit(r.Context(), u.Subject, u.Provider, "credential.issue", "credential", key.ID.String(),
-		map[string]any{"kind": "api_key", "name": key.Name})
+		map[string]any{"kind": "api_key", "name": key.Name, "project_id": key.ProjectID})
 	writeJSON(w, http.StatusCreated, key)
 }
 

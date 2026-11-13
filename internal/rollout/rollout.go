@@ -50,6 +50,8 @@ type Pusher interface {
 
 // Rollout is one bulk config push.
 type Rollout struct {
+	// ProjectID is the project whose agents the rollout targets; nil means unassigned agents.
+	ProjectID       *uuid.UUID         `json:"project_id"`
 	ID              uuid.UUID          `json:"id"`
 	ConfigVersionID uuid.UUID          `json:"config_version_id"`
 	ConfigID        uuid.UUID          `json:"config_id"`
@@ -118,8 +120,8 @@ func NewService(db *pgxpool.Pool, push Pusher, log *slog.Logger) *Service {
 }
 
 // Preview counts the agents a selector matches right now.
-func (s *Service) Preview(ctx context.Context, sel targeting.Selector) (Preview, error) {
-	where, args := sel.Where("attributes", 2)
+func (s *Service) Preview(ctx context.Context, sel targeting.Selector, project *uuid.UUID) (Preview, error) {
+	where, args := sel.WhereIn("attributes", "project_id", project, 2)
 	var p Preview
 	err := s.db.QueryRow(ctx, `
 SELECT count(*), count(*) FILTER (WHERE connected), count(*) FILTER (WHERE capabilities & $1 <> 0)
@@ -131,6 +133,8 @@ FROM agents WHERE `+where, append([]any{acceptsRemoteConfig}, args...)...).Scan(
 type Params struct {
 	VersionID uuid.UUID
 	Selector  targeting.Selector
+	// ProjectID confines the rollout to one project's agents (nil: unassigned agents).
+	ProjectID *uuid.UUID
 	// GroupID records the saved group the selector came from, if any.
 	GroupID   *uuid.UUID
 	BatchSize int
@@ -207,20 +211,20 @@ func (s *Service) Create(ctx context.Context, p Params) (*Rollout, error) {
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
 INSERT INTO rollouts (config_version_id, selector, group_id, batch_size, canary_steps_pct, max_failure_pct,
-                      auto_rollback, manual_approval, status, created_by, started_at)
-VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, 'running', $9, now()) RETURNING id`,
-		versionID, selJSON, p.GroupID, batchSize, steps, maxFailurePct, p.AutoRollback, p.ManualApproval, createdBy).Scan(&id)
+                      auto_rollback, manual_approval, status, created_by, started_at, project_id)
+VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, 'running', $9, now(), $10) RETURNING id`,
+		versionID, selJSON, p.GroupID, batchSize, steps, maxFailurePct, p.AutoRollback, p.ManualApproval, createdBy, p.ProjectID).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 
 	// $2 is the batch size, or for canary rollouts the cumulative agent
 	// count at which each step ends.
-	where, args := sel.Where("attributes", 3)
+	where, args := sel.WhereIn("attributes", "project_id", p.ProjectID, 3)
 	stepExpr, stepArg := `((rn - 1) / $2::int)::int`, any(batchSize)
 	if p.CanarySteps != nil {
 		var total int
-		countWhere, countArgs := sel.Where("attributes", 1)
+		countWhere, countArgs := sel.WhereIn("attributes", "project_id", p.ProjectID, 1)
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM agents WHERE `+countWhere, countArgs...).Scan(&total); err != nil {
 			return nil, err
 		}
@@ -248,7 +252,7 @@ SELECT r.id, r.config_version_id, cv.template_id, ct.name, cv.version, r.selecto
        r.canary_steps_pct, r.max_failure_pct::float8, r.auto_rollback, r.manual_approval, r.status::text, r.current_step, r.created_by, r.created_at, r.finished_at, r.error,
        COALESCE((SELECT jsonb_object_agg(status, n) FROM (
            SELECT status::text, count(*) AS n FROM rollout_agents WHERE rollout_id = r.id GROUP BY status) c), '{}'::jsonb),
-       COALESCE((SELECT max(step) + 1 FROM rollout_agents WHERE rollout_id = r.id), 0)
+       COALESCE((SELECT max(step) + 1 FROM rollout_agents WHERE rollout_id = r.id), 0), r.project_id
 FROM rollouts r
 JOIN config_versions cv ON cv.id = r.config_version_id
 JOIN config_templates ct ON ct.id = cv.template_id
@@ -261,7 +265,7 @@ func scanRollout(row pgx.CollectableRow) (Rollout, error) {
 	)
 	err := row.Scan(&r.ID, &r.ConfigVersionID, &r.ConfigID, &r.ConfigName, &r.ConfigVersion, &sel, &r.GroupID, &r.GroupName,
 		&r.BatchSize, &r.CanarySteps, &r.MaxFailurePct, &r.AutoRollback, &r.ManualApproval, &r.Status, &r.BatchesReleased, &r.CreatedBy, &r.CreatedAt, &r.FinishedAt, &r.Error,
-		&counts, &r.TotalBatches)
+		&counts, &r.TotalBatches, &r.ProjectID)
 	if err != nil {
 		return r, err
 	}
@@ -278,8 +282,9 @@ func scanRollout(row pgx.CollectableRow) (Rollout, error) {
 }
 
 // List returns the most recent rollouts, newest first.
-func (s *Service) List(ctx context.Context) ([]Rollout, error) {
-	rows, err := s.db.Query(ctx, rolloutSelect+` ORDER BY r.created_at DESC LIMIT 100`)
+func (s *Service) List(ctx context.Context, scope targeting.Scope) ([]Rollout, error) {
+	where, args := scope.Where("r.project_id", 1)
+	rows, err := s.db.Query(ctx, rolloutSelect+` WHERE `+where+` ORDER BY r.created_at DESC LIMIT 100`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -513,7 +518,7 @@ const reconcileBatch = 1000
 // An agent matching several groups gets the config of the first by name.
 func (s *Service) ReconcileGroups(ctx context.Context) error {
 	rows, err := s.db.Query(ctx, `
-SELECT g.id, g.selector, g.config_version_id FROM agent_groups g
+SELECT g.id, g.selector, g.config_version_id, g.project_id FROM agent_groups g
 WHERE g.config_version_id IS NOT NULL AND (
     EXISTS (SELECT 1 FROM rollouts r WHERE r.group_id = g.id AND r.config_version_id = g.config_version_id AND r.status = 'completed')
     OR NOT EXISTS (SELECT 1 FROM rollouts r WHERE r.group_id = g.id AND r.config_version_id = g.config_version_id))
@@ -524,10 +529,11 @@ ORDER BY g.name`)
 	type group struct {
 		id, versionID uuid.UUID
 		sel           []byte
+		project       *uuid.UUID
 	}
 	groups, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (group, error) {
 		var g group
-		err := row.Scan(&g.id, &g.sel, &g.versionID)
+		err := row.Scan(&g.id, &g.sel, &g.versionID, &g.project)
 		return g, err
 	})
 	if err != nil {
@@ -538,7 +544,7 @@ ORDER BY g.name`)
 		if err := json.Unmarshal(g.sel, &sel); err != nil {
 			return err
 		}
-		where, args := sel.Where("attributes", 4)
+		where, args := sel.WhereIn("attributes", "project_id", g.project, 4)
 		rows, err := s.db.Query(ctx, `
 UPDATE agents SET desired_config_version_id = $1 WHERE instance_uid IN (
     SELECT instance_uid FROM agents
@@ -580,13 +586,14 @@ func (s *Service) advance(ctx context.Context, id uuid.UUID, outcome *string) ([
 		nextStep, ackStep int
 		selJSON           []byte
 		manualApproval    bool
+		project           *uuid.UUID
 	)
 	err = tx.QueryRow(ctx, `
 SELECT r.config_version_id, r.status::text, cv.body_hash, r.max_failure_pct::float8, r.auto_rollback,
-       r.current_step, r.ack_step, r.selector, r.manual_approval
+       r.current_step, r.ack_step, r.selector, r.manual_approval, r.project_id
 FROM rollouts r JOIN config_versions cv ON cv.id = r.config_version_id
 WHERE r.id = $1 FOR UPDATE OF r SKIP LOCKED`, id).
-		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep, &selJSON, &manualApproval)
+		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep, &selJSON, &manualApproval, &project)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // another replica is advancing it
 	}
@@ -629,7 +636,7 @@ WHERE ra.rollout_id = $1 AND ra.instance_uid = a.instance_uid AND ra.status IN (
 	if err := json.Unmarshal(selJSON, &sel); err != nil {
 		return nil, fmt.Errorf("decode selector: %w", err)
 	}
-	where, args := sel.Where("a.attributes", 3)
+	where, args := sel.WhereIn("a.attributes", "a.project_id", project, 3)
 	_, err = tx.Exec(ctx, `
 INSERT INTO rollout_agents (rollout_id, instance_uid, step)
 SELECT $1, a.instance_uid, $2 FROM agents a

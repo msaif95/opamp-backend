@@ -141,7 +141,7 @@ func apply(c *client, resources []resource, dryRun bool, out io.Writer) (changed
 		case "Config":
 			var existing *configSummary
 			for i := range configs {
-				if configs[i].Name == r.Name {
+				if configs[i].Name == r.Name && c.inProject(configs[i].ProjectID) {
 					existing = &configs[i]
 				}
 			}
@@ -176,7 +176,7 @@ func apply(c *client, resources []resource, dryRun bool, out io.Writer) (changed
 			case existing == nil && dryRun:
 				report(r, "would be created")
 			case existing == nil:
-				if err := c.do("POST", "/configs", map[string]string{"name": r.Name, "description": r.Description, "body": r.Body}, nil); err != nil {
+				if err := c.do("POST", "/configs", c.projectField(map[string]any{"name": r.Name, "description": r.Description, "body": r.Body}), nil); err != nil {
 					return changed, fmt.Errorf("config %q: %w", r.Name, err)
 				}
 				report(r, "created (v1)")
@@ -194,11 +194,11 @@ func apply(c *client, resources []resource, dryRun bool, out io.Writer) (changed
 		case "Group":
 			var existing *group
 			for i := range groups {
-				if groups[i].Name == r.Name {
+				if groups[i].Name == r.Name && c.inProject(groups[i].ProjectID) {
 					existing = &groups[i]
 				}
 			}
-			body := map[string]any{"name": r.Name, "description": r.Description, "selector": r.Selector}
+			body := c.projectField(map[string]any{"name": r.Name, "description": r.Description, "selector": r.Selector})
 			switch {
 			case existing != nil && existing.Description == r.Description && sameSelector(existing.Selector, r.Selector):
 				report(r, "unchanged")

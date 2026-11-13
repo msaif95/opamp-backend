@@ -204,7 +204,7 @@ func TestListFiltersSortsAndFacets(t *testing.T) {
 		t.Fatalf("descending sort: first is %q", agents[0].Attributes["host.name"])
 	}
 
-	facets, err := r.Facets(ctx)
+	facets, err := r.Facets(ctx, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

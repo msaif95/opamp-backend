@@ -41,12 +41,14 @@ func (e *InvalidError) Error() string { return "config failed validation" }
 
 // Template is a named config with a version history.
 type Template struct {
-	ID            uuid.UUID `json:"id"`
-	Name          string    `json:"name"`
-	Description   string    `json:"description"`
-	Origin        string    `json:"origin"`
-	LatestVersion int       `json:"latest_version"`
-	AssignedCount int       `json:"assigned_agents"`
+	ID uuid.UUID `json:"id"`
+	// ProjectID is the project that owns the config; nil means unassigned.
+	ProjectID     *uuid.UUID `json:"project_id"`
+	Name          string     `json:"name"`
+	Description   string     `json:"description"`
+	Origin        string     `json:"origin"`
+	LatestVersion int        `json:"latest_version"`
+	AssignedCount int        `json:"assigned_agents"`
 	// AssignedByVersion maps a version number to the agents assigned to it.
 	AssignedByVersion map[int]int `json:"assigned_by_version"`
 	CreatedAt         time.Time   `json:"created_at"`
@@ -87,7 +89,7 @@ func NewService(db *pgxpool.Pool) *Service {
 
 // Create creates a UI-authored template with its first version.
 // builderSpec is the builder pipeline the body was rendered from, or nil for hand-written YAML.
-func (s *Service) Create(ctx context.Context, name, description, body, author string, builderSpec json.RawMessage) (*Template, *Version, error) {
+func (s *Service) Create(ctx context.Context, project *uuid.UUID, name, description, body, author string, builderSpec json.RawMessage) (*Template, *Version, error) {
 	if issues := Validate(body); HasErrors(issues) {
 		return nil, nil, &InvalidError{Issues: issues}
 	}
@@ -97,10 +99,10 @@ func (s *Service) Create(ctx context.Context, name, description, body, author st
 	}
 	defer tx.Rollback(ctx)
 
-	t := &Template{Name: name, Description: description, Origin: OriginUI, LatestVersion: 1, AssignedByVersion: map[int]int{}}
+	t := &Template{ProjectID: project, Name: name, Description: description, Origin: OriginUI, LatestVersion: 1, AssignedByVersion: map[int]int{}}
 	err = tx.QueryRow(ctx, `
-INSERT INTO config_templates (name, description, origin) VALUES ($1, $2, 'ui')
-RETURNING id, created_at, updated_at`, name, description).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
+INSERT INTO config_templates (name, description, origin, project_id) VALUES ($1, $2, 'ui', $3)
+RETURNING id, created_at, updated_at`, name, description, project).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return nil, nil, ErrNameTaken
@@ -180,7 +182,7 @@ SELECT t.id, t.name, COALESCE(t.description, ''), t.origin::text,
        COALESCE((SELECT jsonb_object_agg(version, n) FROM (
            SELECT v.version, count(*) AS n FROM agents a JOIN config_versions v ON v.id = a.desired_config_version_id
            WHERE v.template_id = t.id GROUP BY v.version) c), '{}'::jsonb),
-       t.created_at, t.updated_at
+       t.created_at, t.updated_at, t.project_id
 FROM config_templates t`
 
 func scanTemplate(row pgx.CollectableRow) (Template, error) {
@@ -188,7 +190,7 @@ func scanTemplate(row pgx.CollectableRow) (Template, error) {
 		t        Template
 		assigned []byte
 	)
-	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &assigned, &t.CreatedAt, &t.UpdatedAt)
+	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &assigned, &t.CreatedAt, &t.UpdatedAt, &t.ProjectID)
 	if err != nil {
 		return t, err
 	}
@@ -201,9 +203,25 @@ func scanTemplate(row pgx.CollectableRow) (Template, error) {
 	return t, nil
 }
 
-// List returns all templates ordered by name.
-func (s *Service) List(ctx context.Context) ([]Template, error) {
-	rows, err := s.db.Query(ctx, templateSelect+` ORDER BY t.name`)
+// Scope limits rows to the projects a caller may view (see access.Scope).
+type Scope interface {
+	Where(projectColumn string, firstParam int) (string, []any)
+}
+
+// ProjectOf returns the project that owns a template (nil for unassigned).
+func (s *Service) ProjectOf(ctx context.Context, templateID uuid.UUID) (*uuid.UUID, error) {
+	var project *uuid.UUID
+	err := s.db.QueryRow(ctx, `SELECT project_id FROM config_templates WHERE id = $1`, templateID).Scan(&project)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return project, err
+}
+
+// List returns the templates the scope may view, ordered by name.
+func (s *Service) List(ctx context.Context, scope Scope) ([]Template, error) {
+	where, args := scope.Where("t.project_id", 1)
+	rows, err := s.db.Query(ctx, templateSelect+` WHERE `+where+` ORDER BY t.name`, args...)
 	if err != nil {
 		return nil, err
 	}

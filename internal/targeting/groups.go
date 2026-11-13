@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,10 +21,12 @@ var (
 // Group is a saved, named selector. Membership is dynamic: it is whatever
 // agents match the selector at the time it is evaluated.
 type Group struct {
-	ID          uuid.UUID `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Selector    Selector  `json:"selector"`
+	ID uuid.UUID `json:"id"`
+	// ProjectID is the project the group belongs to; it only ever matches that project's agents.
+	ProjectID   *uuid.UUID `json:"project_id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Selector    Selector   `json:"selector"`
 	// Members is the number of agents currently matching the selector.
 	Members   int       `json:"members"`
 	CreatedAt time.Time `json:"created_at"`
@@ -42,7 +45,7 @@ type GroupConfig struct {
 }
 
 const (
-	groupColumns = `g.id, g.name, COALESCE(g.description, ''), g.selector, g.created_at,
+	groupColumns = `g.id, g.project_id, g.name, COALESCE(g.description, ''), g.selector, g.created_at,
        g.config_version_id, cv.template_id, ct.name, cv.version, g.config_set_at`
 	groupJoins = `
 LEFT JOIN config_versions cv ON cv.id = g.config_version_id
@@ -52,13 +55,19 @@ LEFT JOIN config_templates ct ON ct.id = cv.template_id`
 // Groups stores saved selectors.
 type Groups struct{ db *pgxpool.Pool }
 
+// Scope limits rows to the projects a caller may view (see access.Scope).
+type Scope interface {
+	Where(projectColumn string, firstParam int) (string, []any)
+}
+
 // NewGroups creates a Groups store.
 func NewGroups(db *pgxpool.Pool) *Groups { return &Groups{db: db} }
 
 // List returns all groups by name with their current member counts.
-func (g *Groups) List(ctx context.Context) ([]Group, error) {
+func (g *Groups) List(ctx context.Context, scope Scope) ([]Group, error) {
+	scopeWhere, scopeArgs := scope.Where("g.project_id", 1)
 	rows, err := g.db.Query(ctx, `
-SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` ORDER BY g.name`)
+SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` WHERE `+scopeWhere+` ORDER BY g.name`, scopeArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +76,10 @@ SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` ORDER BY g.name`)
 		return nil, err
 	}
 	for i := range groups {
-		where, args := groups[i].Selector.Where("attributes", 1)
-		if err := g.db.QueryRow(ctx, `SELECT count(*) FROM agents WHERE `+where, args...).Scan(&groups[i].Members); err != nil {
+		where, args := groups[i].Selector.Where("attributes", 2)
+		err := g.db.QueryRow(ctx, `SELECT count(*) FROM agents WHERE project_id IS NOT DISTINCT FROM $1 AND `+where,
+			append([]any{groups[i].ProjectID}, args...)...).Scan(&groups[i].Members)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -90,15 +101,15 @@ SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` WHERE g.id = $1`, id)
 }
 
 // Create saves a selector under a name.
-func (g *Groups) Create(ctx context.Context, name, description string, sel Selector) (*Group, error) {
+func (g *Groups) Create(ctx context.Context, project *uuid.UUID, name, description string, sel Selector) (*Group, error) {
 	selJSON, err := json.Marshal(sel)
 	if err != nil {
 		return nil, err
 	}
-	grp := &Group{Name: name, Description: description, Selector: sel}
+	grp := &Group{ProjectID: project, Name: name, Description: description, Selector: sel}
 	err = g.db.QueryRow(ctx, `
-INSERT INTO agent_groups (name, description, selector) VALUES ($1, $2, $3::jsonb) RETURNING id, created_at`,
-		name, description, selJSON).Scan(&grp.ID, &grp.CreatedAt)
+INSERT INTO agent_groups (name, description, selector, project_id) VALUES ($1, $2, $3::jsonb, $4) RETURNING id, created_at`,
+		name, description, selJSON, project).Scan(&grp.ID, &grp.CreatedAt)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return nil, ErrGroupNameTaken
@@ -115,7 +126,7 @@ func (g *Groups) Update(ctx context.Context, id uuid.UUID, name, description str
 	grp := &Group{ID: id, Name: name, Description: description, Selector: sel}
 	err = g.db.QueryRow(ctx, `
 UPDATE agent_groups SET name = $2, description = $3, selector = $4::jsonb, updated_at = now()
-WHERE id = $1 RETURNING created_at`, id, name, description, selJSON).Scan(&grp.CreatedAt)
+WHERE id = $1 RETURNING created_at, project_id`, id, name, description, selJSON).Scan(&grp.CreatedAt, &grp.ProjectID)
 	var pgErr *pgconn.PgError
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -163,7 +174,7 @@ func scanGroup(row pgx.CollectableRow) (Group, error) {
 		version               *int
 		setAt                 *time.Time
 	)
-	if err := row.Scan(&grp.ID, &grp.Name, &grp.Description, &sel, &grp.CreatedAt,
+	if err := row.Scan(&grp.ID, &grp.ProjectID, &grp.Name, &grp.Description, &sel, &grp.CreatedAt,
 		&versionID, &templateID, &templateName, &version, &setAt); err != nil {
 		return grp, err
 	}
@@ -171,4 +182,11 @@ func scanGroup(row pgx.CollectableRow) (Group, error) {
 		grp.Config = &GroupConfig{VersionID: *versionID, TemplateID: *templateID, TemplateName: *templateName, Version: *version, SetAt: *setAt}
 	}
 	return grp, json.Unmarshal(sel, &grp.Selector)
+}
+
+// WhereIn is Where confined to one project's agents (nil: unassigned
+// agents). A selector never reaches across projects.
+func (s Selector) WhereIn(attributesColumn, projectColumn string, project *uuid.UUID, firstParam int) (string, []any) {
+	where, args := s.Where(attributesColumn, firstParam)
+	return fmt.Sprintf("(%s) AND %s IS NOT DISTINCT FROM $%d", where, projectColumn, firstParam+len(args)), append(args, project)
 }

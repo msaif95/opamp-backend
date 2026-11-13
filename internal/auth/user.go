@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"github.com/google/uuid"
 	"net/http"
 	"strings"
 	"time"
@@ -23,6 +24,9 @@ const (
 var roleRank = map[Role]int{RoleViewer: 1, RoleOperator: 2, RoleAdmin: 3}
 
 // Allows reports whether r satisfies the required role.
+// RoleNone is the global role of someone who only has project memberships.
+const RoleNone Role = ""
+
 func (r Role) Allows(required Role) bool { return roleRank[r] >= roleRank[required] && roleRank[r] > 0 }
 
 // User is the authenticated human principal attached to a request.
@@ -30,6 +34,8 @@ type User struct {
 	Subject  string `json:"subject"`
 	Provider string `json:"provider"` // okta | local
 	Role     Role   `json:"role"`
+	// TokenProject is set for an API token bound to one project.
+	TokenProject *uuid.UUID `json:"-"`
 }
 
 type claims struct {
@@ -132,7 +138,8 @@ func (s *Sessions) Require(role Role) func(http.Handler) http.Handler {
 				http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 				return
 			}
-			if !u.Role.Allows(role) {
+			// RoleNone admits any signed-in user; what they may reach is decided per project.
+			if role != RoleNone && !u.Role.Allows(role) {
 				http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 				return
 			}

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
+	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
 var (
@@ -33,7 +34,9 @@ type LibraryItem struct {
 	Type      string         `json:"type"`
 	Params    map[string]any `json:"params"`
 	CreatedBy string         `json:"created_by"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	// ProjectID is the project the item belongs to; nil means unassigned.
+	ProjectID *uuid.UUID `json:"project_id"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // Library stores reusable components.
@@ -57,17 +60,18 @@ func scanItem(row pgx.CollectableRow) (LibraryItem, error) {
 		it  LibraryItem
 		raw []byte
 	)
-	if err := row.Scan(&it.ID, &it.Kind, &it.Name, &it.Type, &raw, &it.CreatedBy, &it.UpdatedAt); err != nil {
+	if err := row.Scan(&it.ID, &it.Kind, &it.Name, &it.Type, &raw, &it.CreatedBy, &it.UpdatedAt, &it.ProjectID); err != nil {
 		return it, err
 	}
 	return it, json.Unmarshal(raw, &it.Params)
 }
 
-const itemColumns = `id, kind, name, type, params, created_by, updated_at`
+const itemColumns = `id, kind, name, type, params, created_by, updated_at, project_id`
 
 // List returns all items by kind and name.
-func (l *Library) List(ctx context.Context) ([]LibraryItem, error) {
-	rows, err := l.db.Query(ctx, `SELECT `+itemColumns+` FROM library_components ORDER BY kind, name`)
+func (l *Library) List(ctx context.Context, scope targeting.Scope) ([]LibraryItem, error) {
+	where, args := scope.Where("project_id", 1)
+	rows, err := l.db.Query(ctx, `SELECT `+itemColumns+` FROM library_components WHERE `+where+` ORDER BY kind, name`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +79,8 @@ func (l *Library) List(ctx context.Context) ([]LibraryItem, error) {
 }
 
 // Save creates an item, or replaces the settings of the item with the given ID.
-func (l *Library) Save(ctx context.Context, id *uuid.UUID, kind, name, typ string, params map[string]any, by string) (*LibraryItem, []agentconfig.Issue, error) {
+// project is only used when creating; an item stays in the project it was created in.
+func (l *Library) Save(ctx context.Context, id *uuid.UUID, project *uuid.UUID, kind, name, typ string, params map[string]any, by string) (*LibraryItem, []agentconfig.Issue, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, []agentconfig.Issue{{Severity: agentconfig.SeverityError, Message: "name is required"}}, nil
@@ -90,8 +95,8 @@ func (l *Library) Save(ctx context.Context, id *uuid.UUID, kind, name, typ strin
 	var rows pgx.Rows
 	if id == nil {
 		rows, err = l.db.Query(ctx, `
-INSERT INTO library_components (kind, name, type, params, created_by) VALUES ($1, $2, $3, $4::jsonb, $5)
-RETURNING `+itemColumns, kind, name, typ, raw, by)
+INSERT INTO library_components (kind, name, type, params, created_by, project_id) VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+RETURNING `+itemColumns, kind, name, typ, raw, by, project)
 	} else {
 		// Kind and type are fixed once created: configs referring to the item rely on them.
 		rows, err = l.db.Query(ctx, `
@@ -114,6 +119,16 @@ WHERE id = $1 AND kind = $4 AND type = $5 RETURNING `+itemColumns, *id, name, ra
 	return &it, nil, nil
 }
 
+// ProjectOf returns the project an item belongs to (nil for unassigned).
+func (l *Library) ProjectOf(ctx context.Context, id uuid.UUID) (*uuid.UUID, error) {
+	var project *uuid.UUID
+	err := l.db.QueryRow(ctx, `SELECT project_id FROM library_components WHERE id = $1`, id).Scan(&project)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrLibraryNotFound
+	}
+	return project, err
+}
+
 // Delete removes an item. Configs already saved are unaffected; a pipeline
 // that still refers to it reports the missing item when next opened.
 func (l *Library) Delete(ctx context.Context, id uuid.UUID) error {
@@ -129,7 +144,8 @@ func (l *Library) Delete(ctx context.Context, id uuid.UUID) error {
 
 // Resolve returns a copy of spec in which every component that refers to a
 // library item carries that item's current type and settings.
-func (l *Library) Resolve(ctx context.Context, spec Spec) (Spec, []agentconfig.Issue, error) {
+// Items outside the scope are treated as missing.
+func (l *Library) Resolve(ctx context.Context, scope targeting.Scope, spec Spec) (Spec, []agentconfig.Issue, error) {
 	var ids []uuid.UUID
 	groups := []struct {
 		kind, name string
@@ -146,7 +162,8 @@ func (l *Library) Resolve(ctx context.Context, spec Spec) (Spec, []agentconfig.I
 	if len(ids) == 0 {
 		return spec, nil, nil
 	}
-	rows, err := l.db.Query(ctx, `SELECT `+itemColumns+` FROM library_components WHERE id = ANY($1)`, ids)
+	scopeWhere, scopeArgs := scope.Where("project_id", 2)
+	rows, err := l.db.Query(ctx, `SELECT `+itemColumns+` FROM library_components WHERE id = ANY($1) AND `+scopeWhere, append([]any{ids}, scopeArgs...)...)
 	if err != nil {
 		return spec, nil, err
 	}

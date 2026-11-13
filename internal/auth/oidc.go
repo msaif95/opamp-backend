@@ -25,7 +25,7 @@ const (
 
 // ErrNoRole is returned when a user authenticates with the identity
 // provider but belongs to no group mapped to a role.
-var ErrNoRole = errors.New("your account is not in a group that grants access")
+var ErrNoRole = errors.New("your account is not in a group that grants access, and has not been added to any project")
 
 // OIDCConfig configures single sign-on (Okta or any OIDC provider).
 type OIDCConfig struct {
@@ -42,10 +42,12 @@ type OIDCConfig struct {
 
 // OIDC runs the authorization-code flow with PKCE.
 type OIDC struct {
-	cfg      OIDCConfig
-	oauth    oauth2.Config
-	verifier *oidc.IDTokenVerifier
-	key      []byte
+	// IsProjectMember reports whether a subject belongs to any project.
+	IsProjectMember func(ctx context.Context, subject string) bool
+	cfg             OIDCConfig
+	oauth           oauth2.Config
+	verifier        *oidc.IDTokenVerifier
+	key             []byte
 }
 
 // OIDCIdentity is what the identity provider told us about the user.
@@ -153,16 +155,21 @@ func (o *OIDC) Complete(ctx context.Context, flowCookie, state, code string) (*O
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, err
 	}
-	role, ok := o.roleFor(claims[o.cfg.GroupsClaim])
-	if !ok {
-		return nil, ErrNoRole
-	}
+	role, hasRole := o.roleFor(claims[o.cfg.GroupsClaim])
 	id := &OIDCIdentity{ProviderSub: idToken.Subject}
 	id.Email, _ = claims["email"].(string)
 	id.Name, _ = claims["name"].(string)
 	subject := id.Email
 	if subject == "" {
 		subject = idToken.Subject
+	}
+	if !hasRole {
+		// No group grants a global role. Someone an admin has added to a
+		// project may still sign in; they only see their projects.
+		if o.IsProjectMember == nil || !o.IsProjectMember(ctx, subject) {
+			return nil, ErrNoRole
+		}
+		role = RoleNone
 	}
 	id.User = User{Subject: subject, Provider: "okta", Role: role}
 	return id, nil

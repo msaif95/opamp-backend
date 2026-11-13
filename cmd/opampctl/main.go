@@ -22,6 +22,7 @@ const usage = `opampctl - command-line client for OpAMP Fleet
 Connection (flags or environment):
   --url    console URL, e.g. https://opamp.example.com      (OPAMP_URL)
   --token  API token from the console's Agent credentials   (OPAMP_TOKEN)
+  --project  project to act in, by name; omit for resources outside any project   (OPAMP_PROJECT)
 
 Commands:
   agents [--selector k=v,k=v] [--limit N] [-o json]    list collectors
@@ -59,6 +60,7 @@ func run(args []string, out io.Writer) (int, error) {
 	global.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	url := global.String("url", os.Getenv("OPAMP_URL"), "")
 	token := global.String("token", os.Getenv("OPAMP_TOKEN"), "")
+	project := global.String("project", os.Getenv("OPAMP_PROJECT"), "")
 	if err := global.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0, nil
@@ -79,6 +81,11 @@ func run(args []string, out io.Writer) (int, error) {
 		return 1, errors.New("set the console URL and an API token: --url/--token or OPAMP_URL/OPAMP_TOKEN")
 	}
 	c := newClient(*url, *token)
+	if *project != "" {
+		if err := c.useProject(*project); err != nil {
+			return 1, err
+		}
+	}
 
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	output := fs.String("o", "table", "output format: table or json")
@@ -254,7 +261,7 @@ func run(args []string, out io.Writer) (int, error) {
 			}
 			found := false
 			for _, g := range groups {
-				if g.Name == *groupName {
+				if g.Name == *groupName && c.inProject(g.ProjectID) {
 					req["group_id"], req["selector"], found = g.ID, g.Selector, true
 				}
 			}
@@ -269,7 +276,7 @@ func run(args []string, out io.Writer) (int, error) {
 			req["selector"] = sel
 		}
 		var ro rolloutInfo
-		if err := c.do("POST", "/rollouts", req, &ro); err != nil {
+		if err := c.do("POST", "/rollouts", c.projectField(req), &ro); err != nil {
 			return 1, err
 		}
 		fmt.Fprintf(out, "started push %s: %s v%d to %d agents in %d batches\n", ro.ID, ro.ConfigName, ro.ConfigVersion, ro.TotalAgents, ro.TotalBatches)

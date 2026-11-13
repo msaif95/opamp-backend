@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/open-telemetry/opamp-go/protobufs"
 
+	"github.com/msaif95/opamp-backend/internal/access"
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/targeting"
@@ -67,7 +68,7 @@ func newEnv(t *testing.T) *env {
 	e.svc.OnOutcome = func(_ context.Context, outcome string, _ *Rollout) { e.outcomes = append(e.outcomes, outcome) }
 
 	configs := agentconfig.NewService(db)
-	tmpl, v1, err := configs.Create(ctx, "cfg", "", bodyV1, "tester", nil)
+	tmpl, v1, err := configs.Create(ctx, nil, "cfg", "", bodyV1, "tester", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +414,7 @@ func TestCreateRejectsEmptyTarget(t *testing.T) {
 	if !errors.Is(err, ErrNoAgents) {
 		t.Fatalf("err = %v, want ErrNoAgents", err)
 	}
-	if list, _ := e.svc.List(ctx); len(list) != 0 {
+	if list, _ := e.svc.List(ctx, access.All); len(list) != 0 {
 		t.Fatalf("a rollout with no agents was left behind: %+v", list)
 	}
 }
@@ -421,7 +422,7 @@ func TestCreateRejectsEmptyTarget(t *testing.T) {
 func TestGroupConfigReachesAgentsThatJoinAfterTheRollout(t *testing.T) {
 	e := newEnv(t)
 	groups := targeting.NewGroups(e.db)
-	grp, err := groups.Create(ctx, "prod", "", targeting.Selector{"env": {"prod"}})
+	grp, err := groups.Create(ctx, nil, "prod", "", targeting.Selector{"env": {"prod"}})
 	if err != nil {
 		t.Fatal(err)
 	}

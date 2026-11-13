@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/msaif95/opamp-backend/internal/access"
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/testdb"
@@ -18,17 +19,17 @@ func TestLibrary(t *testing.T) {
 	ctx := context.Background()
 	lib := pipeline.NewLibrary(db)
 
-	if _, issues, _ := lib.Save(ctx, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{}, "alice"); len(issues) == 0 {
+	if _, issues, _ := lib.Save(ctx, nil, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{}, "alice"); len(issues) == 0 {
 		t.Fatal("item with a missing required setting was accepted")
 	}
-	if _, issues, _ := lib.Save(ctx, nil, pipeline.KindDestination, "gw", "nope", nil, "alice"); len(issues) == 0 {
+	if _, issues, _ := lib.Save(ctx, nil, nil, pipeline.KindDestination, "gw", "nope", nil, "alice"); len(issues) == 0 {
 		t.Fatal("unknown type accepted")
 	}
-	gw, issues, err := lib.Save(ctx, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{"endpoint": "old:4317"}, "alice")
+	gw, issues, err := lib.Save(ctx, nil, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{"endpoint": "old:4317"}, "alice")
 	if err != nil || len(issues) != 0 {
 		t.Fatalf("save: %v %+v", err, issues)
 	}
-	if _, _, err := lib.Save(ctx, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{"endpoint": "x:1"}, "alice"); !errors.Is(err, pipeline.ErrLibraryNameTaken) {
+	if _, _, err := lib.Save(ctx, nil, nil, pipeline.KindDestination, "gw", "otlp_grpc", map[string]any{"endpoint": "x:1"}, "alice"); !errors.Is(err, pipeline.ErrLibraryNameTaken) {
 		t.Fatalf("duplicate name: %v", err)
 	}
 
@@ -38,7 +39,7 @@ func TestLibrary(t *testing.T) {
 	}
 	render := func() string {
 		t.Helper()
-		resolved, issues, err := lib.Resolve(ctx, spec)
+		resolved, issues, err := lib.Resolve(ctx, access.All, spec)
 		if err != nil || len(issues) != 0 {
 			t.Fatalf("resolve: %v %+v", err, issues)
 		}
@@ -57,33 +58,33 @@ func TestLibrary(t *testing.T) {
 	}
 
 	// Changing the item changes what the same pipeline renders next time.
-	if _, _, err := lib.Save(ctx, &gw.ID, pipeline.KindDestination, "gateway", "otlp_grpc", map[string]any{"endpoint": "new:4317"}, "bob"); err != nil {
+	if _, _, err := lib.Save(ctx, &gw.ID, nil, pipeline.KindDestination, "gateway", "otlp_grpc", map[string]any{"endpoint": "new:4317"}, "bob"); err != nil {
 		t.Fatal(err)
 	}
 	if body := render(); !strings.Contains(body, "new:4317") || strings.Contains(body, "old:4317") {
 		t.Fatal("updated library settings not used")
 	}
 	// Type cannot change under configs that use the item.
-	if _, _, err := lib.Save(ctx, &gw.ID, pipeline.KindDestination, "gateway", "otlp_http", map[string]any{"endpoint": "https://x"}, "bob"); !errors.Is(err, pipeline.ErrLibraryNotFound) {
+	if _, _, err := lib.Save(ctx, &gw.ID, nil, pipeline.KindDestination, "gateway", "otlp_http", map[string]any{"endpoint": "https://x"}, "bob"); !errors.Is(err, pipeline.ErrLibraryNotFound) {
 		t.Fatalf("type change: %v", err)
 	}
 
 	// A source item cannot be used as a destination, and a deleted item is reported.
-	src, _, _ := lib.Save(ctx, nil, pipeline.KindSource, "in", "otlp", nil, "alice")
+	src, _, _ := lib.Save(ctx, nil, nil, pipeline.KindSource, "in", "otlp", nil, "alice")
 	wrong := pipeline.Spec{Sources: []pipeline.Component{{Type: "otlp"}}, Destinations: []pipeline.Component{{Library: &src.ID}}}
-	if _, issues, _ := lib.Resolve(ctx, wrong); len(issues) != 1 {
+	if _, issues, _ := lib.Resolve(ctx, access.All, wrong); len(issues) != 1 {
 		t.Fatalf("source used as destination: %+v", issues)
 	}
 	if err := lib.Delete(ctx, gw.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, issues, _ := lib.Resolve(ctx, spec); len(issues) != 1 || !strings.Contains(issues[0].Message, "no longer exists") {
+	if _, issues, _ := lib.Resolve(ctx, access.All, spec); len(issues) != 1 || !strings.Contains(issues[0].Message, "no longer exists") {
 		t.Fatalf("deleted item: %+v", issues)
 	}
 	if err := lib.Delete(ctx, uuid.New()); !errors.Is(err, pipeline.ErrLibraryNotFound) {
 		t.Fatalf("delete unknown: %v", err)
 	}
-	if items, _ := lib.List(ctx); len(items) != 1 || items[0].Name != "in" {
+	if items, _ := lib.List(ctx, access.All); len(items) != 1 || items[0].Name != "in" {
 		t.Fatalf("list = %+v", items)
 	}
 }

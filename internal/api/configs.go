@@ -17,7 +17,7 @@ import (
 )
 
 func (s *Server) listConfigs(w http.ResponseWriter, r *http.Request) {
-	configs, err := s.Configs.List(r.Context())
+	configs, err := s.Configs.List(r.Context(), scopeOf(r.Context()))
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -43,6 +43,9 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := s.allowConfig(w, r, id, auth.RoleViewer); !ok {
+		return
+	}
 	t, versions, err := s.Configs.Get(r.Context(), id)
 	if err != nil {
 		s.configError(w, r, err)
@@ -61,6 +64,9 @@ func (s *Server) getConfigVersion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "version must be a number")
 		return
 	}
+	if _, ok := s.allowConfig(w, r, id, auth.RoleViewer); !ok {
+		return
+	}
 	v, err := s.Configs.VersionByNumber(r.Context(), id, n)
 	if err != nil {
 		s.configError(w, r, err)
@@ -76,8 +82,10 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		Body        string `json:"body"`
 		// Builder, if set, is a pipeline from the config builder; the body is rendered from it.
 		Builder *pipeline.Spec `json:"builder"`
+		// ProjectID is the project that will own the config; omit for unassigned.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
-	if !decode(w, r, &req) {
+	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleOperator) {
 		return
 	}
 	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
@@ -90,7 +98,7 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := auth.UserFrom(r.Context())
-	t, v, err := s.Configs.Create(r.Context(), req.Name, req.Description, req.Body, u.Subject, spec)
+	t, v, err := s.Configs.Create(r.Context(), req.ProjectID, req.Name, req.Description, req.Body, u.Subject, spec)
 	if err != nil {
 		s.configError(w, r, err)
 		return
@@ -113,6 +121,9 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if _, ok := s.allowConfig(w, r, id, auth.RoleOperator); !ok {
+		return
+	}
 	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
 	if !ok {
 		return
@@ -131,6 +142,9 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteConfig(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r, "id")
 	if !ok {
+		return
+	}
+	if _, ok := s.allowConfig(w, r, id, auth.RoleOperator); !ok {
 		return
 	}
 	if err := s.Configs.Delete(r.Context(), id); err != nil {
@@ -157,6 +171,19 @@ func (s *Server) assignConfig(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Configs.Version(r.Context(), req.ConfigVersionID)
 	if err != nil {
 		s.configError(w, r, err)
+		return
+	}
+	agentProject, ok := s.allowAgent(w, r, uid, auth.RoleOperator)
+	if !ok {
+		return
+	}
+	configProject, ok := s.allowConfig(w, r, v.TemplateID, auth.RoleViewer)
+	if !ok {
+		return
+	}
+	// Only a global admin may push a config from one project to a collector in another.
+	if !sameProject(agentProject, configProject) && !scopeOf(r.Context()).Admin {
+		writeError(w, http.StatusConflict, "the config and the collector are in different projects")
 		return
 	}
 	err = s.Registry.SetDesiredConfig(r.Context(), uid, v.ID)
@@ -219,7 +246,7 @@ func (s *Server) builderRender(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &spec) {
 		return
 	}
-	resolved, issues, err := s.Library.Resolve(r.Context(), spec)
+	resolved, issues, err := s.Library.Resolve(r.Context(), scopeOf(r.Context()), spec)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -239,7 +266,7 @@ func (s *Server) renderBuilder(w http.ResponseWriter, r *http.Request, spec *pip
 		return nil, true
 	}
 	// The stored spec keeps its library references; only the rendering uses the items' current settings.
-	resolved, issues, err := s.Library.Resolve(r.Context(), *spec)
+	resolved, issues, err := s.Library.Resolve(r.Context(), scopeOf(r.Context()), *spec)
 	if err != nil {
 		s.internal(w, r, err)
 		return nil, false
@@ -262,7 +289,7 @@ func (s *Server) renderBuilder(w http.ResponseWriter, r *http.Request, spec *pip
 }
 
 func (s *Server) listLibrary(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Library.List(r.Context())
+	items, err := s.Library.List(r.Context(), scopeOf(r.Context()))
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -285,12 +312,21 @@ func (s *Server) saveLibraryItem(w http.ResponseWriter, r *http.Request) {
 		Name   string         `json:"name"`
 		Type   string         `json:"type"`
 		Params map[string]any `json:"params"`
+		// ProjectID is used when creating; an item stays in its project afterwards.
+		ProjectID *uuid.UUID `json:"project_id"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
+	if id == nil {
+		if !s.targetProject(w, r, req.ProjectID, auth.RoleOperator) {
+			return
+		}
+	} else if !s.allowLibraryItem(w, r, *id) {
+		return
+	}
 	u, _ := auth.UserFrom(r.Context())
-	item, issues, err := s.Library.Save(r.Context(), id, req.Kind, req.Name, req.Type, req.Params, u.Subject)
+	item, issues, err := s.Library.Save(r.Context(), id, req.ProjectID, req.Kind, req.Name, req.Type, req.Params, u.Subject)
 	switch {
 	case errors.Is(err, pipeline.ErrLibraryNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
@@ -315,6 +351,9 @@ func (s *Server) deleteLibraryItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.allowLibraryItem(w, r, id) {
+		return
+	}
 	err := s.Library.Delete(r.Context(), id)
 	if errors.Is(err, pipeline.ErrLibraryNotFound) {
 		writeError(w, http.StatusNotFound, err.Error())
@@ -327,4 +366,18 @@ func (s *Server) deleteLibraryItem(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFrom(r.Context())
 	s.audit(r.Context(), u.Subject, u.Provider, "library.delete", "library_item", id.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// allowLibraryItem checks the caller may change a library item.
+func (s *Server) allowLibraryItem(w http.ResponseWriter, r *http.Request, id uuid.UUID) bool {
+	project, err := s.Library.ProjectOf(r.Context(), id)
+	if errors.Is(err, pipeline.ErrLibraryNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return false
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return false
+	}
+	return s.allow(w, r, project, auth.RoleOperator)
 }

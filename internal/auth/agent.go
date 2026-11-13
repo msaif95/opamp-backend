@@ -113,8 +113,10 @@ WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '5 mi
 
 // APIKey is a credential record; Secret is only populated at issuance.
 type APIKey struct {
-	ID        uuid.UUID  `json:"id"`
-	Name      string     `json:"name"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	// ProjectID is the project that collectors connecting with this key join; nil means unassigned.
+	ProjectID *uuid.UUID `json:"project_id"`
 	Secret    string     `json:"secret,omitempty"`
 	CreatedBy string     `json:"created_by"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -125,32 +127,54 @@ type APIKey struct {
 
 // IssueAPIKey creates a new agent API key. The secret is returned once and
 // only its SHA-256 is stored.
-func (a *AgentAuthenticator) IssueAPIKey(ctx context.Context, name, createdBy string, expiresAt *time.Time) (*APIKey, error) {
+func (a *AgentAuthenticator) IssueAPIKey(ctx context.Context, name string, project *uuid.UUID, createdBy string, expiresAt *time.Time) (*APIKey, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, err
 	}
-	k := &APIKey{Name: name, CreatedBy: createdBy, ExpiresAt: expiresAt,
+	k := &APIKey{Name: name, ProjectID: project, CreatedBy: createdBy, ExpiresAt: expiresAt,
 		Secret: apiKeyPrefix + base64.RawURLEncoding.EncodeToString(raw)}
 	sum := sha256.Sum256([]byte(k.Secret))
 	err := a.db.QueryRow(ctx, `
-INSERT INTO credentials (kind, name, key_hash, created_by, expires_at)
-VALUES ('api_key', $1, $2, $3, $4) RETURNING id, created_at`,
-		name, sum[:], createdBy, expiresAt).Scan(&k.ID, &k.CreatedAt)
+INSERT INTO credentials (kind, name, key_hash, created_by, expires_at, project_id)
+VALUES ('api_key', $1, $2, $3, $4, $5) RETURNING id, created_at`,
+		name, sum[:], createdBy, expiresAt, project).Scan(&k.ID, &k.CreatedAt)
 	return k, err
+}
+
+// SetAPIKeyProject moves a key, and every collector that connects with it,
+// to a project (nil for unassigned). It returns how many collectors moved.
+func (a *AgentAuthenticator) SetAPIKeyProject(ctx context.Context, id uuid.UUID, project *uuid.UUID) (int64, error) {
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE credentials SET project_id = $2 WHERE id = $1 AND kind = 'api_key'`, id, project)
+	if err != nil {
+		return 0, err
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, pgx.ErrNoRows
+	}
+	moved, err := tx.Exec(ctx, `UPDATE agents SET project_id = $2 WHERE credential_id = $1`, id, project)
+	if err != nil {
+		return 0, err
+	}
+	return moved.RowsAffected(), tx.Commit(ctx)
 }
 
 // ListAPIKeys returns all API key credentials (without secrets).
 func (a *AgentAuthenticator) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := a.db.Query(ctx, `
-SELECT id, name, created_by, created_at, expires_at, revoked_at, last_used_at
+SELECT id, name, created_by, created_at, expires_at, revoked_at, last_used_at, project_id
 FROM credentials WHERE kind = 'api_key' ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (APIKey, error) {
 		var k APIKey
-		err := row.Scan(&k.ID, &k.Name, &k.CreatedBy, &k.CreatedAt, &k.ExpiresAt, &k.RevokedAt, &k.LastUsed)
+		err := row.Scan(&k.ID, &k.Name, &k.CreatedBy, &k.CreatedAt, &k.ExpiresAt, &k.RevokedAt, &k.LastUsed, &k.ProjectID)
 		return k, err
 	})
 }

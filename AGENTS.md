@@ -121,3 +121,12 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - `cmd/opampctl`: CLI over the console API (`make build` → `bin/opampctl`). `apply -f` is idempotent create/update
   of `kind: Config` / `kind: Group` YAML and never deletes or pushes; `push --wait` exits 2 unless completed.
   Its tests use a fake API server; add a case there when adding a resource kind.
+- Projects (`internal/access`, tables `projects`, `project_members`, `project_id` on credentials, agents,
+  config_templates, agent_groups, rollouts, library_components, api_tokens). `access.Scope` = global admin, a global
+  role that covers unassigned (NULL project) resources, and a role per project. Routes only require sign-in
+  (`Sessions.Require(auth.RoleNone)` + `withScope`); every handler must filter lists with `scopeOf(ctx)` and check
+  single resources with `s.allow` / `allowAgent` / `allowConfig` / `allowGroup` / `targetProject`. Something the
+  caller cannot view answers 404, not 403. A collector takes the project of its API key at connect; selectors are
+  always evaluated inside one project (`Selector.WhereIn`), so groups and pushes never cross projects.
+  `internal/api/access_integration_test.go` is the access matrix: extend it with every new endpoint.
+- `opampctl --project <name>` (or `OPAMP_PROJECT`) selects the project commands act in.

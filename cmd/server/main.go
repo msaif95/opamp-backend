@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/msaif95/opamp-backend/internal/access"
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/api"
@@ -288,6 +289,7 @@ func run() error {
 		}
 	}()
 
+	projects := access.NewProjects(db)
 	apiTokens := auth.NewTokens(db)
 	sessions := auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword)
 	sessions.APITokens = apiTokens.Authenticate
@@ -300,6 +302,11 @@ func run() error {
 		}, cfg.JWTSigningKey)
 		if err != nil {
 			return err
+		}
+		// Someone added to a project may sign in without belonging to a role group.
+		sso.IsProjectMember = func(ctx context.Context, subject string) bool {
+			ok, err := projects.IsMember(ctx, subject)
+			return err == nil && ok
 		}
 		log.Info("single sign-on enabled", "issuer", cfg.OktaIssuer)
 	}
@@ -318,7 +325,7 @@ func run() error {
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-			Sessions: sessions, Tokens: apiTokens,
+			Sessions: sessions, Tokens: apiTokens, Projects: projects,
 			// Postgres only. A Redis outage degrades pushes and live updates but
 			// agents and the console keep working, and marking every replica
 			// unready would turn that into a full outage.

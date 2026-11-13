@@ -62,7 +62,9 @@ type ConfigState struct {
 
 // Agent is the API/storage representation of one collector instance.
 type Agent struct {
-	InstanceUID            uuid.UUID         `json:"instance_uid"`
+	InstanceUID uuid.UUID `json:"instance_uid"`
+	// ProjectID is the project the collector belongs to; nil means unassigned.
+	ProjectID              *uuid.UUID        `json:"project_id"`
 	ConnectorType          string            `json:"connector_type"`
 	AuthMode               string            `json:"auth_mode"`
 	Attributes             map[string]string `json:"attributes"`
@@ -270,16 +272,19 @@ INSERT INTO agents (
     healthy, health_status, health_last_error, health,
     effective_config_hash, effective_config,
     remote_config_hash, remote_config_status, remote_config_error,
-    connected, sequence_num, last_seen)
+    connected, sequence_num, last_seen, project_id)
 VALUES (
     $1, $2::auth_mode, $3, COALESCE($4::jsonb, '{}'::jsonb), $5, $6,
     $7, $8, $9, $10::jsonb,
     $11, $12,
     $13, COALESCE($14::remote_config_status, 'unset'), $15,
-    TRUE, $16, now())
+    TRUE, $16, now(), (SELECT project_id FROM credentials WHERE id = $3))
 ON CONFLICT (instance_uid) DO UPDATE SET
     auth_mode             = EXCLUDED.auth_mode,
     credential_id         = EXCLUDED.credential_id,
+    -- A collector belongs to the project of the API key it connects with.
+    -- Certificate-authenticated collectors keep the project an admin gave them.
+    project_id            = CASE WHEN $3::uuid IS NULL THEN agents.project_id ELSE EXCLUDED.project_id END,
     attributes            = COALESCE($4::jsonb, agents.attributes),
     capabilities          = EXCLUDED.capabilities,
     agent_version         = COALESCE($6, agents.agent_version),
@@ -443,6 +448,31 @@ func (r *Registry) RequestPush(ctx context.Context, uids ...uuid.UUID) error {
 			return fmt.Errorf("publish push requests: %w", err)
 		}
 	}
+	return nil
+}
+
+// ProjectOf returns the project an agent belongs to (nil for unassigned).
+func (r *Registry) ProjectOf(ctx context.Context, uid uuid.UUID) (*uuid.UUID, error) {
+	var project *uuid.UUID
+	err := r.db.QueryRow(ctx, `SELECT project_id FROM agents WHERE instance_uid = $1`, uid).Scan(&project)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return project, err
+}
+
+// SetProject moves an agent to a project (nil for unassigned). Collectors
+// that connect with an API key are moved back to the key's project when
+// they next reconnect, so this is for certificate-authenticated ones.
+func (r *Registry) SetProject(ctx context.Context, uid uuid.UUID, project *uuid.UUID) error {
+	tag, err := r.db.Exec(ctx, `UPDATE agents SET project_id = $2 WHERE instance_uid = $1`, uid, project)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	r.publish(ctx, "agent.updated", uid)
 	return nil
 }
 
@@ -610,7 +640,7 @@ UPDATE agents SET connected = FALSE WHERE instance_uid IN (
 const agentColumns = `instance_uid, connector_type::text, auth_mode::text, attributes, capabilities, agent_version,
     healthy, health_status, health_last_error, effective_config_hash, remote_config_hash,
     remote_config_status::text, remote_config_error, desired_config_version_id, connected, first_seen, last_seen,
-    cv.template_id, ct.name, cv.version, a.paused,
+    cv.template_id, ct.name, cv.version, a.paused, a.project_id,
     COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE)`
 
 const agentFrom = ` FROM agents a
@@ -631,6 +661,10 @@ type ListFilter struct {
 	Selector interface {
 		Where(attributesColumn string, firstParam int) (string, []any)
 	}
+	// Scope, if set, limits results to projects the caller may view.
+	Scope Scope
+	// Project, if set, narrows to one project (or to unassigned agents).
+	Project   *ProjectRef
 	Connected *bool
 	Healthy   *bool
 	// ConfigStatus filters on remote_config_status (unset, applied, applying, failed).
@@ -640,6 +674,28 @@ type ListFilter struct {
 	Desc   bool
 	Limit  int
 	Offset int
+}
+
+// Scope limits rows to the projects a caller may view (see access.Scope).
+type Scope interface {
+	Where(projectColumn string, firstParam int) (string, []any)
+}
+
+// ProjectRef names one project, or the unassigned pool when ID is nil.
+type ProjectRef struct{ ID *uuid.UUID }
+
+// scopeWhere renders the scope and project conditions for the agents table aliased "a".
+func scopeWhere(scope Scope, project *ProjectRef, args []any) (string, []any) {
+	cond := "TRUE"
+	if scope != nil {
+		w, a := scope.Where("a.project_id", len(args)+1)
+		cond, args = w, append(args, a...)
+	}
+	if project != nil {
+		args = append(args, project.ID)
+		cond += fmt.Sprintf(" AND a.project_id IS NOT DISTINCT FROM $%d", len(args))
+	}
+	return cond, args
 }
 
 // List returns agents matching the filter, plus the total match count.
@@ -660,7 +716,8 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 		selWhere, selArgs = f.Selector.Where("attributes", len(args)+1)
 		args = append(args, selArgs...)
 	}
-	filter := where + ` AND ` + selWhere
+	scopeCond, args := scopeWhere(f.Scope, f.Project, args)
+	filter := where + ` AND ` + selWhere + ` AND ` + scopeCond
 	limitParams := fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 
 	dir := "ASC"
@@ -673,7 +730,7 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 	}
 
 	var total int
-	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents`+filter, args...).Scan(&total); err != nil {
+	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents a`+filter, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := r.db.Query(ctx,
@@ -713,15 +770,16 @@ type Summary struct {
 }
 
 // Summarize returns fleet-wide counts.
-func (r *Registry) Summarize(ctx context.Context) (Summary, error) {
+func (r *Registry) Summarize(ctx context.Context, scope Scope, project *ProjectRef) (Summary, error) {
 	var s Summary
+	cond, args := scopeWhere(scope, project, nil)
 	err := r.db.QueryRow(ctx, `
 SELECT count(*),
        count(*) FILTER (WHERE connected),
        count(*) FILTER (WHERE connected AND healthy),
        count(*) FILTER (WHERE connected AND healthy = FALSE),
        count(*) FILTER (WHERE remote_config_status = 'failed')
-FROM agents`).Scan(&s.Total, &s.Connected, &s.Healthy, &s.Unhealthy, &s.ConfigFailed)
+FROM agents a WHERE `+cond, args...).Scan(&s.Total, &s.Connected, &s.Healthy, &s.Unhealthy, &s.ConfigFailed)
 	return s, err
 }
 
@@ -754,12 +812,13 @@ type FacetValue struct {
 
 // Facets returns the low-cardinality attributes present in the fleet, for
 // building selectors (region, cloud, datacenter, env, team, ...).
-func (r *Registry) Facets(ctx context.Context) ([]Facet, error) {
+func (r *Registry) Facets(ctx context.Context, scope Scope, project *ProjectRef) ([]Facet, error) {
+	cond, args := scopeWhere(scope, project, []any{maxFacetValues})
 	rows, err := r.db.Query(ctx, `
 SELECT key, value, n FROM (
     SELECT key, value, count(*) AS n, count(*) OVER (PARTITION BY key) AS distinct_values
-    FROM agents, jsonb_each_text(attributes) GROUP BY key, value) t
-WHERE distinct_values <= $1 ORDER BY key, n DESC, value`, maxFacetValues)
+    FROM agents a, jsonb_each_text(a.attributes) WHERE `+cond+` GROUP BY key, value) t
+WHERE distinct_values <= $1 ORDER BY key, n DESC, value`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -794,7 +853,7 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	err := row.Scan(&a.InstanceUID, &a.ConnectorType, &a.AuthMode, &attrs, &caps, &a.AgentVersion,
 		&a.Healthy, &a.HealthStatus, &a.HealthLastError, &a.EffectiveConfigHash, &a.RemoteConfigHash,
 		&a.RemoteConfigStatus, &a.RemoteConfigError, &a.DesiredConfigVersionID, &a.Connected, &a.FirstSeen, &a.LastSeen,
-		&tmplID, &tmplName, &version, &a.Paused, &inSync)
+		&tmplID, &tmplName, &version, &a.Paused, &a.ProjectID, &inSync)
 	if err != nil {
 		return a, err
 	}
