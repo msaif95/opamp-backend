@@ -1,5 +1,11 @@
+DROP TRIGGER IF EXISTS agents_record_events_update ON agents;
+DROP TRIGGER IF EXISTS agents_record_events_insert ON agents;
+DROP FUNCTION IF EXISTS record_agent_events();
+DROP TABLE IF EXISTS agent_events;
+DROP TABLE IF EXISTS library_components;
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS api_tokens;
 DROP TABLE IF EXISTS audit_events;
-DROP TABLE IF EXISTS role_assignments;
 DROP TABLE IF EXISTS users;
 ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_credential_fk;
 DROP TABLE IF EXISTS credentials;
@@ -10,5 +16,7 @@ ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_desired_config_fk;
 DROP TABLE IF EXISTS config_versions;
 DROP TABLE IF EXISTS config_templates;
 DROP TABLE IF EXISTS agents;
+DROP TABLE IF EXISTS project_members;
+DROP TABLE IF EXISTS projects;
 DROP TYPE IF EXISTS rbac_role, identity_provider, credential_kind, rollout_agent_status, rollout_status,
     config_origin, remote_config_status, auth_mode, connector_type;

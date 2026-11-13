@@ -123,7 +123,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			_, err = fmt.Fprintf(w, "data: %s\n\n", payload)
+			// Clients only use an event as a cue to refetch what they are allowed
+			// to see. The payload (which agent, which replica) is not sent, so
+			// the stream reveals nothing about projects the user cannot view.
+			_ = payload
+			_, err = fmt.Fprint(w, "data: {\"type\":\"changed\"}\n\n")
 		case <-tick.C:
 			_, err = fmt.Fprint(w, ": keepalive\n\n")
 		}

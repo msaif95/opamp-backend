@@ -93,7 +93,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   Endpoints: `GET /configs/builder/catalog`, `POST /configs/builder/render`; `POST /configs` and
   `/configs/{id}/versions` accept `builder` instead of `body`. When adding a catalog type, render it and run
   `otelcol-contrib validate --config` on the result; all 15 current types passed that against contrib 0.164.0.
-- The second migration is `000002_runtime_additions` (settings, group config, builder spec).
+- The schema is one migration, `000001_init` (squashed again before first production use). After the first
+  production deployment, add `00000N_<name>` files and never edit an applied one.
 - Builder library (`internal/pipeline/library.go`, table `library_components`): saved sources/processors/destinations.
   A spec component may carry `library: <id>`; `Library.Resolve` substitutes the item's current settings at render and
   save time, and the stored spec keeps only the reference. Saved config versions are never rewritten when an item
@@ -137,3 +138,5 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   first_seen, connected, offline, healthy, unhealthy, config_assigned/unassigned, config_applied/failed (with
   config name, version, error), collection_stopped/resumed, collector_version_changed. Pruned after
   `AGENT_EVENT_RETENTION_DAYS` (90). A new tracked column needs the trigger's WHEN clause and body updated.
+- The SSE stream (`/api/v1/events`) sends only a generic "changed" cue, never agent IDs: any signed-in user can
+  open it, so it must not reveal other projects' activity.
