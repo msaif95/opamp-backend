@@ -20,6 +20,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
+	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
@@ -27,6 +28,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/testdb"
+	"github.com/msaif95/opamp-backend/internal/throughput"
 )
 
 const collectorYAML = "receivers:\n  otlp:\nexporters:\n  debug:\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [debug]\n"
@@ -127,6 +129,10 @@ func TestProjectAccess(t *testing.T) {
 		Tokens: tokens, Projects: projects, Secrets: secretStore, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
 		Throughput: func(context.Context, uuid.UUID) (*throughputSample, error) { return nil, nil },
 		History:    func(context.Context, uuid.UUID) ([]throughputPoint, error) { return nil, nil },
+		AllMetrics: func(context.Context, uuid.UUID) ([]throughput.Series, []throughput.MetricSample, error) {
+			return nil, nil, nil
+		},
+		Traces: func(context.Context, uuid.UUID) ([]owntraces.Span, error) { return nil, nil },
 		Logs: func(context.Context, uuid.UUID, int) ([]ownlogs.Line, error) {
 			return []ownlogs.Line{{Message: "hello"}}, nil
 		},
@@ -222,6 +228,9 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("alice reads unassigned config", first(h.call(alice, "GET", "/configs/"+cU, nil)), 404)
 	h.expect("bob reads project config", first(h.call(bob, "GET", "/configs/"+cA+"/versions/1", nil)), 404)
 	h.expect("carol reads agent metrics", first(h.call(carol, "GET", "/agents/"+a1+"/metrics", nil)), 404)
+	h.expect("carol reads agent traces", first(h.call(carol, "GET", "/agents/"+a1+"/traces", nil)), 404)
+	h.expect("carol reads all agent metrics", first(h.call(carol, "GET", "/agents/"+a1+"/metrics/all", nil)), 404)
+	h.expect("alice reads traces of an agent in B", first(h.call(alice, "GET", "/agents/"+b1+"/traces", nil)), 200)
 	h.expect("carol reads agent logs", first(h.call(carol, "GET", "/agents/"+a1+"/logs", nil)), 404)
 	h.expect("alice reads logs of an agent in B", first(h.call(alice, "GET", "/agents/"+b1+"/logs", nil)), 200)
 

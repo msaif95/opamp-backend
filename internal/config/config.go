@@ -27,10 +27,10 @@ type Config struct {
 	// activity; SessionMaxAge signs them out regardless.
 	SessionIdleTimeout time.Duration
 	SessionMaxAge      time.Duration
-	// OwnTracesEndpoint is where collectors that report their own traces are
-	// told to send them (an OTLP/HTTP traces URL, typically the tracing
-	// backend's .../v1/traces). OwnTracesHeaders are sent with them, e.g. an
-	// API key. Empty endpoint: collectors are not asked for traces.
+	// OwnTracesEndpoint is where this backend forwards a copy of the traces
+	// collectors send about themselves (an OTLP/HTTP traces URL, typically
+	// the tracing backend's .../v1/traces). OwnTracesHeaders are sent with
+	// them, e.g. an API key. Empty endpoint: traces are only kept here.
 	OwnTracesEndpoint string
 	OwnTracesHeaders  map[string]string
 	// SecretsKey encrypts secrets referenced from configs; empty disables them.

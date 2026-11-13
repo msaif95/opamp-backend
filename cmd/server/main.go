@@ -3,16 +3,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/events"
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
+	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
@@ -134,18 +136,45 @@ func run() error {
 	handler := protocol.NewHandler(reg, configs, log)
 	collectorLogs := ownlogs.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
 	// One offer covering whichever of its own metrics, logs and traces a
-	// collector says it can report: metrics and logs come to this backend,
-	// traces go straight to the tracing backend named in the deployment.
-	var ownTraces *protobufs.TelemetryConnectionSettings
+	// collector says it can report. All three come to this backend; traces
+	// are also passed on to the tracing backend named in the deployment.
+	collectorTraces := owntraces.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
 	if cfg.OwnTracesEndpoint != "" {
-		ownTraces = &protobufs.TelemetryConnectionSettings{DestinationEndpoint: cfg.OwnTracesEndpoint, Headers: &protobufs.Headers{}}
-		names := make([]string, 0, len(cfg.OwnTracesHeaders))
-		for name := range cfg.OwnTracesHeaders {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			ownTraces.Headers.Headers = append(ownTraces.Headers.Headers, &protobufs.Header{Key: name, Value: cfg.OwnTracesHeaders[name]})
+		forwardWarn := logthrottle.New(30 * time.Second)
+		client := &http.Client{Timeout: 10 * time.Second}
+		slots := make(chan struct{}, 8)
+		collectorTraces.Forward = func(encoding string, body []byte) {
+			select {
+			case slots <- struct{}{}:
+			default:
+				// The tracing backend is slow or down: drop rather than queue without bound.
+				forwardWarn.Do(func(n int64) { log.Warn("own traces not forwarded: too many requests in flight", "similar_dropped", n) })
+				return
+			}
+			go func() {
+				defer func() { <-slots }()
+				req, err := http.NewRequest(http.MethodPost, cfg.OwnTracesEndpoint, bytes.NewReader(body))
+				if err != nil {
+					return
+				}
+				req.Header.Set("Content-Type", "application/x-protobuf")
+				if encoding != "" {
+					req.Header.Set("Content-Encoding", encoding)
+				}
+				for name, value := range cfg.OwnTracesHeaders {
+					req.Header.Set(name, value)
+				}
+				resp, err := client.Do(req)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					if resp.StatusCode < 300 {
+						return
+					}
+					err = fmt.Errorf("HTTP %d", resp.StatusCode)
+				}
+				forwardWarn.Do(func(n int64) { log.Warn("own traces not forwarded", "err", err, "similar_errors_suppressed", n) })
+			}()
 		}
 	}
 	handler.OwnTelemetry = func(uid uuid.UUID, caps uint64) *protobufs.ConnectionSettingsOffers {
@@ -158,7 +187,7 @@ func run() error {
 			offer.OwnLogs = collectorLogs.Settings(uid)
 		}
 		if can(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnTraces) {
-			offer.OwnTraces = ownTraces
+			offer.OwnTraces = collectorTraces.Settings(uid)
 		}
 		if offer.OwnMetrics == nil && offer.OwnLogs == nil && offer.OwnTraces == nil {
 			return nil
@@ -185,13 +214,14 @@ func run() error {
 	}
 	if secretStore.Enabled() {
 		// A collector may log a header it was sent; hide secret values there too.
-		collectorLogs.Redact = func(ctx context.Context, uid uuid.UUID, text string) (string, error) {
+		redactFor := func(ctx context.Context, uid uuid.UUID, text string) (string, error) {
 			project, err := reg.ProjectOf(ctx, uid)
 			if err != nil {
 				return "", err
 			}
 			return secretStore.Redact(ctx, project, text)
 		}
+		collectorLogs.Redact, collectorTraces.Redact = redactFor, redactFor
 		handler.RedactSecrets = func(ctx context.Context, uid uuid.UUID, body string) (string, error) {
 			project, err := reg.ProjectOf(ctx, uid)
 			if errors.Is(err, registry.ErrNotFound) {
@@ -204,7 +234,7 @@ func run() error {
 		}
 	}
 	conns := connection.NewManager(agentAuth, handler, reg, log)
-	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput, ownlogs.IntakePath: collectorLogs}
+	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput, ownlogs.IntakePath: collectorLogs, owntraces.IntakePath: collectorTraces}
 
 	var tlsCfg *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -434,7 +464,7 @@ func run() error {
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-			Logs: collectorLogs.Recent, Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
+			Logs: collectorLogs.Recent, Traces: collectorTraces.Recent, AllMetrics: tput.All, Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
 			// Postgres only. A Redis outage degrades pushes and live updates but
 			// agents and the console keep working, and marking every replica
 			// unready would turn that into a full outage.

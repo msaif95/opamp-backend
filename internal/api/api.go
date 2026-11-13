@@ -23,6 +23,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
+	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
@@ -56,6 +57,10 @@ type Server struct {
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
 	// History returns an agent's recent CPU, memory and throughput samples.
 	History func(ctx context.Context, uid uuid.UUID) ([]throughput.Point, error)
+	// AllMetrics returns every metric series a collector reports about itself, with samples oldest first.
+	AllMetrics func(ctx context.Context, uid uuid.UUID) ([]throughput.Series, []throughput.MetricSample, error)
+	// Traces returns a collector's most recent own spans, newest first.
+	Traces func(ctx context.Context, uid uuid.UUID) ([]owntraces.Span, error)
 	// Logs returns a collector's most recent own log lines, newest first.
 	Logs     func(ctx context.Context, uid uuid.UUID, limit int) ([]ownlogs.Line, error)
 	Settings *settings.Store
@@ -120,6 +125,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/agents/{uid}/metrics", s.agentMetrics)
 			r.Get("/agents/{uid}/events", s.agentEvents)
 			r.Get("/agents/{uid}/logs", s.agentLogs)
+			r.Get("/agents/{uid}/traces", s.agentTraces)
+			r.Get("/agents/{uid}/metrics/all", s.agentAllMetrics)
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
@@ -503,6 +510,40 @@ func (s *Server) agentEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": nonNil(events)})
+}
+
+// agentAllMetrics returns every metric the collector reports about itself.
+func (s *Server) agentAllMetrics(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	if _, ok := s.allowAgent(w, r, uid, auth.RoleViewer); !ok {
+		return
+	}
+	series, samples, err := s.AllMetrics(r.Context(), uid)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"series": nonNil(series), "samples": nonNil(samples), "max_series": throughput.MaxSeries})
+}
+
+// agentTraces returns the collector's own recent spans, newest first.
+func (s *Server) agentTraces(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	if _, ok := s.allowAgent(w, r, uid, auth.RoleViewer); !ok {
+		return
+	}
+	spans, err := s.Traces(r.Context(), uid)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"spans": nonNil(spans), "kept": owntraces.Keep, "kept_hours": int(owntraces.TTL.Hours())})
 }
 
 // agentLogs returns the collector's own recent log lines, newest first.

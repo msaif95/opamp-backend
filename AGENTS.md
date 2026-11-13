@@ -154,7 +154,9 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Stores: outside dev mode `Validate` requires TLS to Postgres and Redis unless `ALLOW_UNENCRYPTED_STORES=true`.
 - `second_approver` switch: the starter of a rollout cannot `resume` it (checked in `rolloutAction`).
 - Own telemetry: `handler.OwnTelemetry` (wired in main) makes one `ConnectionSettingsOffers` per connection from the
-  agent's capabilities: metrics -> `/v1/metrics` (`internal/throughput`), logs -> `/v1/logs` (`internal/ownlogs`,
-  newest 500 lines per agent in Redis for 24h, secrets redacted, `GET /agents/{uid}/logs`), traces -> the
-  deployment's `OWN_TRACES_ENDPOINT` directly. The stock Supervisor (checked at v0.164.0) supports all three; it has
-  no code for "other connection settings", and only relays custom messages to collector components.
+  agent's capabilities, all pointing at this backend's agent port: `/v1/metrics` (`internal/throughput`: headline
+  points plus, in `all.go`, every reported series as rate/gauge/average, max 300 series, 3h), `/v1/logs`
+  (`internal/ownlogs`, newest 500 lines, 24h), `/v1/traces` (`internal/owntraces`, newest 300 spans, 24h, and
+  forwarded unchanged to `OWN_TRACES_ENDPOINT` if set). All in Redis, secrets redacted. The stock Supervisor
+  (checked at v0.164.0) supports all three; it has no code for "other connection settings" and only relays custom
+  messages to collector components.

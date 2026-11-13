@@ -170,9 +170,15 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	now := time.Now().UTC()
+	// Everything the collector reported, for the per-metric charts.
+	if err := s.recordAll(r.Context(), uid, now, extractAll(&req)); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	totals, gauges, delta := extract(&req)
 	if len(totals) > 0 {
-		if err := s.record(r.Context(), uid, time.Now().UTC(), totals, gauges, delta); err != nil {
+		if err := s.record(r.Context(), uid, now, totals, gauges, delta); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
