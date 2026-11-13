@@ -33,3 +33,11 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Agent events (`opamp:agent-events`) are published only for real changes (connect, disconnect, description,
   health, effective config, remote config status), never for plain heartbeats; the UI relies on this to stay calm.
 - `GET /api/v1/agents` defaults to a stable order by `host.name`; `sort=last_seen` reorders on every heartbeat.
+- SSO: `internal/auth/oidc.go` (authorization code + PKCE, state/nonce in a signed short-lived cookie). Roles come
+  from the ID token `groups` claim via `OKTA_ADMIN_GROUPS` / `OKTA_OPERATOR_GROUPS` / `OKTA_VIEWER_GROUPS`; a user in
+  none of them is refused. The callback hands the session token to the UI in the URL fragment.
+  Try it locally with `go run ./cmd/fakeidp -groups sre` + `make run-sso` (fakeidp is dev-only: it signs in anyone).
+- Rollouts: fixed batches or cumulative canary percentages (`canary_steps_pct`); `auto_rollback` rolls back instead
+  of pausing. Rollback restores `rollout_agents.previous_config_version_id`; agents with no previous config keep
+  the new one and are reported. Engine-initiated pauses/rollbacks are audited as actor `system`.
+- Groups (`internal/targeting/groups.go`) are saved selectors with live membership; rollouts snapshot the selector.

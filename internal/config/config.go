@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,12 @@ type Config struct {
 	OktaClientID     string
 	OktaClientSecret string
 	OktaRedirectURL  string
+	// OktaGroupsClaim is the ID token claim listing the user's groups.
+	OktaGroupsClaim string
+	// Okta groups granting each role (comma-separated in the environment).
+	OktaAdminGroups    []string
+	OktaOperatorGroups []string
+	OktaViewerGroups   []string
 
 	// AgentOfflineAfter is how long without a heartbeat before an agent is marked offline.
 	AgentOfflineAfter time.Duration
@@ -64,6 +71,10 @@ func Load() (*Config, error) {
 		OktaClientID:       env("OKTA_CLIENT_ID", ""),
 		OktaClientSecret:   env("OKTA_CLIENT_SECRET", ""),
 		OktaRedirectURL:    env("OKTA_REDIRECT_URL", ""),
+		OktaGroupsClaim:    env("OKTA_GROUPS_CLAIM", "groups"),
+		OktaAdminGroups:    list(env("OKTA_ADMIN_GROUPS", "")),
+		OktaOperatorGroups: list(env("OKTA_OPERATOR_GROUPS", "")),
+		OktaViewerGroups:   list(env("OKTA_VIEWER_GROUPS", "")),
 		MigrationsDir:      env("MIGRATIONS_DIR", "migrations"),
 		LogLevel:           env("LOG_LEVEL", "info"),
 	}
@@ -89,6 +100,17 @@ func Load() (*Config, error) {
 
 // MTLSEnabled reports whether agent client-cert verification is configured.
 func (c *Config) MTLSEnabled() bool { return c.TLSClientCAFile != "" }
+
+// list splits a comma-separated value, dropping blanks.
+func list(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 func env(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {

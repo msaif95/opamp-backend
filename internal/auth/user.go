@@ -58,6 +58,9 @@ func NewSessions(key []byte, localAdminPassword string) *Sessions {
 	return &Sessions{key: key, localAdminPassword: localAdminPassword}
 }
 
+// LocalEnabled reports whether the break-glass local admin login is configured.
+func (s *Sessions) LocalEnabled() bool { return s.localAdminPassword != "" }
+
 // LocalLogin authenticates the break-glass local admin and returns a session token.
 func (s *Sessions) LocalLogin(username, password string) (string, User, error) {
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(localAdmin))

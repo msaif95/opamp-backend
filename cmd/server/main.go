@@ -26,6 +26,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/store"
+	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
 func main() {
@@ -112,10 +113,24 @@ func run() error {
 		}
 	}()
 
+	var sso *auth.OIDC
+	if cfg.OktaIssuer != "" {
+		sso, err = auth.NewOIDC(ctx, auth.OIDCConfig{
+			Issuer: cfg.OktaIssuer, ClientID: cfg.OktaClientID, ClientSecret: cfg.OktaClientSecret,
+			RedirectURL: cfg.OktaRedirectURL, GroupsClaim: cfg.OktaGroupsClaim,
+			AdminGroups: cfg.OktaAdminGroups, OperatorGroups: cfg.OktaOperatorGroups, ViewerGroups: cfg.OktaViewerGroups,
+		}, cfg.JWTSigningKey)
+		if err != nil {
+			return err
+		}
+		log.Info("single sign-on enabled", "issuer", cfg.OktaIssuer)
+	}
+
 	apiSrv := &http.Server{
 		Addr: cfg.APIListenAddr,
 		Handler: (&api.Server{
-			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth, Events: hub, Log: log,
+			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth,
+			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Sessions: auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword),
 			Ready: func(ctx context.Context) error {
 				return errors.Join(db.Ping(ctx), rdb.Ping(ctx).Err())

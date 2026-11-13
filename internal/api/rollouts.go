@@ -44,12 +44,28 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 		ConfigVersionID uuid.UUID          `json:"config_version_id"`
 		Selector        targeting.Selector `json:"selector"`
 		// AllAgents must be true to target the whole fleet with an empty selector.
-		AllAgents     bool    `json:"all_agents"`
-		BatchSize     int     `json:"batch_size"`
-		MaxFailurePct float64 `json:"max_failure_pct"`
+		AllAgents bool `json:"all_agents"`
+		// GroupID targets a saved group; its selector replaces Selector.
+		GroupID       *uuid.UUID `json:"group_id"`
+		BatchSize     int        `json:"batch_size"`
+		CanarySteps   []int      `json:"canary_steps_pct"`
+		MaxFailurePct float64    `json:"max_failure_pct"`
+		AutoRollback  bool       `json:"auto_rollback"`
 	}{BatchSize: rollout.DefaultBatchSize, MaxFailurePct: rollout.DefaultMaxFailurePct}
 	if !decode(w, r, &req) {
 		return
+	}
+	if req.GroupID != nil {
+		grp, err := s.Groups.Get(r.Context(), *req.GroupID)
+		if errors.Is(err, targeting.ErrGroupNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if err != nil {
+			s.internal(w, r, err)
+			return
+		}
+		req.Selector = grp.Selector
 	}
 	if err := req.Selector.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -65,7 +81,10 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := auth.UserFrom(r.Context())
-	ro, err := s.Rollouts.Create(r.Context(), v.ID, req.Selector, req.BatchSize, req.MaxFailurePct, u.Subject)
+	ro, err := s.Rollouts.Create(r.Context(), rollout.Params{
+		VersionID: v.ID, Selector: req.Selector, GroupID: req.GroupID, BatchSize: req.BatchSize,
+		CanarySteps: req.CanarySteps, MaxFailurePct: req.MaxFailurePct, AutoRollback: req.AutoRollback, CreatedBy: u.Subject,
+	})
 	switch {
 	case errors.Is(err, rollout.ErrNoAgents):
 		writeError(w, http.StatusConflict, err.Error())
@@ -79,7 +98,8 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r.Context(), u.Subject, u.Provider, "rollout.start", "rollout", ro.ID.String(), map[string]any{
 		"config_id": v.TemplateID, "version": v.Version, "selector": req.Selector,
-		"agents": ro.TotalAgents, "batch_size": ro.BatchSize, "max_failure_pct": ro.MaxFailurePct,
+		"agents": ro.TotalAgents, "batch_size": ro.BatchSize, "canary_steps_pct": ro.CanarySteps,
+		"max_failure_pct": ro.MaxFailurePct, "auto_rollback": ro.AutoRollback, "group_id": ro.GroupID,
 	})
 	writeJSON(w, http.StatusCreated, ro)
 }

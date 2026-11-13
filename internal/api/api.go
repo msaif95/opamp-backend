@@ -21,6 +21,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
 // Server holds the API dependencies.
@@ -31,8 +32,11 @@ type Server struct {
 	Rollouts *rollout.Service
 	Agents   *auth.AgentAuthenticator
 	Sessions *auth.Sessions
-	Events   http.Handler
-	Log      *slog.Logger
+	// OIDC is nil when single sign-on is not configured.
+	OIDC   *auth.OIDC
+	Groups *targeting.Groups
+	Events http.Handler
+	Log    *slog.Logger
 	// Ready reports whether backing stores are reachable.
 	Ready func(ctx context.Context) error
 }
@@ -52,6 +56,9 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/login", s.login)
+		r.Get("/auth/config", s.authConfig)
+		r.Get("/auth/okta/login", s.oktaLogin)
+		r.Get("/auth/okta/callback", s.oktaCallback)
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleViewer))
@@ -59,6 +66,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/summary", s.summary)
 			r.Get("/agents", s.listAgents)
 			r.Get("/agents/facets", s.agentFacets)
+			r.Get("/groups", s.listGroups)
 			r.Get("/rollouts", s.listRollouts)
 			r.Post("/rollouts/preview", s.previewRollout)
 			r.Get("/rollouts/{id}", s.getRollout)
@@ -76,7 +84,12 @@ func (s *Server) Router() http.Handler {
 			r.Post("/configs/{id}/versions", s.addConfigVersion)
 			r.Delete("/configs/{id}", s.deleteConfig)
 			r.Put("/agents/{uid}/config", s.assignConfig)
+			r.Post("/groups", s.createGroup)
+			r.Delete("/groups/{id}", s.deleteGroup)
 			r.Post("/rollouts", s.createRollout)
+			r.Post("/rollouts/{id}/rollback", s.rolloutAction("rollback", func(s *Server, r *http.Request, id uuid.UUID) error {
+				return s.Rollouts.Rollback(r.Context(), id)
+			}))
 			r.Post("/rollouts/{id}/pause", s.rolloutAction("pause", func(s *Server, r *http.Request, id uuid.UUID) error {
 				return s.Rollouts.Pause(r.Context(), id)
 			}))
@@ -90,6 +103,7 @@ func (s *Server) Router() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleAdmin))
+			r.Get("/audit", s.listAudit)
 			r.Get("/credentials/api-keys", s.listAPIKeys)
 			r.Post("/credentials/api-keys", s.issueAPIKey)
 			r.Delete("/credentials/{id}", s.revokeCredential)

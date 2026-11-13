@@ -28,6 +28,7 @@ const (
 	DefaultBatchSize     = 100
 	DefaultMaxFailurePct = 2.0
 	maxBatchSize         = 5000
+	maxCanarySteps       = 20
 )
 
 var (
@@ -55,9 +56,17 @@ type Rollout struct {
 	ConfigName      string             `json:"config_name"`
 	ConfigVersion   int                `json:"config_version"`
 	Selector        targeting.Selector `json:"selector"`
-	BatchSize       int                `json:"batch_size"`
-	MaxFailurePct   float64            `json:"max_failure_pct"`
-	Status          string             `json:"status"`
+	// GroupID/GroupName are set when the rollout was started from a saved group.
+	GroupID   *uuid.UUID `json:"group_id"`
+	GroupName *string    `json:"group_name"`
+	BatchSize int        `json:"batch_size"`
+	// CanarySteps are cumulative percentages of the target (e.g. 1, 10, 50,
+	// 100). Nil means fixed-size batches of BatchSize.
+	CanarySteps   []int32 `json:"canary_steps_pct"`
+	MaxFailurePct float64 `json:"max_failure_pct"`
+	// AutoRollback rolls the rollout back instead of pausing when a batch exceeds MaxFailurePct.
+	AutoRollback bool   `json:"auto_rollback"`
+	Status       string `json:"status"`
 	// BatchesReleased is how many batches have been sent so far.
 	BatchesReleased int        `json:"batches_released"`
 	TotalBatches    int        `json:"total_batches"`
@@ -68,7 +77,7 @@ type Rollout struct {
 	// Error explains why the rollout paused.
 	Error *string `json:"error"`
 	// Counts is the number of targeted agents per status:
-	// pending, offered, applying, applied, failed, skipped.
+	// pending, offered, applying, applied, failed, skipped, rolled_back.
 	Counts map[string]int `json:"counts"`
 }
 
@@ -111,15 +120,69 @@ FROM agents WHERE `+where, append([]any{acceptsRemoteConfig}, args...)...).Scan(
 	return p, err
 }
 
-// Create snapshots the agents matching sel, splits them into batches in
-// random order (so the first batch is a representative canary) and starts
-// the rollout.
-func (s *Service) Create(ctx context.Context, versionID uuid.UUID, sel targeting.Selector, batchSize int, maxFailurePct float64, createdBy string) (*Rollout, error) {
-	if batchSize < 1 || batchSize > maxBatchSize {
-		return nil, fmt.Errorf("%w: batch_size must be between 1 and %d", ErrInvalid, maxBatchSize)
+// Params describes a new rollout.
+type Params struct {
+	VersionID uuid.UUID
+	Selector  targeting.Selector
+	// GroupID records the saved group the selector came from, if any.
+	GroupID   *uuid.UUID
+	BatchSize int
+	// CanarySteps, when set, replaces fixed batches with cumulative
+	// percentage steps. It must be strictly increasing and end at 100.
+	CanarySteps   []int
+	MaxFailurePct float64
+	AutoRollback  bool
+	CreatedBy     string
+}
+
+func (p Params) validate() error {
+	if p.BatchSize < 1 || p.BatchSize > maxBatchSize {
+		return fmt.Errorf("%w: batch_size must be between 1 and %d", ErrInvalid, maxBatchSize)
 	}
-	if maxFailurePct < 0 || maxFailurePct > 100 {
-		return nil, fmt.Errorf("%w: max_failure_pct must be between 0 and 100", ErrInvalid)
+	if p.MaxFailurePct < 0 || p.MaxFailurePct > 100 {
+		return fmt.Errorf("%w: max_failure_pct must be between 0 and 100", ErrInvalid)
+	}
+	if p.CanarySteps == nil {
+		return nil
+	}
+	if len(p.CanarySteps) == 0 || len(p.CanarySteps) > maxCanarySteps || p.CanarySteps[len(p.CanarySteps)-1] != 100 {
+		return fmt.Errorf("%w: canary_steps_pct needs 1 to %d steps and must end at 100", ErrInvalid, maxCanarySteps)
+	}
+	prev := 0
+	for _, pct := range p.CanarySteps {
+		if pct <= prev {
+			return fmt.Errorf("%w: canary_steps_pct must be increasing percentages above 0", ErrInvalid)
+		}
+		prev = pct
+	}
+	return nil
+}
+
+// stepBounds converts cumulative percentages into cumulative agent counts
+// for a target of total agents. Steps that would add no agents are dropped,
+// since the engine treats an empty batch as the end of the rollout.
+func stepBounds(steps []int, total int) []int32 {
+	var bounds []int32
+	for _, pct := range steps {
+		n := int32((total*pct + 99) / 100) // ceil, so even 1% of a small target is one agent
+		if len(bounds) == 0 || n > bounds[len(bounds)-1] {
+			bounds = append(bounds, n)
+		}
+	}
+	return bounds
+}
+
+// Create snapshots the agents matching the selector, splits them into
+// batches in random order (so the first batch is a representative canary)
+// and starts the rollout.
+func (s *Service) Create(ctx context.Context, p Params) (*Rollout, error) {
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	sel, versionID, batchSize, maxFailurePct, createdBy := p.Selector, p.VersionID, p.BatchSize, p.MaxFailurePct, p.CreatedBy
+	var steps []int32
+	for _, pct := range p.CanarySteps {
+		steps = append(steps, int32(pct))
 	}
 	selJSON, err := json.Marshal(sel)
 	if err != nil {
@@ -134,18 +197,31 @@ func (s *Service) Create(ctx context.Context, versionID uuid.UUID, sel targeting
 
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
-INSERT INTO rollouts (config_version_id, selector, batch_size, max_failure_pct, status, created_by, started_at)
-VALUES ($1, $2::jsonb, $3, $4, 'running', $5, now()) RETURNING id`,
-		versionID, selJSON, batchSize, maxFailurePct, createdBy).Scan(&id)
+INSERT INTO rollouts (config_version_id, selector, group_id, batch_size, canary_steps_pct, max_failure_pct,
+                      auto_rollback, status, created_by, started_at)
+VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, 'running', $8, now()) RETURNING id`,
+		versionID, selJSON, p.GroupID, batchSize, steps, maxFailurePct, p.AutoRollback, createdBy).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 
+	// $2 is the batch size, or for canary rollouts the cumulative agent
+	// count at which each step ends.
 	where, args := sel.Where("attributes", 3)
+	stepExpr, stepArg := `((rn - 1) / $2::int)::int`, any(batchSize)
+	if p.CanarySteps != nil {
+		var total int
+		countWhere, countArgs := sel.Where("attributes", 1)
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM agents WHERE `+countWhere, countArgs...).Scan(&total); err != nil {
+			return nil, err
+		}
+		stepExpr, stepArg = `(SELECT count(*) FROM unnest($2::int[]) AS bound WHERE bound < rn)::int`, stepBounds(p.CanarySteps, total)
+	}
 	tag, err := tx.Exec(ctx, `
 INSERT INTO rollout_agents (rollout_id, instance_uid, step)
-SELECT $1, instance_uid, (row_number() OVER (ORDER BY random()) - 1) / $2
-FROM agents WHERE `+where, append([]any{id, batchSize}, args...)...)
+SELECT $1, instance_uid, `+stepExpr+`
+FROM (SELECT instance_uid, row_number() OVER (ORDER BY random()) AS rn FROM agents WHERE `+where+`) t`,
+		append([]any{id, stepArg}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -159,22 +235,23 @@ FROM agents WHERE `+where, append([]any{id, batchSize}, args...)...)
 }
 
 const rolloutSelect = `
-SELECT r.id, r.config_version_id, cv.template_id, ct.name, cv.version, r.selector, r.batch_size,
-       r.max_failure_pct::float8, r.status::text, r.current_step, r.created_by, r.created_at, r.finished_at, r.error,
+SELECT r.id, r.config_version_id, cv.template_id, ct.name, cv.version, r.selector, r.group_id, g.name, r.batch_size,
+       r.canary_steps_pct, r.max_failure_pct::float8, r.auto_rollback, r.status::text, r.current_step, r.created_by, r.created_at, r.finished_at, r.error,
        COALESCE((SELECT jsonb_object_agg(status, n) FROM (
            SELECT status::text, count(*) AS n FROM rollout_agents WHERE rollout_id = r.id GROUP BY status) c), '{}'::jsonb),
        COALESCE((SELECT max(step) + 1 FROM rollout_agents WHERE rollout_id = r.id), 0)
 FROM rollouts r
 JOIN config_versions cv ON cv.id = r.config_version_id
-JOIN config_templates ct ON ct.id = cv.template_id`
+JOIN config_templates ct ON ct.id = cv.template_id
+LEFT JOIN agent_groups g ON g.id = r.group_id`
 
 func scanRollout(row pgx.CollectableRow) (Rollout, error) {
 	var (
 		r           Rollout
 		sel, counts []byte
 	)
-	err := row.Scan(&r.ID, &r.ConfigVersionID, &r.ConfigID, &r.ConfigName, &r.ConfigVersion, &sel, &r.BatchSize,
-		&r.MaxFailurePct, &r.Status, &r.BatchesReleased, &r.CreatedBy, &r.CreatedAt, &r.FinishedAt, &r.Error,
+	err := row.Scan(&r.ID, &r.ConfigVersionID, &r.ConfigID, &r.ConfigName, &r.ConfigVersion, &sel, &r.GroupID, &r.GroupName,
+		&r.BatchSize, &r.CanarySteps, &r.MaxFailurePct, &r.AutoRollback, &r.Status, &r.BatchesReleased, &r.CreatedBy, &r.CreatedAt, &r.FinishedAt, &r.Error,
 		&counts, &r.TotalBatches)
 	if err != nil {
 		return r, err
@@ -213,12 +290,13 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Rollout, error) {
 	return &r, err
 }
 
-// Problems returns the failed and skipped agents of a rollout (capped).
+// Problems returns the failed and skipped agents of a rollout, plus
+// rolled-back agents that could not be restored (capped).
 func (s *Service) Problems(ctx context.Context, id uuid.UUID) ([]AgentResult, error) {
 	rows, err := s.db.Query(ctx, `
 SELECT ra.instance_uid, COALESCE(a.attributes->>'host.name', ''), ra.step + 1, ra.status::text, COALESCE(ra.error, '')
 FROM rollout_agents ra JOIN agents a USING (instance_uid)
-WHERE ra.rollout_id = $1 AND ra.status IN ('failed', 'skipped')
+WHERE ra.rollout_id = $1 AND (ra.status IN ('failed', 'skipped') OR (ra.status = 'rolled_back' AND ra.error IS NOT NULL))
 ORDER BY ra.status, ra.step, ra.instance_uid LIMIT $2`, id, problemLimit)
 	if err != nil {
 		return nil, err
@@ -249,6 +327,104 @@ UPDATE rollouts SET status = 'running', error = NULL, ack_step = current_step - 
 func (s *Service) Abort(ctx context.Context, id uuid.UUID) error {
 	return s.transition(ctx, id, `
 UPDATE rollouts SET status = 'aborted', finished_at = now() WHERE id = $1 AND status IN ('running', 'paused')`)
+}
+
+// Rollback re-assigns every agent this rollout touched to the config it had
+// before, pushes that config, and ends the rollout. Agents that had no
+// config assigned before cannot be restored through OpAMP and keep the new
+// one; they are reported as problems.
+func (s *Service) Rollback(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var versionID uuid.UUID
+	err = tx.QueryRow(ctx, `
+SELECT config_version_id FROM rollouts
+WHERE id = $1 AND status IN ('running', 'paused', 'completed', 'aborted') FOR UPDATE`, id).Scan(&versionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := s.Get(ctx, id); err != nil {
+			return err
+		}
+		return ErrBadState
+	}
+	if err != nil {
+		return err
+	}
+	restored, err := rollbackTx(ctx, tx, id, versionID, "rolled back by operator")
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.pushAll(ctx, id, restored)
+	return nil
+}
+
+// rollbackTx restores the previous assignment of every agent still assigned
+// this rollout's version and marks the rollout rolled back. It returns the
+// agents whose previous config must now be pushed.
+func rollbackTx(ctx context.Context, tx pgx.Tx, id, versionID uuid.UUID, reason string) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `
+WITH targets AS (
+    SELECT ra.instance_uid, ra.previous_config_version_id AS prev
+    FROM rollout_agents ra JOIN agents a USING (instance_uid)
+    WHERE ra.rollout_id = $1 AND ra.status <> 'pending' AND a.desired_config_version_id = $2
+), restored AS (
+    UPDATE agents a SET desired_config_version_id = t.prev
+    FROM targets t WHERE a.instance_uid = t.instance_uid
+)
+UPDATE rollout_agents ra SET
+    status = 'rolled_back',
+    error = CASE WHEN t.prev IS NULL THEN 'no previous config to restore; the agent keeps the new config' END
+FROM targets t
+WHERE ra.rollout_id = $1 AND ra.instance_uid = t.instance_uid
+RETURNING ra.instance_uid, t.prev IS NOT NULL`, id, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("restore previous configs: %w", err)
+	}
+	var restored []uuid.UUID
+	for rows.Next() {
+		var (
+			uid     uuid.UUID
+			hasPrev bool
+		)
+		if err := rows.Scan(&uid, &hasPrev); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if hasPrev {
+			restored = append(restored, uid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE rollouts SET status = 'rolled_back', finished_at = now(), error = $2 WHERE id = $1`, id, reason)
+	return restored, err
+}
+
+// auditSystem records an action the engine took on its own, in the same
+// transaction as the action.
+func auditSystem(ctx context.Context, tx pgx.Tx, action string, id uuid.UUID, reason string) error {
+	details, _ := json.Marshal(map[string]string{"reason": reason})
+	_, err := tx.Exec(ctx, `
+INSERT INTO audit_events (actor, actor_auth, action, target_type, target_id, details)
+VALUES ('system', 'system', $1, 'rollout', $2, $3::jsonb)`, action, id.String(), details)
+	return err
+}
+
+// pushAll asks for delivery to each agent. Best effort: an agent that
+// misses the push still gets its config with the response to its next message.
+func (s *Service) pushAll(ctx context.Context, id uuid.UUID, uids []uuid.UUID) {
+	for _, uid := range uids {
+		if err := s.push.RequestPush(ctx, uid); err != nil {
+			s.log.WarnContext(ctx, "request push", "rollout_id", id, "instance_uid", uid, "err", err)
+		}
+	}
 }
 
 func (s *Service) transition(ctx context.Context, id uuid.UUID, sql string) error {
@@ -302,18 +478,13 @@ WHERE r.status = 'running' OR (r.status IN ('paused', 'aborted') AND EXISTS (
 			s.log.ErrorContext(ctx, "advance rollout", "rollout_id", id, "err", err)
 			continue
 		}
-		for _, uid := range released {
-			// Best effort: an agent that misses the push still gets the
-			// config with the response to its next message.
-			if err := s.push.RequestPush(ctx, uid); err != nil {
-				s.log.WarnContext(ctx, "request push", "rollout_id", id, "instance_uid", uid, "err", err)
-			}
-		}
+		s.pushAll(ctx, id, released)
 	}
 }
 
 // advance performs one step of the rollout state machine and returns the
-// agents that were just offered the config.
+// agents that must be pushed a config: the newly released batch, or on an
+// automatic rollback the agents being restored.
 func (s *Service) advance(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -326,13 +497,15 @@ func (s *Service) advance(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error
 		status            string
 		hash              []byte
 		maxFailurePct     float64
+		autoRollback      bool
 		nextStep, ackStep int
 	)
 	err = tx.QueryRow(ctx, `
-SELECT r.config_version_id, r.status::text, cv.body_hash, r.max_failure_pct::float8, r.current_step, r.ack_step
+SELECT r.config_version_id, r.status::text, cv.body_hash, r.max_failure_pct::float8, r.auto_rollback,
+       r.current_step, r.ack_step
 FROM rollouts r JOIN config_versions cv ON cv.id = r.config_version_id
 WHERE r.id = $1 FOR UPDATE OF r SKIP LOCKED`, id).
-		Scan(&versionID, &status, &hash, &maxFailurePct, &nextStep, &ackStep)
+		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // another replica is advancing it
 	}
@@ -380,9 +553,22 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 			return nil, err
 		}
 		if active > ackStep && failed > 0 && float64(failed)*100/float64(attempted) > maxFailurePct {
-			msg := fmt.Sprintf("paused automatically: %d of %d agents in batch %d failed (limit %.4g%%)",
-				failed, attempted, active+1, maxFailurePct)
+			detail := fmt.Sprintf("%d of %d agents in batch %d failed (limit %.4g%%)", failed, attempted, active+1, maxFailurePct)
+			if autoRollback {
+				restored, err := rollbackTx(ctx, tx, id, versionID, "rolled back automatically: "+detail)
+				if err != nil {
+					return nil, err
+				}
+				if err := auditSystem(ctx, tx, "rollout.auto_rollback", id, detail); err != nil {
+					return nil, err
+				}
+				return restored, tx.Commit(ctx)
+			}
+			msg := "paused automatically: " + detail
 			if _, err := tx.Exec(ctx, `UPDATE rollouts SET status = 'paused', error = $2 WHERE id = $1`, id, msg); err != nil {
+				return nil, err
+			}
+			if err := auditSystem(ctx, tx, "rollout.auto_pause", id, detail); err != nil {
 				return nil, err
 			}
 			return nil, tx.Commit(ctx)
@@ -397,7 +583,7 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 	// they reconnect.
 	rows, err := tx.Query(ctx, `
 WITH batch AS (
-    SELECT ra.instance_uid, a.connected, a.capabilities & $4 <> 0 AS accepts
+    SELECT ra.instance_uid, a.connected, a.capabilities & $4 <> 0 AS accepts, a.desired_config_version_id AS prev
     FROM rollout_agents ra JOIN agents a USING (instance_uid)
     WHERE ra.rollout_id = $1 AND ra.step = $2 AND ra.status = 'pending'
 ), assigned AS (
@@ -408,6 +594,7 @@ UPDATE rollout_agents ra SET
     status = CASE WHEN b.accepts AND b.connected THEN 'offered' ELSE 'skipped' END::rollout_agent_status,
     error = CASE WHEN NOT b.accepts THEN 'agent does not accept remote config'
                  WHEN NOT b.connected THEN 'agent offline; the config applies when it reconnects' END,
+    previous_config_version_id = b.prev,
     updated_at = now()
 FROM batch b
 WHERE ra.rollout_id = $1 AND ra.instance_uid = b.instance_uid
