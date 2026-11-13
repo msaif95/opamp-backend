@@ -288,6 +288,9 @@ func run() error {
 		}
 	}()
 
+	apiTokens := auth.NewTokens(db)
+	sessions := auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword)
+	sessions.APITokens = apiTokens.Authenticate
 	var sso *auth.OIDC
 	if cfg.OktaIssuer != "" {
 		sso, err = auth.NewOIDC(ctx, auth.OIDCConfig{
@@ -315,7 +318,7 @@ func run() error {
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-			Sessions: auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword),
+			Sessions: sessions, Tokens: apiTokens,
 			// Postgres only. A Redis outage degrades pushes and live updates but
 			// agents and the console keep working, and marking every replica
 			// unready would turn that into a full outage.

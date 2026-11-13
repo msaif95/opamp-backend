@@ -46,6 +46,7 @@ type Server struct {
 	// Status describes how this deployment is configured, for the System page.
 	Status  SystemStatus
 	Install InstallConfig
+	Tokens  *auth.Tokens
 	// Throughput returns an agent's latest pipeline rates, or nil.
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
 	// History returns an agent's recent CPU, memory and throughput samples.
@@ -148,6 +149,9 @@ func (s *Server) Router() http.Handler {
 			r.Use(s.Sessions.Require(auth.RoleAdmin))
 			r.Get("/audit", s.listAudit)
 			r.Get("/system", s.system)
+			r.Get("/auth/tokens", s.listTokens)
+			r.Post("/auth/tokens", s.createToken)
+			r.Delete("/auth/tokens/{id}", s.revokeToken)
 			r.Put("/system/settings/{key}", s.updateSetting)
 			r.Get("/credentials/api-keys", s.listAPIKeys)
 			r.Post("/credentials/api-keys", s.issueAPIKey)

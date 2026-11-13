@@ -115,3 +115,9 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `agents.paused`; a paused agent is sent `protocol.PausedConfig` (nop receiver to nop exporter) instead of its
   assigned config, which is kept for resume. Bulk pushes mark paused agents skipped (the config applies on resume).
   Verified against opampsupervisor 0.164.0.
+- Console API tokens (`internal/auth/tokens.go`, table `api_tokens`, admin endpoints under `/api/v1/auth/tokens`):
+  secrets start with `opamp_pat_`, are stored hashed, carry a fixed role and are checked against the database on
+  every request. `Sessions.Require` accepts them wherever it accepts a session.
+- `cmd/opampctl`: CLI over the console API (`make build` → `bin/opampctl`). `apply -f` is idempotent create/update
+  of `kind: Config` / `kind: Group` YAML and never deletes or pushes; `push --wait` exits 2 unless completed.
+  Its tests use a fake API server; add a case there when adding a resource kind.

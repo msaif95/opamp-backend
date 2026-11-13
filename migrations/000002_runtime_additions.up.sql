@@ -34,3 +34,16 @@ ALTER TABLE rollouts ADD COLUMN manual_approval BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- A paused collector is sent an empty pipeline instead of its assigned config.
 ALTER TABLE agents ADD COLUMN paused BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Long-lived tokens for the CLI and automation, each with a fixed role.
+CREATE TABLE api_tokens (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name         TEXT NOT NULL UNIQUE,
+    role         rbac_role NOT NULL,
+    token_hash   BYTEA NOT NULL UNIQUE,
+    created_by   TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ,
+    revoked_at   TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ
+);

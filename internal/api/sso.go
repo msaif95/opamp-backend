@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/settings"
@@ -139,4 +141,73 @@ ORDER BY id DESC LIMIT $3`, before, q.Get("q"), limit)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
+	tokens, err := s.Tokens.List(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": nonNil(tokens)})
+}
+
+// createToken issues a console API token for the CLI or automation. The secret is returned once.
+func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string    `json:"name"`
+		Role        auth.Role `json:"role"`
+		ExpiresDays int       `json:"expires_days"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	switch {
+	case strings.TrimSpace(req.Name) == "":
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	case req.Role != auth.RoleViewer && req.Role != auth.RoleOperator && req.Role != auth.RoleAdmin:
+		writeError(w, http.StatusBadRequest, "role must be viewer, operator or admin")
+		return
+	case req.ExpiresDays < 0:
+		writeError(w, http.StatusBadRequest, "expires_days must be 0 or more")
+		return
+	}
+	var expires *time.Time
+	if req.ExpiresDays > 0 {
+		t := time.Now().AddDate(0, 0, req.ExpiresDays)
+		expires = &t
+	}
+	u, _ := auth.UserFrom(r.Context())
+	tok, err := s.Tokens.Create(r.Context(), req.Name, req.Role, u.Subject, expires)
+	if errors.Is(err, auth.ErrTokenNameTaken) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "api_token.create", "api_token", tok.ID.String(),
+		map[string]any{"name": tok.Name, "role": tok.Role})
+	writeJSON(w, http.StatusCreated, tok)
+}
+
+func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	err := s.Tokens.Revoke(r.Context(), id)
+	if errors.Is(err, auth.ErrTokenNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "api_token.revoke", "api_token", id.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
 }

@@ -51,6 +51,8 @@ var ErrInvalidCredentials = errors.New("invalid credentials")
 type Sessions struct {
 	key                []byte
 	localAdminPassword string
+	// APITokens resolves a console API token to the user it acts as.
+	APITokens func(ctx context.Context, secret string) (User, error)
 }
 
 // NewSessions creates a Sessions. An empty localAdminPassword disables local login.
@@ -117,7 +119,15 @@ func (s *Sessions) Require(role Role) func(http.Handler) http.Handler {
 			if !ok {
 				token = r.URL.Query().Get("access_token")
 			}
-			u, err := s.Verify(token)
+			var (
+				u   User
+				err error
+			)
+			if strings.HasPrefix(token, TokenPrefix) && s.APITokens != nil {
+				u, err = s.APITokens(r.Context(), token)
+			} else {
+				u, err = s.Verify(token)
+			}
 			if err != nil {
 				http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 				return

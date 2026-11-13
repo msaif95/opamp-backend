@@ -49,6 +49,26 @@ Everything is set through environment variables; the full table is in the
 | `TLS_CLIENT_CA_FILE` | CA that agent client certificates must chain to (enables mTLS) |
 | `OKTA_*` or `LOCAL_ADMIN_PASSWORD` | At least one way to sign in |
 
+## Command-line tool
+
+`opampctl` drives the console API from a terminal or a CI pipeline. Create an API token in the console (Agent
+credentials → Console API tokens), then:
+
+```bash
+make build                                   # builds bin/opampctl (released binaries are attached to GitHub releases)
+export OPAMP_URL=https://opamp.example.com OPAMP_TOKEN=opamp_pat_...
+opampctl agents --selector env=prod,team=sre
+opampctl apply -f fleet/ --dry-run           # configs and groups from YAML files; see below
+opampctl apply -f fleet/
+opampctl push --config linux-hosts --group prod-sre --approve-each-batch --wait
+opampctl rollout <id> resume
+opampctl restart <collector-uid>
+```
+
+`apply` reads documents of `kind: Config` (with `body` or `bodyFile`) and `kind: Group` (with `selector`), creates
+what is missing and adds a config version only when the body changed. It never deletes and never pushes to
+collectors, so it is safe to run on every merge; `push` is the deliberate step. `opampctl help` lists everything.
+
 ## Test
 
 ```bash
@@ -61,6 +81,7 @@ make test-integration   # everything, against a separate opamp_test database (ne
 
 ```
 cmd/server        the backend
+cmd/opampctl      command-line client
 cmd/agentsim      simulated agents, for development and scale tests
 cmd/fakeidp       development-only stand-in for Okta
 internal/         connection (listener), protocol (OpAMP messages), registry (agent state), agentconfig,

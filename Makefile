@@ -28,6 +28,7 @@ run-sso:
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/opamp-backend ./cmd/server
+	go build -ldflags "$(LDFLAGS)" -o bin/opampctl ./cmd/opampctl
 
 test:
 	go test -race ./...

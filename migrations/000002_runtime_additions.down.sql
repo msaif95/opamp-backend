@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS api_tokens;
 ALTER TABLE agents DROP COLUMN IF EXISTS paused;
 ALTER TABLE rollouts DROP COLUMN IF EXISTS manual_approval;
 DROP TABLE IF EXISTS library_components;
