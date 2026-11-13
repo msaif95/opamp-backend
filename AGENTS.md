@@ -108,3 +108,6 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   about 3 hours). `GET /api/v1/agents/{uid}/metrics` serves them; the UI charts them with recharts.
 - Approval stages: a rollout with `manual_approval` pauses after every settled batch (error text starts with
   "waiting for approval", outcome `awaiting_approval`, which also raises an alert); `Resume` approves the next batch.
+- Restart: `POST /api/v1/agents/{uid}/restart` (operator) publishes `restart:<uid>` on the owning replica's push
+  channel; that replica sends the OpAMP Restart command. Needs the AcceptsRestartCommand capability (0x400), which
+  install scripts now enable. Verified against opampsupervisor 0.164.0 (collector PID changed, came back healthy).

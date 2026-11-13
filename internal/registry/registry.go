@@ -106,6 +106,8 @@ type Registry struct {
 	routeTTL  time.Duration
 
 	redisWarn *logthrottle.Throttle
+	// OnRestart is called on the replica holding the agent's connection when a restart is requested.
+	OnRestart func(uid uuid.UUID)
 
 	// Agents that heartbeated since the last flush; see FlushHeartbeats.
 	hbMu       sync.Mutex
@@ -440,6 +442,18 @@ func (r *Registry) RequestPush(ctx context.Context, uids ...uuid.UUID) error {
 	return nil
 }
 
+const restartPrefix = "restart:"
+
+// RequestRestart asks the replica holding the agent's connection to send it
+// a restart command. It reports false when the agent has no live connection.
+func (r *Registry) RequestRestart(ctx context.Context, uid uuid.UUID) (bool, error) {
+	replica, err := r.Route(ctx, uid)
+	if err != nil || replica == "" {
+		return false, err
+	}
+	return true, r.rdb.Publish(ctx, pushChanPrefix+replica, restartPrefix+uid.String()).Err()
+}
+
 // SubscribePush calls fn, concurrently, for every push request addressed to
 // this replica until ctx is cancelled.
 func (r *Registry) SubscribePush(ctx context.Context, fn func(uid uuid.UUID)) {
@@ -454,6 +468,12 @@ func (r *Registry) SubscribePush(ctx context.Context, fn func(uid uuid.UUID)) {
 		case msg, ok := <-msgs:
 			if !ok {
 				return
+			}
+			if rest, ok := strings.CutPrefix(msg.Payload, restartPrefix); ok {
+				if uid, err := uuid.Parse(rest); err == nil && r.OnRestart != nil {
+					go r.OnRestart(uid)
+				}
+				continue
 			}
 			uid, err := uuid.Parse(msg.Payload)
 			if err != nil {

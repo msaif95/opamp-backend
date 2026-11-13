@@ -285,6 +285,21 @@ func (m *Manager) Push(ctx context.Context, uid uuid.UUID) {
 	m.pushes.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
+// Restart sends the agent an OpAMP restart command, if it is connected to this replica.
+func (m *Manager) Restart(ctx context.Context, uid uuid.UUID) {
+	m.mu.Lock()
+	conn := m.byUID[uid]
+	m.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	err := conn.Send(ctx, &protobufs.ServerToAgent{InstanceUid: uid[:],
+		Command: &protobufs.ServerToAgentCommand{Type: protobufs.CommandType_CommandType_Restart}})
+	if err != nil {
+		m.log.WarnContext(ctx, "restart command failed", "instance_uid", uid, "err", err)
+	}
+}
+
 // EnforceCredentials closes live connections whose credential was revoked
 // or has expired since they connected. Authentication only happens at
 // connect time, so without this a revoked agent would stay connected until

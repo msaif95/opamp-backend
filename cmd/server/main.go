@@ -156,6 +156,11 @@ func run() error {
 	}
 	log.Info("opamp listener started", "addr", cfg.OpAMPListenAddr, "tls", tlsCfg != nil, "mtls", cfg.MTLSEnabled())
 
+	reg.OnRestart = func(uid uuid.UUID) {
+		cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		conns.Restart(cmdCtx, uid)
+	}
 	go reg.SubscribePush(ctx, func(uid uuid.UUID) {
 		pushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()

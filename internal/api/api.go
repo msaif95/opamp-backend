@@ -121,6 +121,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/configs/{id}/versions", s.addConfigVersion)
 			r.Delete("/configs/{id}", s.deleteConfig)
 			r.Put("/agents/{uid}/config", s.assignConfig)
+			r.Post("/agents/{uid}/restart", s.restartAgent)
 			r.Post("/groups", s.createGroup)
 			r.Put("/groups/{id}", s.updateGroup)
 			r.Put("/groups/{id}/config", s.setGroupConfig)
@@ -315,6 +316,42 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 		Throughput *throughput.Sample `json:"throughput"`
 	}{a, sample})
 }
+
+// restartAgent asks the collector's Supervisor to restart the collector process.
+func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	a, err := s.Registry.Get(r.Context(), uid)
+	if errors.Is(err, registry.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if a.Capabilities&capAcceptsRestart == 0 {
+		writeError(w, http.StatusConflict, "this collector does not accept restart commands (set accepts_restart_command: true in its Supervisor config)")
+		return
+	}
+	sent, err := s.Registry.RequestRestart(r.Context(), uid)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if !sent {
+		writeError(w, http.StatusConflict, "the collector is not connected")
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "agent.restart", "agent", uid.String(), nil)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// capAcceptsRestart is the OpAMP AcceptsRestartCommand capability bit.
+const capAcceptsRestart = 0x400
 
 // agentMetrics returns the agent's recent CPU, memory and throughput samples for charts.
 func (s *Server) agentMetrics(w http.ResponseWriter, r *http.Request) {
