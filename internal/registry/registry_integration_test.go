@@ -219,6 +219,12 @@ func TestListFiltersSortsAndFacets(t *testing.T) {
 	if got["prod"] != 2 || got["dev"] != 1 {
 		t.Fatalf("env facet = %v", got)
 	}
+	// host.name is different on every agent: an identifier, not something to target groups by.
+	for _, f := range facets {
+		if f.Key == "host.name" {
+			t.Fatalf("identifier attribute offered as a facet: %+v", f)
+		}
+	}
 }
 
 func TestSetDesiredConfigNeedsCapability(t *testing.T) {

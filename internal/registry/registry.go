@@ -816,9 +816,13 @@ func (r *Registry) Facets(ctx context.Context, scope Scope, project *ProjectRef)
 	cond, args := scopeWhere(scope, project, []any{maxFacetValues})
 	rows, err := r.db.Query(ctx, `
 SELECT key, value, n FROM (
-    SELECT key, value, count(*) AS n, count(*) OVER (PARTITION BY key) AS distinct_values
+    SELECT key, value, count(*) AS n, count(*) OVER (PARTITION BY key) AS distinct_values,
+           max(count(*)) OVER (PARTITION BY key) AS largest
     FROM agents a, jsonb_each_text(a.attributes) WHERE `+cond+` GROUP BY key, value) t
-WHERE distinct_values <= $1 ORDER BY key, n DESC, value`, args...)
+-- Identifiers (host names, instance IDs) have a different value on every
+-- agent. In a small fleet or project they slip under the value limit, so
+-- they are also recognised by no value being shared by two agents.
+WHERE distinct_values <= $1 AND (largest > 1 OR distinct_values <= 2) ORDER BY key, n DESC, value`, args...)
 	if err != nil {
 		return nil, err
 	}
