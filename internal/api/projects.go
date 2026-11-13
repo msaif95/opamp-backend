@@ -329,3 +329,13 @@ func (s *Server) setAPIKeyProject(w http.ResponseWriter, r *http.Request) {
 
 // scopeOf is shorthand used by list handlers.
 func scopeOf(ctx context.Context) access.Scope { return access.From(ctx) }
+
+// listUsers returns everyone who has signed in or been added to a project, with their projects.
+func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
+	people, err := s.Projects.People(r.Context())
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": nonNil(people)})
+}

@@ -152,6 +152,7 @@ func (s *Server) Router() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleAdmin), s.withScope)
+			r.Get("/users", s.listUsers)
 			r.Post("/projects", s.createProject)
 			r.Delete("/projects/{id}", s.deleteProject)
 			r.Get("/projects/{id}/members", s.listProjectMembers)
@@ -200,6 +201,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.audit(r.Context(), req.Username, "local", "auth.login_failed", "user", req.Username, nil)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
+	}
+	if err := s.Projects.RecordSignIn(r.Context(), "local", user.Subject, "", "", user.Role); err != nil {
+		s.Log.WarnContext(r.Context(), "record sign-in", "err", err)
 	}
 	s.audit(r.Context(), user.Subject, user.Provider, "auth.login", "user", user.Subject, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": user})

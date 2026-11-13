@@ -130,3 +130,5 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   always evaluated inside one project (`Selector.WhereIn`), so groups and pushes never cross projects.
   `internal/api/access_integration_test.go` is the access matrix: extend it with every new endpoint.
 - `opampctl --project <name>` (or `OPAMP_PROJECT`) selects the project commands act in.
+- `GET /api/v1/users` (admin) lists everyone who signed in (table `users`, updated by `Projects.RecordSignIn` on
+  local and Okta sign-in) plus people added to a project before their first sign-in, with their memberships.

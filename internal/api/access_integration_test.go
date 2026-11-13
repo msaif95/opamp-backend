@@ -247,6 +247,30 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("project token changes B", first(h.call(tok["secret"].(string), "POST", "/configs/"+cB+"/versions", map[string]any{"body": collectorYAML + "# y\n"})), 404)
 	h.expect("admin token cannot be project-bound", first(h.call(admin, "POST", "/auth/tokens", map[string]any{"name": "x", "role": "admin", "project_id": A})), 400)
 
+	// --- The Users page: people who signed in, and people added ahead of their first sign-in.
+	if err := projects.RecordSignIn(ctx, "okta", "00u1", "Alice@Example.com", "Alice A", auth.RoleNone); err != nil {
+		t.Fatal(err)
+	}
+	h.expect("non-admin lists users", first(h.call(alice, "GET", "/users", nil)), 403)
+	_, users := h.call(admin, "GET", "/users", nil)
+	byName := map[string]map[string]any{}
+	for _, u := range users["users"].([]any) {
+		byName[u.(map[string]any)["subject"].(string)] = u.(map[string]any)
+	}
+	if a := byName["alice@example.com"]; a == nil || a["name"] != "Alice A" || a["provider"] != "okta" || len(a["projects"].([]any)) != 2 {
+		t.Errorf("alice on the users page = %v", a)
+	}
+	h.expect("add someone who never signed in", first(h.call(admin, "PUT", "/projects/"+B+"/members", map[string]string{"subject": "new@example.com", "role": "viewer"})), 204)
+	_, users = h.call(admin, "GET", "/users", nil)
+	found := false
+	for _, u := range users["users"].([]any) {
+		m := u.(map[string]any)
+		found = found || (m["subject"] == "new@example.com" && m["provider"] == "" && len(m["projects"].([]any)) == 1)
+	}
+	if !found {
+		t.Error("a person added before signing in is missing from the users page")
+	}
+
 	// --- Admin-only housekeeping.
 	h.expect("delete a project that owns things", first(h.call(admin, "DELETE", "/projects/"+A, nil)), 409)
 	h.expect("remove alice from A", first(h.call(admin, "DELETE", "/projects/"+A+"/members/alice@example.com", nil)), 204)

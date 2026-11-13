@@ -1,3 +1,4 @@
+ALTER TABLE users DROP COLUMN IF EXISTS global_role;
 DROP INDEX IF EXISTS library_components_project_kind_name_key, agent_groups_project_name_key, config_templates_project_name_key, agents_project_idx;
 ALTER TABLE api_tokens DROP COLUMN IF EXISTS project_id;
 ALTER TABLE library_components DROP COLUMN IF EXISTS project_id;

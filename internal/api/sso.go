@@ -72,10 +72,7 @@ func (s *Server) oktaCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = s.DB.Exec(r.Context(), `
-INSERT INTO users (provider, subject, email, display_name, last_login_at) VALUES ('okta', $1, $2, $3, now())
-ON CONFLICT (provider, subject) DO UPDATE SET email = EXCLUDED.email, display_name = EXCLUDED.display_name, last_login_at = now()`,
-		id.ProviderSub, id.Email, id.Name)
+	err = s.Projects.RecordSignIn(r.Context(), "okta", id.ProviderSub, id.Email, id.Name, id.User.Role)
 	if err != nil {
 		s.internal(w, r, err)
 		return

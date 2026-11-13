@@ -248,3 +248,81 @@ func (p *Projects) RemoveMember(ctx context.Context, id uuid.UUID, subject strin
 	_, err := p.db.Exec(ctx, `DELETE FROM project_members WHERE project_id = $1 AND subject = $2`, id, normalize(subject))
 	return err
 }
+
+// Person is someone who has signed in, or has been added to a project
+// ahead of their first sign-in.
+type Person struct {
+	// Subject is the sign-in name memberships are keyed by.
+	Subject string `json:"subject"`
+	Name    string `json:"name"`
+	// Provider is okta or local; empty for someone who has never signed in.
+	Provider string `json:"provider"`
+	// GlobalRole is the role they had at their last sign-in ("" for none).
+	GlobalRole  string       `json:"global_role"`
+	LastLoginAt *time.Time   `json:"last_login_at"`
+	Projects    []Membership `json:"projects"`
+}
+
+// Membership is one project a person belongs to.
+type Membership struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	Role auth.Role `json:"role"`
+}
+
+// People lists everyone known to the console, by sign-in name.
+func (p *Projects) People(ctx context.Context) ([]Person, error) {
+	rows, err := p.db.Query(ctx, `
+WITH signed_in AS (
+    SELECT lower(COALESCE(NULLIF(email, ''), subject)) AS subject, COALESCE(display_name, '') AS name,
+           provider::text AS provider, global_role, last_login_at
+    FROM users
+), names AS (
+    SELECT subject FROM signed_in UNION SELECT subject FROM project_members
+)
+SELECT n.subject, COALESCE(s.name, ''), COALESCE(s.provider, ''), COALESCE(s.global_role, ''), s.last_login_at
+FROM names n LEFT JOIN signed_in s USING (subject) ORDER BY n.subject`)
+	if err != nil {
+		return nil, err
+	}
+	people, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Person, error) {
+		pr := Person{Projects: []Membership{}}
+		err := row.Scan(&pr.Subject, &pr.Name, &pr.Provider, &pr.GlobalRole, &pr.LastLoginAt)
+		return pr, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	index := map[string]int{}
+	for i, pr := range people {
+		index[pr.Subject] = i
+	}
+	rows, err = p.db.Query(ctx, `
+SELECT m.subject, p.id, p.name, m.role::text FROM project_members m JOIN projects p ON p.id = m.project_id ORDER BY p.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			subject string
+			m       Membership
+		)
+		if err := rows.Scan(&subject, &m.ID, &m.Name, &m.Role); err != nil {
+			return nil, err
+		}
+		if i, ok := index[subject]; ok {
+			people[i].Projects = append(people[i].Projects, m)
+		}
+	}
+	return people, rows.Err()
+}
+
+// RecordSignIn notes a sign-in so the person appears on the Users page.
+func (p *Projects) RecordSignIn(ctx context.Context, provider, providerSubject, email, name string, role auth.Role) error {
+	_, err := p.db.Exec(ctx, `
+INSERT INTO users (provider, subject, email, display_name, global_role, last_login_at) VALUES ($1::identity_provider, $2, $3, $4, $5, now())
+ON CONFLICT (provider, subject) DO UPDATE SET email = EXCLUDED.email, display_name = EXCLUDED.display_name,
+    global_role = EXCLUDED.global_role, last_login_at = now()`, provider, providerSubject, email, name, string(role))
+	return err
+}

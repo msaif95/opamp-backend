@@ -89,3 +89,7 @@ ALTER TABLE agent_groups DROP CONSTRAINT agent_groups_name_key;
 CREATE UNIQUE INDEX agent_groups_project_name_key ON agent_groups (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
 ALTER TABLE library_components DROP CONSTRAINT library_components_kind_name_key;
 CREATE UNIQUE INDEX library_components_project_kind_name_key ON library_components (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), kind, name);
+
+-- The global role a person had at their last sign-in, for the Users page.
+-- Okta decides it from groups on every sign-in; this is only a record.
+ALTER TABLE users ADD COLUMN global_role TEXT NOT NULL DEFAULT '';
