@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/retention"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/store"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/telemetry"
@@ -73,7 +75,12 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	stopTelemetry, err := telemetry.Setup(ctx, cfg.ReplicaID)
+	// Telemetry starts before the database is open, so its switch is bound late.
+	var protections atomic.Pointer[settings.Store]
+	stopTelemetry, err := telemetry.Setup(ctx, cfg.ReplicaID, func() bool {
+		st := protections.Load()
+		return st == nil || st.Enabled(settings.Telemetry)
+	})
 	if err != nil {
 		return err
 	}
@@ -119,6 +126,25 @@ func run() error {
 	} else {
 		log.Warn("OpAMP listener is plaintext", "tls_terminated_upstream", cfg.AgentTLSUpstream, "dev_mode", cfg.DevMode)
 	}
+	switches, err := settings.New(ctx, db, rdb, map[string]settings.Definition{
+		settings.SSO:        {Available: cfg.OktaIssuer != "", Default: true},
+		settings.LocalLogin: {Available: cfg.LocalAdminPassword != "", Default: true},
+		// Switching TLS at runtime would drop every agent and, when off, send
+		// their credentials in plaintext; it stays a deployment decision.
+		settings.AgentTLS:          {Available: tlsCfg != nil || cfg.AgentTLSUpstream, Default: true, Locked: true},
+		settings.AgentMTLS:         {Available: cfg.MTLSEnabled(), Default: true},
+		settings.AlertDelivery:     {Available: cfg.AlertWebhookURL != "", Default: true},
+		settings.Telemetry:         {Available: telemetry.Enabled(), Default: true},
+		settings.Rebalancing:       {Available: true, Default: cfg.RebalanceEnabled},
+		settings.FleetHealthAlerts: {Available: cfg.AlertOfflinePct > 0 || cfg.AlertUnhealthyPct > 0, Default: true},
+	}, log)
+	if err != nil {
+		return err
+	}
+	protections.Store(switches)
+	go switches.Run(ctx)
+	agentAuth.MTLSEnabled = switches.Func(settings.AgentMTLS)
+
 	if err := conns.Start(cfg.OpAMPListenAddr, tlsCfg); err != nil {
 		return err
 	}
@@ -132,6 +158,7 @@ func run() error {
 
 	alertStore := alert.NewStore(rdb)
 	alerts := alert.NewWebhook(cfg.AlertWebhookURL, log)
+	alerts.Enabled = switches.Func(settings.AlertDelivery)
 	alerts.Record = func(ctx context.Context, a alert.Alert) {
 		if err := alertStore.Add(ctx, a); err != nil {
 			log.Error("record alert", "err", err)
@@ -190,14 +217,13 @@ func run() error {
 			return alert.FleetStats{Connected: connected, Unhealthy: unhealthy, RecentlyOffline: offline}, err
 		},
 		Redis: rdb, Notify: alerts.Notify, OfflinePct: cfg.AlertOfflinePct, UnhealthyPct: cfg.AlertUnhealthyPct,
-		PublicURL: cfg.PublicURL, Log: log,
+		PublicURL: cfg.PublicURL, Log: log, Enabled: switches.Func(settings.FleetHealthAlerts),
 	}).Run(ctx)
 
-	if cfg.RebalanceEnabled {
-		go (&connection.Rebalancer{
-			Manager: conns, ReplicaID: cfg.ReplicaID, StartedAt: startedAt, Replicas: reg.Replicas, Log: log,
-		}).Run(ctx)
-	}
+	go (&connection.Rebalancer{
+		Manager: conns, ReplicaID: cfg.ReplicaID, StartedAt: startedAt, Replicas: reg.Replicas, Log: log,
+		Enabled: switches.Func(settings.Rebalancing),
+	}).Run(ctx)
 
 	go func() {
 		t := time.NewTicker(credentialCheckInterval)
@@ -270,12 +296,9 @@ func run() error {
 			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
-			Alerts: alertStore,
+			Alerts: alertStore, Settings: switches,
 			Status: api.SystemStatus{
-				SSO: sso != nil, SSOIssuer: cfg.OktaIssuer, LocalLogin: cfg.LocalAdminPassword != "",
-				Version: version, DevMode: cfg.DevMode,
-				AgentTLS: tlsCfg != nil || cfg.AgentTLSUpstream, AgentMTLS: cfg.MTLSEnabled(),
-				AlertWebhook: alerts.Configured(), Telemetry: telemetry.Enabled(), Rebalancing: cfg.RebalanceEnabled,
+				SSOIssuer: cfg.OktaIssuer, Version: version, DevMode: cfg.DevMode,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},

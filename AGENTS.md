@@ -70,3 +70,10 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Retention (`internal/retention`): audit events, finished rollouts and long-offline agents are pruned by
   `AUDIT_RETENTION_DAYS` (0 = keep), `ROLLOUT_RETENTION_DAYS` (180), `AGENT_RETENTION_DAYS` (30).
 - CI (`.github/workflows/ci.yml`) runs lint, the integration tests and govulncheck, then builds the image.
+- Runtime switches (`internal/settings`, table `settings`, `PUT /api/v1/system/settings/{key}`, admin): SSO, local
+  login, agent mTLS, alert delivery, monitoring export, rebalancing and fleet-health alerts can be switched on/off
+  from the System page. Each replica caches the values and refreshes on a Redis notification or every 5 s.
+  Components take a `func() bool` gate rather than reading config. A switch can only turn on something the
+  deployment configured (`Definition.Available`); agent TLS is `Locked`; the last working sign-in method cannot be
+  switched off. Add a new protection by adding a key, a `Definition` in `cmd/server/main.go` and UI copy in
+  `opamp-ui/src/features/system/System.tsx`.

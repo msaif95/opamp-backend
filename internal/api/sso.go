@@ -7,15 +7,21 @@ import (
 	"strconv"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/settings"
 )
 
 func (s *Server) authConfig(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"local": s.Sessions.LocalEnabled(), "okta": s.OIDC != nil})
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"local": s.Settings.Enabled(settings.LocalLogin), "okta": s.ssoOn(),
+	})
 }
 
+// ssoOn reports whether single sign-on is configured and not switched off.
+func (s *Server) ssoOn() bool { return s.OIDC != nil && s.Settings.Enabled(settings.SSO) }
+
 func (s *Server) oktaLogin(w http.ResponseWriter, r *http.Request) {
-	if s.OIDC == nil {
-		writeError(w, http.StatusNotFound, "single sign-on is not configured")
+	if !s.ssoOn() {
+		writeError(w, http.StatusNotFound, "single sign-on is not configured or is switched off")
 		return
 	}
 	redirect, cookie, err := s.OIDC.Begin()
@@ -30,8 +36,8 @@ func (s *Server) oktaLogin(w http.ResponseWriter, r *http.Request) {
 // oktaCallback completes the login and hands the session token to the UI in
 // the URL fragment, which browsers never send to servers or write to access logs.
 func (s *Server) oktaCallback(w http.ResponseWriter, r *http.Request) {
-	if s.OIDC == nil {
-		writeError(w, http.StatusNotFound, "single sign-on is not configured")
+	if !s.ssoOn() {
+		writeError(w, http.StatusNotFound, "single sign-on is not configured or is switched off")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: auth.OIDCCookie, Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.OIDC.SecureCookies()})

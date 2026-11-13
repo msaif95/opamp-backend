@@ -38,7 +38,13 @@ var (
 // AgentAuthenticator validates agent connections in either auth mode.
 type AgentAuthenticator struct {
 	db *pgxpool.Pool
+	// MTLSEnabled, if set, is consulted on every connection. When it
+	// returns false client certificates are ignored, so agents need an API
+	// key, and agents already connected with a certificate are cut off.
+	MTLSEnabled func() bool
 }
+
+func (a *AgentAuthenticator) mtlsOn() bool { return a.MTLSEnabled == nil || a.MTLSEnabled() }
 
 // NewAgentAuthenticator creates an AgentAuthenticator.
 func NewAgentAuthenticator(db *pgxpool.Pool) *AgentAuthenticator {
@@ -48,7 +54,7 @@ func NewAgentAuthenticator(db *pgxpool.Pool) *AgentAuthenticator {
 // Authenticate resolves the identity of an incoming OpAMP connection.
 // A CA-verified client certificate takes precedence over a bearer API key.
 func (a *AgentAuthenticator) Authenticate(ctx context.Context, r *http.Request) (registry.Identity, error) {
-	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 {
+	if a.mtlsOn() && r.TLS != nil && len(r.TLS.VerifiedChains) > 0 {
 		return a.authenticateCert(ctx, r.TLS.VerifiedChains[0][0])
 	}
 	if key, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && key != "" {
@@ -163,6 +169,12 @@ WHERE (id = ANY($1) OR (kind = 'mtls_cert' AND key_hash = ANY($2)))
 	}
 	defer rows.Close()
 	badIDs, badCerts := map[uuid.UUID]bool{}, map[string]bool{}
+	if !a.mtlsOn() {
+		// Certificates are not accepted at all right now.
+		for _, fp := range fingerprints {
+			badCerts[string(fp)] = true
+		}
+	}
 	for rows.Next() {
 		var (
 			id   uuid.UUID

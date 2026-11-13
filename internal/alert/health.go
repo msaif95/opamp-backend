@@ -94,6 +94,8 @@ type HealthMonitor struct {
 	// PublicURL, if set, is appended to alerts as a link to the console.
 	PublicURL string
 	Log       *slog.Logger
+	// Enabled, if set, is consulted every minute; false skips the check.
+	Enabled func() bool
 }
 
 // Run evaluates the rules every minute until ctx is cancelled.
@@ -117,6 +119,9 @@ func (m *HealthMonitor) Run(ctx context.Context) {
 
 // Evaluate runs one check, if this replica wins the lock for this minute.
 func (m *HealthMonitor) Evaluate(ctx context.Context) error {
+	if m.Enabled != nil && !m.Enabled() {
+		return nil
+	}
 	won, err := m.Redis.SetNX(ctx, healthLockKey, 1, healthLockSeconds*time.Second).Result()
 	if err != nil || !won {
 		return err

@@ -19,6 +19,8 @@ const (
 	DeliverySent          = "sent"
 	DeliveryFailed        = "failed"
 	DeliveryNotConfigured = "not_configured"
+	// DeliveryDisabled means an administrator switched alert delivery off.
+	DeliveryDisabled = "disabled"
 )
 
 // Alert is one notification and what became of it.
@@ -40,6 +42,9 @@ type Webhook struct {
 	// attempt, including when no webhook is configured, so alerts stay
 	// visible in the console either way.
 	Record func(ctx context.Context, a Alert)
+	// Enabled, if set, is consulted before each delivery; false skips the
+	// webhook (the alert is still recorded).
+	Enabled func() bool
 }
 
 // Configured reports whether alerts are delivered to a webhook.
@@ -68,7 +73,9 @@ func (w *Webhook) Run(ctx context.Context) {
 			return
 		case text := <-w.queue:
 			a := Alert{At: time.Now().UTC(), Text: text, Delivery: DeliveryNotConfigured}
-			if w.Configured() {
+			if w.Configured() && w.Enabled != nil && !w.Enabled() {
+				a.Delivery = DeliveryDisabled
+			} else if w.Configured() {
 				a.Delivery = DeliverySent
 				if err := w.send(ctx, text); err != nil {
 					w.log.Error("alert delivery failed", "err", err, "text", text)

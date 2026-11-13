@@ -23,6 +23,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
@@ -40,8 +41,9 @@ type Server struct {
 	Events http.Handler
 	Log    *slog.Logger
 	// Status describes how this deployment is configured, for the System page.
-	Status SystemStatus
-	Alerts *alert.Store
+	Status   SystemStatus
+	Settings *settings.Store
+	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
 	// TrustProxyHeaders makes the client address come from X-Forwarded-For.
@@ -126,6 +128,7 @@ func (s *Server) Router() http.Handler {
 			r.Use(s.Sessions.Require(auth.RoleAdmin))
 			r.Get("/audit", s.listAudit)
 			r.Get("/system", s.system)
+			r.Put("/system/settings/{key}", s.updateSetting)
 			r.Get("/credentials/api-keys", s.listAPIKeys)
 			r.Post("/credentials/api-keys", s.issueAPIKey)
 			r.Delete("/credentials/{id}", s.revokeCredential)
@@ -142,6 +145,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	if !s.Settings.Enabled(settings.LocalLogin) {
+		writeError(w, http.StatusForbidden, "local sign-in is switched off")
 		return
 	}
 	client := s.clientAddr(r)

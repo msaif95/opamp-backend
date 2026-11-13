@@ -62,6 +62,8 @@ type Rebalancer struct {
 	// Replicas lists the running replicas with their connection counts.
 	Replicas func(ctx context.Context) ([]registry.Replica, error)
 	Log      *slog.Logger
+	// Enabled, if set, is consulted every round; false skips it.
+	Enabled func() bool
 
 	futile      int
 	streakStart int
@@ -83,7 +85,7 @@ func (r *Rebalancer) Run(ctx context.Context) {
 }
 
 func (r *Rebalancer) round(ctx context.Context, now time.Time) {
-	if now.Sub(r.StartedAt) < rebalanceMinUptime || now.Before(r.pausedUntil) {
+	if now.Sub(r.StartedAt) < rebalanceMinUptime || now.Before(r.pausedUntil) || (r.Enabled != nil && !r.Enabled()) {
 		return
 	}
 	replicas, err := r.Replicas(ctx)
