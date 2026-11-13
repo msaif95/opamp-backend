@@ -31,3 +31,6 @@ CREATE TABLE library_components (
 
 -- Stop after every batch and wait for an operator to approve the next one.
 ALTER TABLE rollouts ADD COLUMN manual_approval BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- A paused collector is sent an empty pipeline instead of its assigned config.
+ALTER TABLE agents ADD COLUMN paused BOOLEAN NOT NULL DEFAULT FALSE;

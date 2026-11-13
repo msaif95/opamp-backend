@@ -255,3 +255,39 @@ func TestListBySelectorCombinesWithOtherFilters(t *testing.T) {
 		t.Fatalf("total %d, page %d, err %v; want 3 matching, page of 2", total, len(agents), err)
 	}
 }
+
+func TestSetPaused(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	uid := uuid.New()
+	mustReport(t, r, uid, fullReport("host-1"))
+
+	// Nothing to come back to yet.
+	if err := r.SetPaused(ctx, uid, true); !errors.Is(err, registry.ErrNoConfig) {
+		t.Fatalf("pause without a config: %v", err)
+	}
+	if err := r.SetPaused(ctx, uuid.New(), true); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("pause unknown agent: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO config_templates (id, name) VALUES ('00000000-0000-0000-0000-0000000000aa', 'c')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO config_versions (id, template_id, version, body, body_hash, author)
+		VALUES ('00000000-0000-0000-0000-0000000000bb', '00000000-0000-0000-0000-0000000000aa', 1, 'x', 'h', 'a')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetDesiredConfig(ctx, uid, uuid.MustParse("00000000-0000-0000-0000-0000000000bb")); err != nil {
+		t.Fatal(err)
+	}
+	for _, paused := range []bool{true, false} {
+		if err := r.SetPaused(ctx, uid, paused); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := r.ConfigState(ctx, uid)
+		a, _ := r.Get(ctx, uid)
+		// The assigned config is kept while paused, so resume has something to restore.
+		if st.Paused != paused || a.Paused != paused || st.DesiredConfigVersionID == nil {
+			t.Fatalf("paused=%v: state %+v, agent paused %v", paused, st, a.Paused)
+		}
+	}
+}

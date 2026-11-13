@@ -701,7 +701,8 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 	// they reconnect.
 	rows, err := tx.Query(ctx, `
 WITH batch AS (
-    SELECT ra.instance_uid, a.connected, a.capabilities & $4 <> 0 AS accepts, a.desired_config_version_id AS prev
+    SELECT ra.instance_uid, a.connected AND NOT a.paused AS connected, a.paused, a.capabilities & $4 <> 0 AS accepts,
+           a.desired_config_version_id AS prev
     FROM rollout_agents ra JOIN agents a USING (instance_uid)
     WHERE ra.rollout_id = $1 AND ra.step = $2 AND ra.status = 'pending'
     -- Lock agents in a fixed order: heartbeat flushes and offline sweeps on
@@ -714,6 +715,7 @@ WITH batch AS (
 UPDATE rollout_agents ra SET
     status = CASE WHEN b.accepts AND b.connected THEN 'offered' ELSE 'skipped' END::rollout_agent_status,
     error = CASE WHEN NOT b.accepts THEN 'agent does not accept remote config'
+                 WHEN b.paused THEN 'collection is paused; the config applies when it is resumed'
                  WHEN NOT b.connected THEN 'agent offline; the config applies when it reconnects' END,
     previous_config_version_id = b.prev,
     updated_at = now()

@@ -122,6 +122,8 @@ func (s *Server) Router() http.Handler {
 			r.Delete("/configs/{id}", s.deleteConfig)
 			r.Put("/agents/{uid}/config", s.assignConfig)
 			r.Post("/agents/{uid}/restart", s.restartAgent)
+			r.Post("/agents/{uid}/pause", s.pauseAgent(true))
+			r.Post("/agents/{uid}/resume", s.pauseAgent(false))
 			r.Post("/groups", s.createGroup)
 			r.Put("/groups/{id}", s.updateGroup)
 			r.Put("/groups/{id}/config", s.setGroupConfig)
@@ -348,6 +350,32 @@ func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFrom(r.Context())
 	s.audit(r.Context(), u.Subject, u.Provider, "agent.restart", "agent", uid.String(), nil)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// pauseAgent stops (or resumes) collection on a collector without stopping the process.
+func (s *Server) pauseAgent(paused bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid, ok := pathUUID(w, r, "uid")
+		if !ok {
+			return
+		}
+		err := s.Registry.SetPaused(r.Context(), uid, paused)
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		case errors.Is(err, registry.ErrNoConfig), errors.Is(err, registry.ErrRemoteConfigUnsupported):
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		case err != nil:
+			s.internal(w, r, err)
+			return
+		}
+		action := map[bool]string{true: "agent.pause", false: "agent.resume"}[paused]
+		u, _ := auth.UserFrom(r.Context())
+		s.audit(r.Context(), u.Subject, u.Provider, action, "agent", uid.String(), nil)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // capAcceptsRestart is the OpAMP AcceptsRestartCommand capability bit.

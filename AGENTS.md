@@ -111,3 +111,7 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Restart: `POST /api/v1/agents/{uid}/restart` (operator) publishes `restart:<uid>` on the owning replica's push
   channel; that replica sends the OpAMP Restart command. Needs the AcceptsRestartCommand capability (0x400), which
   install scripts now enable. Verified against opampsupervisor 0.164.0 (collector PID changed, came back healthy).
+- Stop/resume collection: OpAMP has no stop command, so `POST /agents/{uid}/pause|resume` (operator) sets
+  `agents.paused`; a paused agent is sent `protocol.PausedConfig` (nop receiver to nop exporter) instead of its
+  assigned config, which is kept for resume. Bulk pushes mark paused agents skipped (the config applies on resume).
+  Verified against opampsupervisor 0.164.0.

@@ -56,6 +56,8 @@ type ConfigState struct {
 	Capabilities           uint64
 	DesiredConfigVersionID *uuid.UUID
 	RemoteConfigHash       []byte
+	// Paused agents are sent an empty pipeline instead of their assigned config.
+	Paused bool
 }
 
 // Agent is the API/storage representation of one collector instance.
@@ -76,9 +78,11 @@ type Agent struct {
 	RemoteConfigError      *string           `json:"remote_config_error"`
 	DesiredConfigVersionID *uuid.UUID        `json:"desired_config_version_id"`
 	DesiredConfig          *DesiredConfig    `json:"desired_config"`
-	Connected              bool              `json:"connected"`
-	FirstSeen              time.Time         `json:"first_seen"`
-	LastSeen               time.Time         `json:"last_seen"`
+	// Paused: collection is stopped; the collector runs an empty pipeline.
+	Paused    bool      `json:"paused"`
+	Connected bool      `json:"connected"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
 }
 
 // Event is published on EventsChannel whenever an agent's state changes.
@@ -198,8 +202,8 @@ func (r *Registry) heartbeat(ctx context.Context, uid uuid.UUID, msg *protobufs.
 		connected bool
 	)
 	err = r.db.QueryRow(ctx, `
-SELECT capabilities, desired_config_version_id, remote_config_hash, connected FROM agents WHERE instance_uid = $1`,
-		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected)
+SELECT capabilities, desired_config_version_id, remote_config_hash, connected, paused FROM agents WHERE instance_uid = $1`,
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected, &st.Paused)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!connected || uint64(caps) != msg.Capabilities)) {
 		return st, false, nil
 	}
@@ -294,7 +298,7 @@ ON CONFLICT (instance_uid) DO UPDATE SET
     connected             = TRUE,
     sequence_num          = EXCLUDED.sequence_num,
     last_seen             = now()
-RETURNING capabilities, desired_config_version_id, remote_config_hash,
+RETURNING capabilities, desired_config_version_id, remote_config_hash, paused,
           COALESCE((SELECT connected FROM prev), FALSE)`
 
 // Report applies an AgentToServer status report. Fields the agent omitted
@@ -349,7 +353,7 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		healthy, healthStatus, healthErr, health,
 		effHash, effBody,
 		remoteHash, remoteStatus, remoteError,
-		int64(msg.SequenceNum)).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &wasConnected)
+		int64(msg.SequenceNum)).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &wasConnected)
 	if err != nil {
 		return st, fmt.Errorf("upsert agent %s: %w", uid, err)
 	}
@@ -373,8 +377,8 @@ func (r *Registry) ConfigState(ctx context.Context, uid uuid.UUID) (ConfigState,
 		caps int64
 	)
 	err := r.db.QueryRow(ctx, `
-SELECT capabilities, desired_config_version_id, remote_config_hash FROM agents WHERE instance_uid = $1`,
-		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash)
+SELECT capabilities, desired_config_version_id, remote_config_hash, paused FROM agents WHERE instance_uid = $1`,
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, ErrNotFound
 	}
@@ -440,6 +444,31 @@ func (r *Registry) RequestPush(ctx context.Context, uids ...uuid.UUID) error {
 		}
 	}
 	return nil
+}
+
+// ErrNoConfig is returned when pausing an agent that has no assigned config to come back to.
+var ErrNoConfig = errors.New("assign a config to this collector before pausing it, so there is something to resume to")
+
+// SetPaused stops or resumes collection on an agent and pushes the change.
+func (r *Registry) SetPaused(ctx context.Context, uid uuid.UUID, paused bool) error {
+	tag, err := r.db.Exec(ctx, `
+UPDATE agents SET paused = $2 WHERE instance_uid = $1 AND capabilities & $3 <> 0 AND desired_config_version_id IS NOT NULL`,
+		uid, paused, int64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		st, err := r.ConfigState(ctx, uid)
+		if err != nil {
+			return err
+		}
+		if st.DesiredConfigVersionID == nil {
+			return ErrNoConfig
+		}
+		return ErrRemoteConfigUnsupported
+	}
+	r.publish(ctx, "agent.updated", uid)
+	return r.RequestPush(ctx, uid)
 }
 
 const restartPrefix = "restart:"
@@ -581,7 +610,7 @@ UPDATE agents SET connected = FALSE WHERE instance_uid IN (
 const agentColumns = `instance_uid, connector_type::text, auth_mode::text, attributes, capabilities, agent_version,
     healthy, health_status, health_last_error, effective_config_hash, remote_config_hash,
     remote_config_status::text, remote_config_error, desired_config_version_id, connected, first_seen, last_seen,
-    cv.template_id, ct.name, cv.version,
+    cv.template_id, ct.name, cv.version, a.paused,
     COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE)`
 
 const agentFrom = ` FROM agents a
@@ -765,7 +794,7 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	err := row.Scan(&a.InstanceUID, &a.ConnectorType, &a.AuthMode, &attrs, &caps, &a.AgentVersion,
 		&a.Healthy, &a.HealthStatus, &a.HealthLastError, &a.EffectiveConfigHash, &a.RemoteConfigHash,
 		&a.RemoteConfigStatus, &a.RemoteConfigError, &a.DesiredConfigVersionID, &a.Connected, &a.FirstSeen, &a.LastSeen,
-		&tmplID, &tmplName, &version, &inSync)
+		&tmplID, &tmplName, &version, &a.Paused, &inSync)
 	if err != nil {
 		return a, err
 	}

@@ -6,6 +6,7 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"log/slog"
 	"time"
 
@@ -24,6 +25,22 @@ const ServerCapabilities = uint64(protobufs.ServerCapabilities_ServerCapabilitie
 	protobufs.ServerCapabilities_ServerCapabilities_OffersConnectionSettings)
 
 const configContentType = "text/yaml"
+
+// PausedConfig is what a paused collector runs: one pipeline that receives
+// and sends nothing. The collector stays up and connected so it can be resumed.
+const PausedConfig = `# Collection paused from OpAMP Fleet. Resume it in the console to restore the assigned config.
+receivers:
+  nop:
+exporters:
+  nop:
+service:
+  pipelines:
+    logs:
+      receivers: [nop]
+      exporters: [nop]
+`
+
+var pausedHash = sha256.Sum256([]byte(PausedConfig))
 
 // Registry is the slice of the agent registry the handler needs.
 type Registry interface {
@@ -116,6 +133,17 @@ func (h *Handler) pendingConfig(ctx context.Context, uid uuid.UUID, st registry.
 	if st.DesiredConfigVersionID == nil ||
 		st.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig) == 0 {
 		return nil
+	}
+	if st.Paused {
+		if bytes.Equal(pausedHash[:], st.RemoteConfigHash) {
+			return nil
+		}
+		return &protobufs.AgentRemoteConfig{
+			ConfigHash: pausedHash[:],
+			Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
+				"": {Body: []byte(PausedConfig), ContentType: configContentType},
+			}},
+		}
 	}
 	v, err := h.configs.Version(ctx, *st.DesiredConfigVersionID)
 	if err != nil {

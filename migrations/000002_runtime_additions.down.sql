@@ -1,3 +1,4 @@
+ALTER TABLE agents DROP COLUMN IF EXISTS paused;
 ALTER TABLE rollouts DROP COLUMN IF EXISTS manual_approval;
 DROP TABLE IF EXISTS library_components;
 ALTER TABLE config_versions DROP COLUMN IF EXISTS builder_spec;
