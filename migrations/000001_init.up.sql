@@ -426,3 +426,17 @@ CREATE TABLE secrets (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX secrets_project_name_key ON secrets (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+
+-- Fleet trend ----------------------------------------------------------------
+-- One row per project per minute (project_id NULL: unassigned agents), written
+-- by a single replica, for the trend lines on the overview page. Kept 48 hours.
+CREATE TABLE fleet_samples (
+    at            TIMESTAMPTZ NOT NULL,
+    project_id    UUID REFERENCES projects(id) ON DELETE CASCADE,
+    total         INTEGER NOT NULL,
+    connected     INTEGER NOT NULL,
+    healthy       INTEGER NOT NULL,
+    unhealthy     INTEGER NOT NULL,
+    config_failed INTEGER NOT NULL
+);
+CREATE INDEX fleet_samples_at_idx ON fleet_samples (at);

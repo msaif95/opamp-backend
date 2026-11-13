@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,20 @@ func (h *harness) call(token, method, path string, body any) (int, map[string]an
 	var out map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return resp.StatusCode, out
+}
+
+// raw returns a response body as text, for downloads.
+func (h *harness) raw(token, path string) string {
+	h.t.Helper()
+	req, _ := http.NewRequest("GET", h.srv.URL+"/api/v1"+path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return string(body)
 }
 
 func (h *harness) session(subject string, role auth.Role) string {
@@ -293,10 +308,49 @@ func TestProjectAccess(t *testing.T) {
 		t.Error("a person added before signing in is missing from the users page")
 	}
 
+	// --- Search, export, breakdown and trend all respect projects.
+	_, searched := h.call(alice, "GET", "/agents?q=1", nil) // every host name contains "1"
+	if got := names(searched, "agents", "host"); !equal(got, []string{"a1", "b1"}) {
+		t.Errorf("alice searching finds %v", got)
+	}
+	if csv := h.raw(alice, "/agents/export?format=csv"); !strings.Contains(csv, "a1") || !strings.Contains(csv, "b1") || strings.Contains(csv, "u1") {
+		t.Errorf("alice's export:\n%s", csv)
+	}
+	if csv := h.raw(carol, "/agents/export"); strings.Count(csv, "\n") != 1 {
+		t.Errorf("carol's export should be a header only:\n%s", csv)
+	}
+	_, bd := h.call(alice, "GET", "/agents/breakdown?by=env", nil)
+	if rows := bd["rows"].([]any); len(rows) != 1 || rows[0].(map[string]any)["total"].(float64) != 2 {
+		t.Errorf("alice's breakdown = %v", bd)
+	}
+	if err := reg.SampleFleet(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, trend := h.call(alice, "GET", "/summary/history?hours=1", nil)
+	if pts := trend["points"].([]any); len(pts) != 1 || pts[0].(map[string]any)["total"].(float64) != 2 {
+		t.Errorf("alice's trend = %v", trend)
+	}
+	h.expect("non-admin exports the audit log", first(h.call(alice, "GET", "/audit/export", nil)), 403)
+	if csv := h.raw(admin, "/audit/export?format=csv"); !strings.HasPrefix(csv, "id,occurred_at,actor") || !strings.Contains(csv, "project.create") {
+		t.Errorf("audit export:\n%.300s", csv)
+	}
+	h.expect("bob reads A's push timeline", first(h.call(bob, "GET", "/rollouts/"+ro["id"].(string)+"/batches", nil)), 404)
+	_, tl := h.call(alice, "GET", "/rollouts/"+ro["id"].(string)+"/batches", nil)
+	if b := tl["batches"].([]any); len(b) != 1 || b[0].(map[string]any)["agents"].(float64) != 1 {
+		t.Errorf("timeline = %v", tl)
+	}
+
 	// --- Secrets: admins only, and the value never comes back out.
 	h.expect("admin sets a secret", first(h.call(admin, "PUT", "/secrets", map[string]any{"name": "vendor_key", "value": "s3cr3t-value", "project_id": A})), 204)
 	h.expect("operator sets a secret", first(h.call(alice, "PUT", "/secrets", map[string]any{"name": "x", "value": "s3cr3t-value", "project_id": A})), 403)
 	h.expect("operator lists secrets", first(h.call(alice, "GET", "/secrets", nil)), 403)
+	// Operators may see which names exist in their project (for the editor), never values, and not other projects' names.
+	_, nm := h.call(alice, "GET", "/secrets/names?project_id="+A, nil)
+	if got := nm["names"].([]any); len(got) != 1 || got[0] != "vendor_key" {
+		t.Errorf("secret names for alice = %v", nm)
+	}
+	h.expect("viewer lists secret names in B", first(h.call(alice, "GET", "/secrets/names?project_id="+B, nil)), 403)
+	h.expect("alice lists unassigned secret names", first(h.call(alice, "GET", "/secrets/names?project_id=none", nil)), 404)
 	_, listed := h.call(admin, "GET", "/secrets", nil)
 	if raw, _ := json.Marshal(listed); len(listed["secrets"].([]any)) != 1 || bytes.Contains(raw, []byte("s3cr3t")) {
 		t.Errorf("secret list = %s", raw)

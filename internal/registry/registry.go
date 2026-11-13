@@ -705,6 +705,9 @@ type ListFilter struct {
 	Healthy   *bool
 	// ConfigStatus filters on remote_config_status (unset, applied, applying, failed).
 	ConfigStatus *string
+	// Search, if set, matches agents whose instance UID or any attribute name
+	// or value (host name, IP address, …) contains it, ignoring case.
+	Search string
 	// Sort is SortName (default, stable between refreshes) or SortLastSeen.
 	Sort   string
 	Desc   bool
@@ -744,8 +747,9 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 		attrs, _ = json.Marshal(f.Attributes)
 	}
 	const where = ` WHERE attributes @> $1::jsonb AND ($2::boolean IS NULL OR connected = $2)
-    AND ($3::boolean IS NULL OR healthy = $3) AND ($4::text IS NULL OR remote_config_status::text = $4)`
-	args := []any{attrs, f.Connected, f.Healthy, f.ConfigStatus}
+    AND ($3::boolean IS NULL OR healthy = $3) AND ($4::text IS NULL OR remote_config_status::text = $4)
+    AND ($5 = '' OR a.instance_uid::text ILIKE $5 OR a.attributes::text ILIKE $5)`
+	args := []any{attrs, f.Connected, f.Healthy, f.ConfigStatus, likePattern(f.Search)}
 	selWhere := "TRUE"
 	if f.Selector != nil {
 		var selArgs []any
@@ -777,6 +781,102 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 	}
 	agents, err := pgx.CollectRows(rows, scanAgent)
 	return agents, total, err
+}
+
+// likePattern turns free text into an ILIKE pattern that matches it anywhere, literally.
+func likePattern(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	return "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(text) + "%"
+}
+
+// BreakdownRow counts the agents sharing one combination of attribute values.
+type BreakdownRow struct {
+	// Values are the values of the requested attributes, in order; "" when an agent does not report one.
+	Values    []string `json:"values"`
+	Total     int      `json:"total"`
+	Connected int      `json:"connected"`
+	Healthy   int      `json:"healthy"`
+	Unhealthy int      `json:"unhealthy"`
+}
+
+// Breakdown groups agents by up to two attributes, for the topology view.
+func (r *Registry) Breakdown(ctx context.Context, scope Scope, project *ProjectRef, keys []string) ([]BreakdownRow, error) {
+	if len(keys) == 0 || len(keys) > 2 {
+		return nil, errors.New("breakdown needs one or two attributes")
+	}
+	cond, args := scopeWhere(scope, project, nil)
+	cols := make([]string, len(keys))
+	for i, k := range keys {
+		args = append(args, k)
+		cols[i] = fmt.Sprintf("COALESCE(a.attributes->>$%d, '')", len(args))
+	}
+	group := "1"
+	if len(keys) == 2 {
+		group = "1, 2"
+	}
+	rows, err := r.db.Query(ctx, `
+SELECT `+strings.Join(cols, ", ")+`, count(*), count(*) FILTER (WHERE connected),
+       count(*) FILTER (WHERE connected AND healthy), count(*) FILTER (WHERE connected AND healthy = FALSE)
+FROM agents a WHERE `+cond+` GROUP BY `+group+` ORDER BY `+group+` LIMIT 1000`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (BreakdownRow, error) {
+		b := BreakdownRow{Values: make([]string, len(keys))}
+		dst := []any{}
+		for i := range b.Values {
+			dst = append(dst, &b.Values[i])
+		}
+		err := row.Scan(append(dst, &b.Total, &b.Connected, &b.Healthy, &b.Unhealthy)...)
+		return b, err
+	})
+}
+
+// SampleFleet records the current counts per project, for the trend lines,
+// and drops samples older than two days. Call it once a minute from one replica.
+func (r *Registry) SampleFleet(ctx context.Context) error {
+	_, err := r.db.Exec(ctx, `
+WITH pruned AS (DELETE FROM fleet_samples WHERE at < now() - interval '48 hours')
+INSERT INTO fleet_samples (at, project_id, total, connected, healthy, unhealthy, config_failed)
+SELECT date_trunc('minute', now()), project_id, count(*), count(*) FILTER (WHERE connected),
+       count(*) FILTER (WHERE connected AND healthy), count(*) FILTER (WHERE connected AND healthy = FALSE),
+       count(*) FILTER (WHERE remote_config_status = 'failed')
+FROM agents GROUP BY project_id`)
+	return err
+}
+
+// TrendPoint is the fleet's counts at one moment.
+type TrendPoint struct {
+	At time.Time `json:"at"`
+	Summary
+}
+
+// FleetTrend returns the recorded counts over the last hours, summed over the
+// projects in scope and averaged into at most about 300 points.
+func (r *Registry) FleetTrend(ctx context.Context, scope Scope, project *ProjectRef, hours int) ([]TrendPoint, error) {
+	if hours <= 0 || hours > 48 {
+		hours = 24
+	}
+	bucket := max(60, hours*3600/288) // seconds
+	cond, args := scopeWhere(scope, project, []any{hours, bucket})
+	rows, err := r.db.Query(ctx, `
+SELECT to_timestamp(floor(extract(epoch FROM at) / $2) * $2) AS t,
+       round(avg(total)), round(avg(connected)), round(avg(healthy)), round(avg(unhealthy)), round(avg(config_failed))
+FROM (SELECT a.at, sum(total) AS total, sum(connected) AS connected, sum(healthy) AS healthy,
+             sum(unhealthy) AS unhealthy, sum(config_failed) AS config_failed
+      FROM fleet_samples a WHERE a.at > now() - make_interval(hours => $1) AND `+cond+` GROUP BY a.at) per_minute
+GROUP BY t ORDER BY t`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (TrendPoint, error) {
+		var p TrendPoint
+		err := row.Scan(&p.At, &p.Total, &p.Connected, &p.Healthy, &p.Unhealthy, &p.ConfigFailed)
+		return p, err
+	})
 }
 
 // Get returns one agent including its effective config body.

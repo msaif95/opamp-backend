@@ -109,6 +109,11 @@ func (s *Server) Router() http.Handler {
 			r.Post("/rollouts/preview", s.previewRollout)
 			r.Get("/rollouts/{id}", s.getRollout)
 			r.Get("/agents/{uid}", s.getAgent)
+			r.Get("/agents/export", s.exportAgents)
+			r.Get("/agents/breakdown", s.agentBreakdown)
+			r.Get("/summary/history", s.summaryHistory)
+			r.Get("/rollouts/{id}/batches", s.rolloutBatches)
+			r.Get("/secrets/names", s.secretNames)
 			r.Get("/agents/{uid}/metrics", s.agentMetrics)
 			r.Get("/agents/{uid}/events", s.agentEvents)
 			r.Method(http.MethodGet, "/events", s.Events)
@@ -170,6 +175,7 @@ func (s *Server) Router() http.Handler {
 			r.Put("/credentials/api-keys/{id}/project", s.setAPIKeyProject)
 			r.Get("/audit", s.listAudit)
 			r.Get("/audit/verify", s.verifyAudit)
+			r.Get("/audit/export", s.exportAudit)
 			r.Get("/system", s.system)
 			r.Get("/auth/tokens", s.listTokens)
 			r.Post("/auth/tokens", s.createToken)
@@ -280,12 +286,14 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 // listAgents supports ?limit=&offset=, the filters ?connected= and ?healthy=
 // (true|false), ?config_status= and repeated ?attr=key=value, and ordering
 // with ?sort=name|last_seen and ?order=asc|desc.
-func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
+// agentFilter reads the fleet filters from the query. ok is false when a
+// response has already been written; none is true when the filters cannot
+// match anything (a group and a project that do not belong together).
+func (s *Server) agentFilter(w http.ResponseWriter, r *http.Request) (f registry.ListFilter, ok bool, none bool) {
 	q := r.URL.Query()
-	f := registry.ListFilter{Attributes: map[string]string{}, Scope: scopeOf(r.Context())}
-	var ok bool
+	f = registry.ListFilter{Attributes: map[string]string{}, Scope: scopeOf(r.Context()), Search: q.Get("q")}
 	if f.Project, ok = projectFilter(w, r); !ok {
-		return
+		return f, false, false
 	}
 	f.Limit, _ = strconv.Atoi(q.Get("limit"))
 	f.Offset, _ = strconv.Atoi(q.Get("offset"))
@@ -297,7 +305,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 			b, err := strconv.ParseBool(v)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, name+" must be true or false")
-				return
+				return f, false, false
 			}
 			*dst = &b
 		}
@@ -305,7 +313,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("config_status"); v != "" {
 		if !slices.Contains([]string{"unset", "applied", "applying", "failed"}, v) {
 			writeError(w, http.StatusBadRequest, "config_status must be unset, applied, applying or failed")
-			return
+			return f, false, false
 		}
 		f.ConfigStatus = &v
 	}
@@ -313,7 +321,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	case "", registry.SortName, registry.SortLastSeen:
 	default:
 		writeError(w, http.StatusBadRequest, "sort must be name or last_seen")
-		return
+		return f, false, false
 	}
 	switch q.Get("order") {
 	case "", "asc":
@@ -321,43 +329,54 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		f.Desc = true
 	default:
 		writeError(w, http.StatusBadRequest, "order must be asc or desc")
-		return
+		return f, false, false
 	}
 	if v := q.Get("group_id"); v != "" {
 		id, err := uuid.Parse(v)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid group_id")
-			return
+			return f, false, false
 		}
 		grp, err := s.Groups.Get(r.Context(), id)
 		if errors.Is(err, targeting.ErrGroupNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
-			return
+			return f, false, false
 		}
 		if err != nil {
 			s.internal(w, r, err)
-			return
+			return f, false, false
 		}
 		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
-			return
+			return f, false, false
 		}
 		// A group only ever matches its own project's agents. Combined with a
 		// project filter for a different project, nothing can match both.
 		if f.Project != nil && !sameProject(f.Project.ID, grp.ProjectID) {
-			writeJSON(w, http.StatusOK, map[string]any{"agents": []registry.Agent{}, "total": 0})
-			return
+			return f, true, true
 		}
 		f.Selector, f.Project = grp.Selector, &registry.ProjectRef{ID: grp.ProjectID}
 	}
 	for _, kv := range q["attr"] {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok || k == "" {
+		k, v, found := strings.Cut(kv, "=")
+		if !found || k == "" {
 			writeError(w, http.StatusBadRequest, "attr must be key=value")
-			return
+			return f, false, false
 		}
 		f.Attributes[k] = v
 	}
 
+	return f, true, false
+}
+
+func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
+	f, ok, none := s.agentFilter(w, r)
+	if !ok {
+		return
+	}
+	if none {
+		writeJSON(w, http.StatusOK, map[string]any{"agents": []registry.Agent{}, "total": 0})
+		return
+	}
 	agents, total, err := s.Registry.List(r.Context(), f)
 	if err != nil {
 		s.internal(w, r, err)

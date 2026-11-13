@@ -250,6 +250,25 @@ func run() error {
 		alerts.Notify(text)
 	}
 	go rollouts.Run(ctx)
+	// Fleet trend: one sample a minute, taken by whichever replica wins the minute.
+	go func() {
+		tick := time.NewTicker(time.Minute)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-tick.C:
+				won, err := rdb.SetNX(ctx, "opamp:fleet-sample:"+now.UTC().Format("200601021504"), 1, 2*time.Minute).Result()
+				if err != nil || !won {
+					continue
+				}
+				if err := reg.SampleFleet(ctx); err != nil {
+					log.Warn("fleet trend sample failed", "err", err)
+				}
+			}
+		}
+	}()
 
 	go (&retention.Job{
 		DB: db, Redis: rdb, Log: log,

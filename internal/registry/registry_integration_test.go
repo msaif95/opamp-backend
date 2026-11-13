@@ -428,3 +428,64 @@ func TestAgentHistory(t *testing.T) {
 		t.Fatalf("paging returned %+v", older)
 	}
 }
+
+func TestSearchBreakdownAndTrend(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	ids := map[string]uuid.UUID{}
+	for host, attrs := range map[string][2]string{
+		"web-01": {"us-east-1", "10.0.0.11"}, "web-02": {"us-east-1", "10.0.0.12"}, "db_01": {"eu-west-1", "10.9.0.5"},
+	} {
+		uid := uuid.New()
+		ids[host] = uid
+		msg := fullReport(host)
+		msg.AgentDescription.NonIdentifyingAttributes = append(msg.AgentDescription.NonIdentifyingAttributes,
+			kv("region", attrs[0]), kv("host.ip", attrs[1]))
+		mustReport(t, r, uid, msg)
+	}
+	search := func(q string) []string {
+		t.Helper()
+		agents, _, err := r.List(ctx, registry.ListFilter{Search: q})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hosts []string
+		for _, a := range agents {
+			hosts = append(hosts, a.Attributes["host.name"])
+		}
+		return hosts
+	}
+	for q, want := range map[string][]string{
+		"WEB":                       {"web-01", "web-02"}, // host name, any case
+		"10.9.0":                    {"db_01"},            // IP address
+		"eu-west":                   {"db_01"},            // any attribute value
+		ids["web-02"].String()[:13]: {"web-02"},           // instance UID
+		"db_":                       {"db_01"},            // _ is literal, not "any character"
+		"%":                         nil,                  // % is literal too
+		"nothing-matches":           nil,
+	} {
+		if got := search(q); !slices.Equal(got, want) {
+			t.Errorf("search %q = %v, want %v", q, got, want)
+		}
+	}
+
+	rows, err := r.Breakdown(ctx, nil, nil, []string{"region"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[1].Values[0] != "us-east-1" || rows[1].Total != 2 || rows[1].Healthy != 2 {
+		t.Fatalf("breakdown = %+v", rows)
+	}
+
+	// Trend: samples are summed across projects and returned in time order.
+	if err := r.SampleFleet(ctx); err != nil {
+		t.Fatal(err)
+	}
+	points, err := r.FleetTrend(ctx, nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Total != 3 || points[0].Connected != 3 {
+		t.Fatalf("trend = %+v", points)
+	}
+}

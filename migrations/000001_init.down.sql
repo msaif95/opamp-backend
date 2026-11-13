@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS fleet_samples;
 DROP TABLE IF EXISTS secrets;
 DROP TRIGGER IF EXISTS agents_record_events_update ON agents;
 DROP TRIGGER IF EXISTS agents_record_events_insert ON agents;

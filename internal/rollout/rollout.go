@@ -304,6 +304,52 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Rollout, error) {
 	return &r, err
 }
 
+// Batch describes one batch of a rollout, for the timeline.
+type Batch struct {
+	// Number is 1-based.
+	Number int            `json:"number"`
+	Agents int            `json:"agents"`
+	Counts map[string]int `json:"counts"`
+	// StartedAt is when the first agent of the batch was offered the config;
+	// nil while the batch has not been released.
+	StartedAt *time.Time `json:"started_at"`
+	// FinishedAt is when the last agent settled; nil while any is still in progress.
+	FinishedAt *time.Time `json:"finished_at"`
+}
+
+// Batches returns the batches of a rollout in order. Times come from when
+// each agent's state last changed, so a batch's start is the earliest state
+// change still on record for it, which is close to but not exactly its release.
+func (s *Service) Batches(ctx context.Context, id uuid.UUID) ([]Batch, error) {
+	rows, err := s.db.Query(ctx, `
+SELECT step + 1, count(*), jsonb_object_agg(status, n),
+       min(first_change) FILTER (WHERE status <> 'pending'),
+       CASE WHEN bool_or(status IN ('pending', 'offered', 'applying')) THEN NULL ELSE max(last_change) END
+FROM (SELECT step, status::text AS status, count(*) AS n, min(updated_at) AS first_change, max(updated_at) AS last_change
+      FROM rollout_agents WHERE rollout_id = $1 GROUP BY step, status) per_status
+GROUP BY step ORDER BY step`, id)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Batch, error) {
+		var (
+			b      Batch
+			counts []byte
+			sum    int
+		)
+		if err := row.Scan(&b.Number, &sum, &counts, &b.StartedAt, &b.FinishedAt); err != nil {
+			return b, err
+		}
+		if err := json.Unmarshal(counts, &b.Counts); err != nil {
+			return b, err
+		}
+		for _, n := range b.Counts {
+			b.Agents += n
+		}
+		return b, nil
+	})
+}
+
 // Problems returns the failed and skipped agents of a rollout, plus
 // rolled-back agents that could not be restored (capped).
 func (s *Service) Problems(ctx context.Context, id uuid.UUID) ([]AgentResult, error) {

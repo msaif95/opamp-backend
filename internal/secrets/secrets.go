@@ -136,6 +136,15 @@ func (s *Store) List(ctx context.Context) ([]Secret, error) {
 	})
 }
 
+// Names lists the names of a project's secrets, for editors that offer them.
+func (s *Store) Names(ctx context.Context, project *uuid.UUID) ([]string, error) {
+	rows, err := s.db.Query(ctx, `SELECT name FROM secrets WHERE project_id IS NOT DISTINCT FROM $1 ORDER BY name`, project)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
 // Delete removes a secret. Configs that still refer to it stop being delivered until it is set again.
 func (s *Store) Delete(ctx context.Context, id uuid.UUID) error {
 	tag, err := s.db.Exec(ctx, `DELETE FROM secrets WHERE id = $1`, id)
