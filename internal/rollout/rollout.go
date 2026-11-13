@@ -43,9 +43,9 @@ var (
 
 var acceptsRemoteConfig = int64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig)
 
-// Pusher asks the replica holding an agent's connection to deliver its desired config.
+// Pusher asks the replicas holding the agents' connections to deliver their desired config.
 type Pusher interface {
-	RequestPush(ctx context.Context, uid uuid.UUID) error
+	RequestPush(ctx context.Context, uids ...uuid.UUID) error
 }
 
 // Rollout is one bulk config push.
@@ -373,6 +373,7 @@ WITH targets AS (
     SELECT ra.instance_uid, ra.previous_config_version_id AS prev
     FROM rollout_agents ra JOIN agents a USING (instance_uid)
     WHERE ra.rollout_id = $1 AND ra.status <> 'pending' AND a.desired_config_version_id = $2
+    ORDER BY ra.instance_uid FOR UPDATE OF a
 ), restored AS (
     UPDATE agents a SET desired_config_version_id = t.prev
     FROM targets t WHERE a.instance_uid = t.instance_uid
@@ -420,10 +421,8 @@ VALUES ('system', 'system', $1, 'rollout', $2, $3::jsonb)`, action, id.String(),
 // pushAll asks for delivery to each agent. Best effort: an agent that
 // misses the push still gets its config with the response to its next message.
 func (s *Service) pushAll(ctx context.Context, id uuid.UUID, uids []uuid.UUID) {
-	for _, uid := range uids {
-		if err := s.push.RequestPush(ctx, uid); err != nil {
-			s.log.WarnContext(ctx, "request push", "rollout_id", id, "instance_uid", uid, "err", err)
-		}
+	if err := s.push.RequestPush(ctx, uids...); err != nil {
+		s.log.WarnContext(ctx, "request push", "rollout_id", id, "agents", len(uids), "err", err)
 	}
 }
 
@@ -586,6 +585,9 @@ WITH batch AS (
     SELECT ra.instance_uid, a.connected, a.capabilities & $4 <> 0 AS accepts, a.desired_config_version_id AS prev
     FROM rollout_agents ra JOIN agents a USING (instance_uid)
     WHERE ra.rollout_id = $1 AND ra.step = $2 AND ra.status = 'pending'
+    -- Lock agents in a fixed order: heartbeat flushes and offline sweeps on
+    -- other replicas update many agent rows too, and unordered locking deadlocks.
+    ORDER BY ra.instance_uid FOR UPDATE OF a
 ), assigned AS (
     UPDATE agents a SET desired_config_version_id = $3
     FROM batch b WHERE a.instance_uid = b.instance_uid AND b.accepts

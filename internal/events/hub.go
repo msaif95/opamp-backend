@@ -20,9 +20,10 @@ const (
 
 // Hub relays messages from one Redis channel to many SSE subscribers.
 type Hub struct {
-	log  *slog.Logger
-	mu   sync.Mutex
-	subs map[chan string]struct{}
+	log    *slog.Logger
+	mu     sync.Mutex
+	subs   map[chan string]struct{}
+	closed bool
 }
 
 // NewHub creates a Hub.
@@ -47,6 +48,19 @@ func (h *Hub) Run(ctx context.Context, rdb *redis.Client, channel string) {
 	}
 }
 
+// Close ends every open event stream and refuses new ones. Streams never
+// finish on their own, so a graceful HTTP shutdown would otherwise wait for
+// them until its deadline.
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for ch := range h.subs {
+		delete(h.subs, ch)
+		close(ch)
+	}
+}
+
 func (h *Hub) broadcast(payload string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -65,8 +79,12 @@ func (h *Hub) broadcast(payload string) {
 func (h *Hub) subscribe() chan string {
 	ch := make(chan string, subscriberBuffer)
 	h.mu.Lock()
-	h.subs[ch] = struct{}{}
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	if h.closed {
+		close(ch)
+	} else {
+		h.subs[ch] = struct{}{}
+	}
 	return ch
 }
 

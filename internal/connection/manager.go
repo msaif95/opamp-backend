@@ -111,8 +111,14 @@ func (m *Manager) Start(addr string, tlsCfg *tls.Config) error {
 	return nil
 }
 
-// Stop closes the listener and all agent connections.
+// Stop closes the listener and all agent connections. The listener goes
+// first: otherwise disconnected agents reconnect straight back to this
+// replica, only to be dropped again when the process exits.
 func (m *Manager) Stop(ctx context.Context) error {
+	var err error
+	if m.httpSrv != nil {
+		err = m.httpSrv.Shutdown(ctx)
+	}
 	m.mu.Lock()
 	conns := make([]types.Connection, 0, len(m.conns))
 	for c := range m.conns {
@@ -122,10 +128,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 	for _, c := range conns {
 		_ = c.Disconnect()
 	}
-	if m.httpSrv == nil {
-		return nil
-	}
-	return m.httpSrv.Shutdown(ctx)
+	return err
 }
 
 // ConnectionCount returns the number of live WebSocket connections on this replica.

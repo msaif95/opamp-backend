@@ -54,7 +54,7 @@ func run() error {
 	if err := store.Migrate(cfg.PostgresDSN, cfg.MigrationsDir); err != nil {
 		return err
 	}
-	db, err := store.Open(ctx, cfg.PostgresDSN)
+	db, err := store.Open(ctx, cfg.PostgresDSN, cfg.PostgresMaxConns)
 	if err != nil {
 		return err
 	}
@@ -95,6 +95,21 @@ func run() error {
 
 	hub := events.NewHub(log)
 	go hub.Run(ctx, rdb, registry.EventsChannel)
+
+	go func() {
+		t := time.NewTicker(registry.HeartbeatFlushInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := reg.FlushHeartbeats(ctx); err != nil {
+					log.Error("heartbeat flush failed", "err", err)
+				}
+			}
+		}
+	}()
 
 	go func() {
 		t := time.NewTicker(cfg.AgentOfflineAfter / 3)
@@ -138,6 +153,7 @@ func run() error {
 		}).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	apiSrv.RegisterOnShutdown(hub.Close)
 	apiErr := make(chan error, 1)
 	go func() { apiErr <- apiSrv.ListenAndServe() }()
 	log.Info("api listener started", "addr", cfg.APIListenAddr)
@@ -151,5 +167,6 @@ func run() error {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	return errors.Join(apiSrv.Shutdown(shutdownCtx), conns.Stop(shutdownCtx))
+	// Agents first, so they move to other replicas while this one drains its API requests.
+	return errors.Join(conns.Stop(shutdownCtx), apiSrv.Shutdown(shutdownCtx))
 }

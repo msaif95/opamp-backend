@@ -12,9 +12,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Open connects to Postgres and returns a ready pool.
-func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// Open connects to Postgres and returns a ready pool of at most maxConns connections.
+func Open(ctx context.Context, dsn string, maxConns int) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres dsn: %w", err)
+	}
+	cfg.MaxConns = int32(maxConns)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("postgres connect: %w", err)
 	}

@@ -3,13 +3,16 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,12 +98,89 @@ type Registry struct {
 	rdb       *redis.Client
 	replicaID string
 	routeTTL  time.Duration
+
+	// Agents that heartbeated since the last flush; see FlushHeartbeats.
+	hbMu       sync.Mutex
+	heartbeats map[uuid.UUID]struct{}
 }
 
 // New creates a Registry. routeTTL bounds how long a routing entry survives
 // without a heartbeat from the owning replica.
 func New(db *pgxpool.Pool, rdb *redis.Client, replicaID string, routeTTL time.Duration) *Registry {
-	return &Registry{db: db, rdb: rdb, replicaID: replicaID, routeTTL: routeTTL}
+	return &Registry{db: db, rdb: rdb, replicaID: replicaID, routeTTL: routeTTL, heartbeats: make(map[uuid.UUID]struct{})}
+}
+
+// HeartbeatFlushInterval is how often buffered heartbeats are written to
+// Postgres; last_seen can lag reality by this much.
+const HeartbeatFlushInterval = 5 * time.Second
+
+// isHeartbeat reports whether the message carries no state change.
+func isHeartbeat(msg *protobufs.AgentToServer) bool {
+	return msg.AgentDescription == nil && msg.Health == nil && msg.EffectiveConfig == nil &&
+		msg.RemoteConfigStatus == nil && msg.PackageStatuses == nil && msg.AgentDisconnect == nil
+}
+
+// heartbeat handles a message with no state change without writing to
+// Postgres: at fleet scale these are almost all messages, and one
+// synchronous commit each would dominate the database's write load. The
+// agent's liveness is recorded in Redis immediately and its last_seen is
+// written in batches. ok is false when the stored row cannot be trusted
+// (unknown agent, marked offline, or changed capabilities) and the caller
+// must fall back to the full upsert.
+func (r *Registry) heartbeat(ctx context.Context, uid uuid.UUID, msg *protobufs.AgentToServer) (st ConfigState, ok bool, err error) {
+	var (
+		caps      int64
+		connected bool
+	)
+	err = r.db.QueryRow(ctx, `
+SELECT capabilities, desired_config_version_id, remote_config_hash, connected FROM agents WHERE instance_uid = $1`,
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!connected || uint64(caps) != msg.Capabilities)) {
+		return st, false, nil
+	}
+	if err != nil {
+		return st, false, fmt.Errorf("load agent %s: %w", uid, err)
+	}
+	st.Capabilities = uint64(caps)
+	if err := r.rdb.Set(ctx, routeKeyPrefix+uid.String(), r.replicaID, r.routeTTL).Err(); err != nil {
+		return st, false, fmt.Errorf("set route %s: %w", uid, err)
+	}
+	r.hbMu.Lock()
+	r.heartbeats[uid] = struct{}{}
+	r.hbMu.Unlock()
+	return st, true, nil
+}
+
+// FlushHeartbeats writes last_seen for every agent that heartbeated since
+// the previous flush, in one statement.
+func (r *Registry) FlushHeartbeats(ctx context.Context) error {
+	r.hbMu.Lock()
+	batch := r.heartbeats
+	r.heartbeats = make(map[uuid.UUID]struct{}, len(batch))
+	r.hbMu.Unlock()
+	if len(batch) == 0 {
+		return nil
+	}
+	uids := make([]uuid.UUID, 0, len(batch))
+	for uid := range batch {
+		uids = append(uids, uid)
+	}
+	// A consistent lock order keeps concurrent flushes from other replicas from deadlocking with this one.
+	slices.SortFunc(uids, func(a, b uuid.UUID) int { return bytes.Compare(a[:], b[:]) })
+	_, err := r.db.Exec(ctx, `
+UPDATE agents SET last_seen = now() FROM (
+    SELECT instance_uid FROM agents WHERE instance_uid = ANY($1) ORDER BY instance_uid FOR UPDATE) locked
+WHERE agents.instance_uid = locked.instance_uid`, uids)
+	if err != nil {
+		// Keep them for the next flush; losing a heartbeat could age a live agent out.
+		r.hbMu.Lock()
+		for _, uid := range uids {
+			r.heartbeats[uid] = struct{}{}
+		}
+		r.hbMu.Unlock()
+		return fmt.Errorf("flush %d heartbeats: %w", len(uids), err)
+	}
+	return nil
 }
 
 const upsertSQL = `
@@ -129,7 +209,10 @@ ON CONFLICT (instance_uid) DO UPDATE SET
     health                = COALESCE($10::jsonb, agents.health),
     effective_config_hash = COALESCE($11, agents.effective_config_hash),
     effective_config      = COALESCE($12, agents.effective_config),
-    remote_config_hash    = COALESCE($13, agents.remote_config_hash),
+    -- When the agent reports a status, its hash is taken as reported, even if
+    -- empty: an agent that lost its state (reinstall, wiped storage) reports
+    -- no hash, and keeping the old one would stop the config being re-offered.
+    remote_config_hash    = CASE WHEN $14::remote_config_status IS NULL THEN agents.remote_config_hash ELSE $13 END,
     remote_config_status  = COALESCE($14::remote_config_status, agents.remote_config_status),
     remote_config_error   = CASE WHEN $14::remote_config_status IS NULL THEN agents.remote_config_error ELSE $15 END,
     connected             = TRUE,
@@ -141,6 +224,11 @@ RETURNING capabilities, desired_config_version_id, remote_config_hash,
 // Report applies an AgentToServer status report. Fields the agent omitted
 // (unchanged since its last message) are left untouched.
 func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *protobufs.AgentToServer) (ConfigState, error) {
+	if isHeartbeat(msg) {
+		if st, ok, err := r.heartbeat(ctx, uid, msg); ok || err != nil {
+			return st, err
+		}
+	}
 	var (
 		attrs, health                      []byte
 		version, healthStatus, healthErr   *string
@@ -237,31 +325,69 @@ WHERE instance_uid = $1 AND capabilities & $3 <> 0`,
 	return r.RequestPush(ctx, uid)
 }
 
-// RequestPush notifies the replica that owns the agent's connection.
-func (r *Registry) RequestPush(ctx context.Context, uid uuid.UUID) error {
-	replica, err := r.Route(ctx, uid)
-	if err != nil || replica == "" {
-		return err
+const (
+	pushChunk = 500
+	// pushWorkers bounds concurrent deliveries on one replica, so a large
+	// rollout batch cannot monopolise the database pool.
+	pushWorkers = 32
+	// pushBuffer must hold a full rollout batch: go-redis drops pub/sub
+	// messages when the consumer falls behind.
+	pushBuffer = 10000
+)
+
+// RequestPush notifies the replicas that own the agents' connections.
+// Agents without a route (offline or polling) are skipped; they receive
+// their config with the response to their next message.
+func (r *Registry) RequestPush(ctx context.Context, uids ...uuid.UUID) error {
+	for len(uids) > 0 {
+		chunk := uids[:min(pushChunk, len(uids))]
+		uids = uids[len(chunk):]
+
+		keys := make([]string, len(chunk))
+		for i, uid := range chunk {
+			keys[i] = routeKeyPrefix + uid.String()
+		}
+		replicas, err := r.rdb.MGet(ctx, keys...).Result()
+		if err != nil {
+			return fmt.Errorf("look up routes: %w", err)
+		}
+		pipe := r.rdb.Pipeline()
+		for i, replica := range replicas {
+			if id, ok := replica.(string); ok {
+				pipe.Publish(ctx, pushChanPrefix+id, chunk[i].String())
+			}
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("publish push requests: %w", err)
+		}
 	}
-	return r.rdb.Publish(ctx, pushChanPrefix+replica, uid.String()).Err()
+	return nil
 }
 
-// SubscribePush calls fn for every push request addressed to this replica
-// until ctx is cancelled.
+// SubscribePush calls fn, concurrently, for every push request addressed to
+// this replica until ctx is cancelled.
 func (r *Registry) SubscribePush(ctx context.Context, fn func(uid uuid.UUID)) {
 	sub := r.rdb.Subscribe(ctx, pushChanPrefix+r.replicaID)
 	defer sub.Close()
+	slots := make(chan struct{}, pushWorkers)
+	msgs := sub.Channel(redis.WithChannelSize(pushBuffer))
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg, ok := <-sub.Channel():
+		case msg, ok := <-msgs:
 			if !ok {
 				return
 			}
-			if uid, err := uuid.Parse(msg.Payload); err == nil {
-				fn(uid)
+			uid, err := uuid.Parse(msg.Payload)
+			if err != nil {
+				continue
 			}
+			slots <- struct{}{}
+			go func() {
+				defer func() { <-slots }()
+				fn(uid)
+			}()
 		}
 	}
 }
@@ -299,10 +425,14 @@ func (r *Registry) Route(ctx context.Context, uid uuid.UUID) (string, error) {
 }
 
 // SweepOffline marks agents not seen within offlineAfter as disconnected.
-// Covers replicas that died without running Disconnected.
+// Covers replicas that died without running Disconnected. Every replica
+// runs it, so rows are locked in a fixed order and rows another replica is
+// already handling are skipped; unordered concurrent sweeps deadlock.
 func (r *Registry) SweepOffline(ctx context.Context, offlineAfter time.Duration) (int64, error) {
 	tag, err := r.db.Exec(ctx,
-		`UPDATE agents SET connected = FALSE WHERE connected AND last_seen < now() - $1::interval`,
+		`UPDATE agents SET connected = FALSE WHERE instance_uid IN (
+    SELECT instance_uid FROM agents WHERE connected AND last_seen < now() - $1::interval
+    ORDER BY instance_uid FOR UPDATE SKIP LOCKED)`,
 		offlineAfter.String())
 	if err != nil {
 		return 0, err

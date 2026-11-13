@@ -26,8 +26,11 @@ type Config struct {
 	TLSClientCAFile string
 
 	PostgresDSN string
-	RedisAddr   string
-	RedisDB     int
+	// PostgresMaxConns caps this replica's connection pool. Size it so that
+	// replicas x PostgresMaxConns stays below the server's max_connections.
+	PostgresMaxConns int
+	RedisAddr        string
+	RedisDB          int
 
 	// JWTSigningKey signs human-session JWTs and agent JWTs.
 	JWTSigningKey []byte
@@ -80,6 +83,9 @@ func Load() (*Config, error) {
 	}
 
 	var err error
+	if c.PostgresMaxConns, err = strconv.Atoi(env("POSTGRES_MAX_CONNS", "10")); err != nil || c.PostgresMaxConns < 2 {
+		return nil, fmt.Errorf("POSTGRES_MAX_CONNS must be a number of at least 2")
+	}
 	if c.RedisDB, err = strconv.Atoi(env("REDIS_DB", "0")); err != nil {
 		return nil, fmt.Errorf("REDIS_DB: %w", err)
 	}

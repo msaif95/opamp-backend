@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +46,8 @@ func main() {
 	heartbeat := flag.Duration("heartbeat", 30*time.Second, "heartbeat interval")
 	unhealthyPct := flag.Int("unhealthy-pct", 0, "percentage of agents reporting unhealthy")
 	applyFailPct := flag.Int("apply-fail-pct", 0, "percentage of agents that fail to apply remote config")
+	backends := flag.String("backends", "", "comma-separated host:port list; connections are spread across them and fail over to a live one, like an L4 load balancer")
+	ramp := flag.Int("ramp", 0, "agents started per second (0 = all at once)")
 	caFile := flag.String("ca", "", "CA bundle to verify the server (wss only)")
 	certFile := flag.String("cert", "", "client certificate for mTLS")
 	keyFile := flag.String("key", "", "client key for mTLS")
@@ -65,6 +70,47 @@ func main() {
 			tlsCfg.Certificates = []tls.Certificate{cert}
 		}
 	}
+	// Emulates an L4 load balancer in front of the replicas: each dial starts
+	// at a random backend and falls through to the next one that accepts.
+	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	if *backends != "" {
+		addrs := strings.Split(*backends, ",")
+		// Thousands of simultaneous dials during a reconnect storm would exhaust the simulator's OS threads.
+		dialSlots := make(chan struct{}, 256)
+		dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			select {
+			case dialSlots <- struct{}{}:
+				defer func() { <-dialSlots }()
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			var (
+				d       net.Dialer
+				lastErr error
+			)
+			start := rand.IntN(len(addrs))
+			for i := range addrs {
+				conn, err := d.DialContext(ctx, network, addrs[(start+i)%len(addrs)])
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		}
+	}
+
+	var connected, connectFailures atomic.Int64
+	go func() {
+		var last string
+		for range time.Tick(5 * time.Second) {
+			if line := fmt.Sprintf("connected=%d connect_failures=%d", connected.Load(), connectFailures.Load()); line != last {
+				log.Print(line)
+				last = line
+			}
+		}
+	}()
+
 	header := http.Header{}
 	if *token != "" {
 		header.Set("Authorization", "Bearer "+*token)
@@ -81,10 +127,9 @@ func main() {
 
 	clients := make([]client.OpAMPClient, 0, *n)
 	for i := range *n {
-		uid, err := uuid.NewV7()
-		if err != nil {
-			log.Fatal(err)
-		}
+		// Derived from the index so that re-running the simulator reconnects
+		// the same agents instead of creating new ones.
+		uid := uuid.NewSHA1(uuid.NameSpaceDNS, fmt.Appendf(nil, "agentsim-%d", i))
 		c := client.NewWebSocket(nil)
 		region := regions[i%len(regions)]
 		must(c.SetAgentDescription(&protobufs.AgentDescription{
@@ -127,10 +172,13 @@ func main() {
 			OpAMPServerURL:    *url,
 			Header:            header,
 			TLSConfig:         tlsCfg,
+			DialContext:       dial,
 			InstanceUid:       types.InstanceUid(uid),
 			HeartbeatInterval: heartbeat,
 			Callbacks: types.Callbacks{
-				OnConnectFailed: func(_ context.Context, err error) { log.Printf("agent %s connect failed: %v", uid, err) },
+				OnConnect: func(context.Context) { connected.Add(1) },
+				// Counted rather than logged: at fleet scale one line per failure floods the output.
+				OnConnectFailed: func(context.Context, error) { connectFailures.Add(1) },
 				GetEffectiveConfig: func(context.Context) (*protobufs.EffectiveConfig, error) {
 					mu.Lock()
 					defer mu.Unlock()
@@ -170,6 +218,9 @@ func main() {
 			},
 		}))
 		clients = append(clients, c)
+		if *ramp > 0 && (i+1)%*ramp == 0 {
+			time.Sleep(time.Second)
+		}
 	}
 	log.Printf("started %d simulated agents against %s", *n, *url)
 
