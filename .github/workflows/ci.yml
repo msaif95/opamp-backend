@@ -1,0 +1,55 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_USER: opamp, POSTGRES_PASSWORD: opamp, POSTGRES_DB: opamp_test }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U opamp" --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Lint
+        run: make lint
+      - name: Module files are tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Test (unit and integration)
+        env:
+          OPAMP_TEST_POSTGRES_DSN: postgres://opamp:opamp@localhost:5432/opamp_test?sslmode=disable
+        # -p 1: the integration tests share one database.
+        run: go test -race -p 1 ./...
+      - name: Known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: v
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: docker build --build-arg VERSION=sha-${{ steps.v.outputs.sha }} -t ghcr.io/${{ github.repository_owner }}/opamp-backend:sha-${{ steps.v.outputs.sha }} .
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: docker push ghcr.io/${{ github.repository_owner }}/opamp-backend:sha-${{ steps.v.outputs.sha }}

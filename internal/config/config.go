@@ -11,6 +11,20 @@ import (
 
 // Config is the full runtime configuration for one backend replica.
 type Config struct {
+	// DevMode relaxes the production safety checks in Validate: plaintext
+	// agent connections and weak secrets are allowed. Never set it in production.
+	DevMode bool
+	// AgentTLSUpstream declares that a load balancer in front of the OpAMP
+	// port terminates TLS, so the listener itself may be plaintext. Agent
+	// client certificates (mTLS) cannot be used in that setup.
+	AgentTLSUpstream bool
+
+	// Retention, in days; 0 keeps the data forever.
+	AuditRetentionDays   int
+	RolloutRetentionDays int
+	// AgentRetentionDays removes agents that have been offline this long.
+	AgentRetentionDays int
+
 	// ReplicaID uniquely identifies this backend instance in the Redis routing table.
 	ReplicaID string
 
@@ -96,6 +110,8 @@ func Load() (*Config, error) {
 		PublicURL:          strings.TrimRight(env("PUBLIC_URL", ""), "/"),
 		RebalanceEnabled:   env("REBALANCE_ENABLED", "true") == "true",
 		TrustProxyHeaders:  env("TRUST_PROXY_HEADERS", "false") == "true",
+		DevMode:            env("DEV_MODE", "false") == "true",
+		AgentTLSUpstream:   env("AGENT_TLS_TERMINATED_UPSTREAM", "false") == "true",
 		MigrationsDir:      env("MIGRATIONS_DIR", "migrations"),
 		LogLevel:           env("LOG_LEVEL", "info"),
 	}
@@ -116,6 +132,15 @@ func Load() (*Config, error) {
 	if c.AgentOfflineAfter, err = time.ParseDuration(env("AGENT_OFFLINE_AFTER", "90s")); err != nil {
 		return nil, fmt.Errorf("AGENT_OFFLINE_AFTER: %w", err)
 	}
+	for name, dst := range map[string]*int{
+		"AUDIT_RETENTION_DAYS": &c.AuditRetentionDays, "ROLLOUT_RETENTION_DAYS": &c.RolloutRetentionDays,
+		"AGENT_RETENTION_DAYS": &c.AgentRetentionDays,
+	} {
+		def := map[string]string{"AUDIT_RETENTION_DAYS": "0", "ROLLOUT_RETENTION_DAYS": "180", "AGENT_RETENTION_DAYS": "30"}[name]
+		if *dst, err = strconv.Atoi(env(name, def)); err != nil || *dst < 0 {
+			return nil, fmt.Errorf("%s must be a number of days, 0 or more", name)
+		}
+	}
 	if len(c.JWTSigningKey) < 32 {
 		return nil, fmt.Errorf("JWT_SIGNING_KEY must be set and at least 32 bytes")
 	}
@@ -125,8 +150,44 @@ func Load() (*Config, error) {
 	if c.TLSClientCAFile != "" && c.TLSCertFile == "" {
 		return nil, fmt.Errorf("TLS_CLIENT_CA_FILE requires TLS_CERT_FILE/TLS_KEY_FILE")
 	}
-	return c, nil
+	return c, c.validateProduction()
 }
+
+// validateProduction refuses configurations that are only safe on a
+// developer's machine, unless DevMode says that is where we are. Failing at
+// start-up beats discovering a plaintext listener or a default password in
+// production.
+func (c *Config) validateProduction() error {
+	if c.DevMode {
+		return nil
+	}
+	var problems []string
+	if c.TLSCertFile == "" && !c.AgentTLSUpstream {
+		problems = append(problems, "agent connections would be plaintext: set TLS_CERT_FILE and TLS_KEY_FILE, "+
+			"or AGENT_TLS_TERMINATED_UPSTREAM=true if a load balancer terminates TLS")
+	}
+	if strings.Contains(strings.ToLower(string(c.JWTSigningKey)), "dev-only") {
+		problems = append(problems, "JWT_SIGNING_KEY is the development key")
+	}
+	if c.LocalAdminPassword != "" && len(c.LocalAdminPassword) < minAdminPasswordLen {
+		problems = append(problems, fmt.Sprintf("LOCAL_ADMIN_PASSWORD is shorter than %d characters", minAdminPasswordLen))
+	}
+	if c.OktaIssuer != "" && !strings.HasPrefix(c.OktaIssuer, "https://") {
+		problems = append(problems, "OKTA_ISSUER must use https")
+	}
+	if c.OktaIssuer != "" && !strings.HasPrefix(c.OktaRedirectURL, "https://") {
+		problems = append(problems, "OKTA_REDIRECT_URL must use https")
+	}
+	if c.OktaIssuer == "" && c.LocalAdminPassword == "" {
+		problems = append(problems, "no sign-in method: configure Okta or set LOCAL_ADMIN_PASSWORD")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("unsafe configuration (set DEV_MODE=true only on a development machine): %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+const minAdminPasswordLen = 16
 
 // MTLSEnabled reports whether agent client-cert verification is configured.
 func (c *Config) MTLSEnabled() bool { return c.TLSClientCAFile != "" }

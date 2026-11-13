@@ -28,11 +28,15 @@ import (
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
+	"github.com/msaif95/opamp-backend/internal/retention"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/store"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/telemetry"
 )
+
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
 
 // credentialCheckInterval bounds how long a revoked or expired credential
 // can keep an already established agent connection open.
@@ -61,6 +65,10 @@ func run() error {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})).With("replica", cfg.ReplicaID)
 	slog.SetDefault(log)
+	log.Info("starting opamp-backend", "version", version)
+	if cfg.DevMode {
+		log.Warn("DEV_MODE is on: production safety checks are disabled")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -109,7 +117,7 @@ func run() error {
 			return err
 		}
 	} else {
-		log.Warn("OpAMP listener running WITHOUT TLS; development use only")
+		log.Warn("OpAMP listener is plaintext", "tls_terminated_upstream", cfg.AgentTLSUpstream, "dev_mode", cfg.DevMode)
 	}
 	if err := conns.Start(cfg.OpAMPListenAddr, tlsCfg); err != nil {
 		return err
@@ -170,6 +178,11 @@ func run() error {
 		alerts.Notify(text)
 	}
 	go rollouts.Run(ctx)
+
+	go (&retention.Job{
+		DB: db, Redis: rdb, Log: log,
+		AuditDays: cfg.AuditRetentionDays, RolloutDays: cfg.RolloutRetentionDays, AgentDays: cfg.AgentRetentionDays,
+	}).Run(ctx)
 
 	go (&alert.HealthMonitor{
 		Stats: func(ctx context.Context) (alert.FleetStats, error) {
@@ -260,7 +273,8 @@ func run() error {
 			Alerts: alertStore,
 			Status: api.SystemStatus{
 				SSO: sso != nil, SSOIssuer: cfg.OktaIssuer, LocalLogin: cfg.LocalAdminPassword != "",
-				AgentTLS: tlsCfg != nil, AgentMTLS: cfg.MTLSEnabled(),
+				Version: version, DevMode: cfg.DevMode,
+				AgentTLS: tlsCfg != nil || cfg.AgentTLSUpstream, AgentMTLS: cfg.MTLSEnabled(),
 				AlertWebhook: alerts.Configured(), Telemetry: telemetry.Enabled(), Rebalancing: cfg.RebalanceEnabled,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),

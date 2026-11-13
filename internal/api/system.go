@@ -5,6 +5,9 @@ import "net/http"
 // SystemStatus is how this deployment is configured. It carries no secrets:
 // only whether each protection is on.
 type SystemStatus struct {
+	Version string `json:"version"`
+	// DevMode means the production safety checks are switched off.
+	DevMode    bool   `json:"dev_mode"`
 	SSO        bool   `json:"sso"`
 	SSOIssuer  string `json:"sso_issuer"`
 	LocalLogin bool   `json:"local_login"`

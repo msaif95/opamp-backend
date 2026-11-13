@@ -9,7 +9,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `make run` defaults to local admin `admin`/`admin` and a dev JWT key; both are dev-only.
 - Simulated agents: `go run ./cmd/agentsim -n 200 -token <api key>`; issue the key with
   `POST /api/v1/credentials/api-keys` (admin) or from the UI's Agent credentials page.
-- Migrations in `migrations/` are applied on startup (golang-migrate); add new numbered files, never edit applied ones.
+- Migrations in `migrations/` are applied on startup (golang-migrate). The schema is a single `000001_init` pair
+  (squashed before the first production deployment); from now on add new numbered files, never edit applied ones.
 - Layout: `internal/connection` (listener, auth on connect, live conn tracking), `internal/protocol` (message
   handling, OpAMP-only), `internal/registry` (Postgres agent state + Redis `opamp:route:<uid>` routing table and
   `opamp:agent-events` pub/sub), `internal/agentconfig` (config templates, immutable versions, YAML/pipeline validation;
@@ -64,3 +65,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Rebalancing (`internal/connection/rebalance.go`) and fleet-health alerts (`internal/alert/health.go`) are pure
   decision functions plus a small loop; keep the logic in the tested functions.
 - A running rollout picks up agents that start matching its selector (they join the next batch); a finished one does not.
+- Production guards: `config.Load` refuses plaintext agent connections, the dev signing key, a short admin
+  password or no sign-in method unless `DEV_MODE=true` (set by `make run*` and `scripts/replicas.sh`).
+- Retention (`internal/retention`): audit events, finished rollouts and long-offline agents are pruned by
+  `AUDIT_RETENTION_DAYS` (0 = keep), `ROLLOUT_RETENTION_DAYS` (180), `AGENT_RETENTION_DAYS` (30).
+- CI (`.github/workflows/ci.yml`) runs lint, the integration tests and govulncheck, then builds the image.

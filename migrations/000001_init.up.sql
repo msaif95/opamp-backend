@@ -35,6 +35,8 @@ CREATE TABLE agents (
 CREATE INDEX agents_attributes_gin ON agents USING GIN (attributes jsonb_path_ops);
 CREATE INDEX agents_last_seen_idx ON agents (last_seen);
 CREATE INDEX agents_connected_idx ON agents (connected);
+CREATE INDEX agents_desired_config_idx ON agents (desired_config_version_id) WHERE desired_config_version_id IS NOT NULL;
+CREATE INDEX agents_host_name_idx ON agents ((attributes->>'host.name'), instance_uid);
 
 -- Config templates / versions ---------------------------------------------
 CREATE TYPE config_origin AS ENUM ('ui', 'git');
@@ -81,19 +83,27 @@ CREATE TABLE agent_groups (
 
 -- Rollouts -----------------------------------------------------------------
 CREATE TYPE rollout_status AS ENUM ('pending', 'running', 'paused', 'completed', 'failed', 'rolled_back', 'aborted');
-CREATE TYPE rollout_agent_status AS ENUM ('pending', 'offered', 'applying', 'applied', 'failed', 'skipped');
+CREATE TYPE rollout_agent_status AS ENUM ('pending', 'offered', 'applying', 'applied', 'failed', 'skipped', 'rolled_back');
 
 CREATE TABLE rollouts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     config_version_id   UUID NOT NULL REFERENCES config_versions(id),
-    group_id            UUID REFERENCES agent_groups(id),
+    -- The saved group the target came from, if any. The rollout keeps its own
+    -- selector snapshot, so deleting the group must not be blocked by history.
+    group_id            UUID REFERENCES agent_groups(id) ON DELETE SET NULL,
     selector            JSONB NOT NULL,
-    -- Strategy: canary steps as percentages, batch size, pause threshold.
-    canary_steps_pct    INTEGER[] NOT NULL DEFAULT '{1,10,50,100}',
+    -- Strategy. NULL canary_steps_pct means fixed-size batches of batch_size;
+    -- otherwise cumulative percentages of the target, e.g. {1,10,50,100}.
+    canary_steps_pct    INTEGER[],
     batch_size          INTEGER NOT NULL DEFAULT 100,
     max_failure_pct     NUMERIC(5,2) NOT NULL DEFAULT 2.0,
+    -- Roll back instead of pausing when a batch exceeds max_failure_pct.
+    auto_rollback       BOOLEAN NOT NULL DEFAULT FALSE,
     status              rollout_status NOT NULL DEFAULT 'pending',
     current_step        INTEGER NOT NULL DEFAULT 0,
+    -- Highest step whose failures an operator has acknowledged by resuming.
+    -- The failure threshold is only enforced for steps above it.
+    ack_step            INTEGER NOT NULL DEFAULT -1,
     created_by          TEXT NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at          TIMESTAMPTZ,
@@ -109,6 +119,8 @@ CREATE TABLE rollout_agents (
     status         rollout_agent_status NOT NULL DEFAULT 'pending',
     error          TEXT,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- What the agent was assigned before this rollout touched it, for rollback.
+    previous_config_version_id UUID REFERENCES config_versions(id) ON DELETE SET NULL,
     PRIMARY KEY (rollout_id, instance_uid)
 );
 CREATE INDEX rollout_agents_status_idx ON rollout_agents (rollout_id, status);

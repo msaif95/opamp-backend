@@ -1,0 +1,28 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      version: { description: "Release version (MAJOR.MINOR.PATCH)", required: true }
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions: { contents: write, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: '[[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be MAJOR.MINOR.PATCH"; exit 1; }'
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: make lint && go test -race ./...
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/opamp-backend:${{ inputs.version }}
+          docker build --build-arg VERSION=${{ inputs.version }} -t $IMG . && docker push $IMG
+          echo "- \`$IMG\` $(docker inspect --format='{{index .RepoDigests 0}}' $IMG | cut -d@ -f2)" > digests.md
+      - run: |
+          git config user.name "github-actions[bot]"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ inputs.version }}" -m "opamp-backend ${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
+      - uses: softprops/action-gh-release@v2
+        with: { tag_name: 'v${{ inputs.version }}', name: 'opamp-backend ${{ inputs.version }}', body_path: digests.md, generate_release_notes: true }

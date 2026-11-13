@@ -3,6 +3,10 @@
 # Dev-only defaults; never use these values outside a local machine.
 export JWT_SIGNING_KEY ?= dev-only-signing-key-do-not-use-in-prod
 export LOCAL_ADMIN_PASSWORD ?= admin
+export DEV_MODE ?= true
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
 
 COMPOSE := docker compose -f ../opamp-deploy/compose/docker-compose.yml
 
@@ -23,7 +27,7 @@ run-sso:
 	go run ./cmd/server
 
 build:
-	go build -o bin/opamp-backend ./cmd/server
+	go build -ldflags "$(LDFLAGS)" -o bin/opamp-backend ./cmd/server
 
 test:
 	go test -race ./...

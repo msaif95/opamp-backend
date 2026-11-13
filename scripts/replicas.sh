@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 run_dir="${OPAMP_RUN_DIR:-/tmp/opamp-replicas}"
 export JWT_SIGNING_KEY="${JWT_SIGNING_KEY:-dev-only-signing-key-do-not-use-in-prod}"
 export LOCAL_ADMIN_PASSWORD="${LOCAL_ADMIN_PASSWORD:-admin}"
+export DEV_MODE=true
 
 stop() {
   for pid_file in "$run_dir"/*.pid; do
