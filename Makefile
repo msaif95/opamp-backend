@@ -1,4 +1,4 @@
-.PHONY: deps-up deps-down run run-sso build test lint
+.PHONY: deps-up deps-down run run-sso build test test-integration lint
 
 # Dev-only defaults; never use these values outside a local machine.
 export JWT_SIGNING_KEY ?= dev-only-signing-key-do-not-use-in-prod
@@ -27,6 +27,15 @@ build:
 
 test:
 	go test -race ./...
+
+# Runs every test, including those that need Postgres and Redis (`make deps-up` first).
+# Uses a separate `opamp_test` database and Redis database 15, so dev data is untouched.
+# -p 1: the integration tests share that database, so packages must not run in parallel.
+test-integration:
+	docker exec opamp-postgres-1 psql -U opamp -tAc "SELECT 1 FROM pg_database WHERE datname = 'opamp_test'" | grep -q 1 \
+		|| docker exec opamp-postgres-1 psql -U opamp -c "CREATE DATABASE opamp_test"
+	OPAMP_TEST_POSTGRES_DSN='postgres://opamp:opamp@localhost:5432/opamp_test?sslmode=disable' \
+		go test -race -p 1 ./...
 
 lint:
 	test -z "$$(gofmt -l .)"

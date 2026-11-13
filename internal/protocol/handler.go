@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/open-telemetry/opamp-go/protobufs"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
+	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/registry"
 )
 
@@ -38,11 +40,13 @@ type Handler struct {
 	reg     Registry
 	configs ConfigSource
 	log     *slog.Logger
+	// During a database outage every agent message fails the same way.
+	reportErr *logthrottle.Throttle
 }
 
 // NewHandler creates a Handler.
 func NewHandler(reg Registry, configs ConfigSource, log *slog.Logger) *Handler {
-	return &Handler{reg: reg, configs: configs, log: log}
+	return &Handler{reg: reg, configs: configs, log: log, reportErr: logthrottle.New(10 * time.Second)}
 }
 
 // Handle processes one message. needFullState asks the agent to resend its
@@ -62,7 +66,9 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 
 	state, err := h.reg.Report(ctx, uid, id, msg)
 	if err != nil {
-		h.log.ErrorContext(ctx, "agent report failed", "instance_uid", uid, "err", err)
+		h.reportErr.Do(func(suppressed int64) {
+			h.log.ErrorContext(ctx, "agent report failed", "instance_uid", uid, "err", err, "similar_errors_suppressed", suppressed)
+		})
 		resp.ErrorResponse = &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable,
 			ErrorMessage: "registry unavailable",

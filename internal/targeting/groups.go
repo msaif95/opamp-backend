@@ -86,6 +86,26 @@ INSERT INTO agent_groups (name, description, selector) VALUES ($1, $2, $3::jsonb
 	return grp, err
 }
 
+// Update replaces a group's name, description and selector.
+func (g *Groups) Update(ctx context.Context, id uuid.UUID, name, description string, sel Selector) (*Group, error) {
+	selJSON, err := json.Marshal(sel)
+	if err != nil {
+		return nil, err
+	}
+	grp := &Group{ID: id, Name: name, Description: description, Selector: sel}
+	err = g.db.QueryRow(ctx, `
+UPDATE agent_groups SET name = $2, description = $3, selector = $4::jsonb, updated_at = now()
+WHERE id = $1 RETURNING created_at`, id, name, description, selJSON).Scan(&grp.CreatedAt)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, ErrGroupNotFound
+	case errors.As(err, &pgErr) && pgErr.Code == "23505":
+		return nil, ErrGroupNameTaken
+	}
+	return grp, err
+}
+
 // Delete removes a group. Past rollouts keep their own copy of the selector.
 func (g *Groups) Delete(ctx context.Context, id uuid.UUID) error {
 	tag, err := g.db.Exec(ctx, `DELETE FROM agent_groups WHERE id = $1`, id)

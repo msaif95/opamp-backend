@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,19 +16,32 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
+	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/config"
 	"github.com/msaif95/opamp-backend/internal/connection"
 	"github.com/msaif95/opamp-backend/internal/events"
+	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/store"
 	"github.com/msaif95/opamp-backend/internal/targeting"
+	"github.com/msaif95/opamp-backend/internal/telemetry"
 )
+
+// credentialCheckInterval bounds how long a revoked or expired credential
+// can keep an already established agent connection open.
+const credentialCheckInterval = 30 * time.Second
+
+// redisLogger adapts a function to go-redis's internal logging interface.
+type redisLogger func(msg string)
+
+func (f redisLogger) Printf(_ context.Context, format string, v ...any) { f(fmt.Sprintf(format, v...)) }
 
 func main() {
 	if err := run(); err != nil {
@@ -51,6 +65,17 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	stopTelemetry, err := telemetry.Setup(ctx, cfg.ReplicaID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = stopTelemetry(flushCtx)
+	}()
+	log.Info("self-telemetry", "otlp_export", telemetry.Enabled())
+
 	if err := store.Migrate(cfg.PostgresDSN, cfg.MigrationsDir); err != nil {
 		return err
 	}
@@ -60,6 +85,13 @@ func run() error {
 	}
 	defer db.Close()
 
+	// go-redis logs every failed dial; during an outage that is thousands of lines a minute.
+	redisLog := logthrottle.New(10 * time.Second)
+	redis.SetLogger(redisLogger(func(msg string) {
+		redisLog.Do(func(suppressed int64) {
+			log.Warn("redis client", "msg", msg, "similar_messages_suppressed", suppressed)
+		})
+	}))
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB})
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -90,8 +122,86 @@ func run() error {
 		conns.Push(pushCtx, uid)
 	})
 
+	alertStore := alert.NewStore(rdb)
+	alerts := alert.NewWebhook(cfg.AlertWebhookURL, log)
+	alerts.Record = func(ctx context.Context, a alert.Alert) {
+		if err := alertStore.Add(ctx, a); err != nil {
+			log.Error("record alert", "err", err)
+		}
+	}
+	go alerts.Run(ctx)
+
+	startedAt := time.Now().UTC()
+	announce := func() {
+		if err := reg.AnnounceReplica(ctx, conns.ConnectionCount(), startedAt); err != nil && ctx.Err() == nil {
+			log.Error("announce replica", "err", err)
+		}
+	}
+	announce()
+	go func() {
+		t := time.NewTicker(registry.ReplicaAnnounceInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				announce()
+			}
+		}
+	}()
+
 	rollouts := rollout.NewService(db, reg, log)
+	rollouts.OnOutcome = func(_ context.Context, outcome string, r *rollout.Rollout) {
+		failed := r.Counts["failed"]
+		// A clean completion is not worth a page; everything else is.
+		if outcome == "completed" && failed == 0 {
+			return
+		}
+		// For pauses and rollbacks the rollout's own error already says what happened and why.
+		what := fmt.Sprintf("completed with %d failed agents", failed)
+		if outcome != "completed" && r.Error != nil {
+			what = *r.Error
+		}
+		text := fmt.Sprintf("OpAMP bulk push of %s v%d to %d agents %s.", r.ConfigName, r.ConfigVersion, r.TotalAgents, what)
+		if cfg.PublicURL != "" {
+			text += " " + cfg.PublicURL + "/rollouts/" + r.ID.String()
+		}
+		alerts.Notify(text)
+	}
 	go rollouts.Run(ctx)
+
+	go (&alert.HealthMonitor{
+		Stats: func(ctx context.Context) (alert.FleetStats, error) {
+			connected, unhealthy, offline, err := reg.FleetHealth(ctx, alert.RecentlyOfflineWindow)
+			return alert.FleetStats{Connected: connected, Unhealthy: unhealthy, RecentlyOffline: offline}, err
+		},
+		Redis: rdb, Notify: alerts.Notify, OfflinePct: cfg.AlertOfflinePct, UnhealthyPct: cfg.AlertUnhealthyPct,
+		PublicURL: cfg.PublicURL, Log: log,
+	}).Run(ctx)
+
+	if cfg.RebalanceEnabled {
+		go (&connection.Rebalancer{
+			Manager: conns, ReplicaID: cfg.ReplicaID, StartedAt: startedAt, Replicas: reg.Replicas, Log: log,
+		}).Run(ctx)
+	}
+
+	go func() {
+		t := time.NewTicker(credentialCheckInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n, err := conns.EnforceCredentials(ctx); err != nil {
+					log.Error("credential enforcement failed", "err", err)
+				} else if n > 0 {
+					log.Info("closed connections with revoked or expired credentials", "count", n)
+				}
+			}
+		}
+	}()
 
 	hub := events.NewHub(log)
 	go hub.Run(ctx, rdb, registry.EventsChannel)
@@ -143,15 +253,28 @@ func run() error {
 
 	apiSrv := &http.Server{
 		Addr: cfg.APIListenAddr,
-		Handler: (&api.Server{
+		Handler: otelhttp.NewHandler((&api.Server{
 			DB: db, Registry: reg, Configs: configs, Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
-			Sessions: auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword),
-			Ready: func(ctx context.Context) error {
-				return errors.Join(db.Ping(ctx), rdb.Ping(ctx).Err())
+			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
+			Alerts: alertStore,
+			Status: api.SystemStatus{
+				SSO: sso != nil, SSOIssuer: cfg.OktaIssuer, LocalLogin: cfg.LocalAdminPassword != "",
+				AgentTLS: tlsCfg != nil, AgentMTLS: cfg.MTLSEnabled(),
+				AlertWebhook: alerts.Configured(), Telemetry: telemetry.Enabled(), Rebalancing: cfg.RebalanceEnabled,
+				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
+				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-		}).Router(),
+			Sessions: auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword),
+			// Postgres only. A Redis outage degrades pushes and live updates but
+			// agents and the console keep working, and marking every replica
+			// unready would turn that into a full outage.
+			Ready: db.Ping,
+		}).Router(), "api"),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		// No WriteTimeout: the event stream is a long-lived response.
 	}
 	apiSrv.RegisterOnShutdown(hub.Close)
 	apiErr := make(chan error, 1)
@@ -167,6 +290,7 @@ func run() error {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	_ = reg.WithdrawReplica(shutdownCtx)
 	// Agents first, so they move to other replicas while this one drains its API requests.
 	return errors.Join(conns.Stop(shutdownCtx), apiSrv.Shutdown(shutdownCtx))
 }

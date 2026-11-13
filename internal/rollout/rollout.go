@@ -103,6 +103,11 @@ type Service struct {
 	db   *pgxpool.Pool
 	push Pusher
 	log  *slog.Logger
+
+	// OnOutcome, if set, is called when the engine itself ends or stops a
+	// rollout: "paused", "rolled_back" or "completed". It is called once,
+	// by the replica that made the transition.
+	OnOutcome func(ctx context.Context, outcome string, r *Rollout)
 }
 
 // NewService creates a Service.
@@ -472,19 +477,26 @@ WHERE r.status = 'running' OR (r.status IN ('paused', 'aborted') AND EXISTS (
 		return
 	}
 	for _, id := range ids {
-		released, err := s.advance(ctx, id)
+		var outcome string
+		released, err := s.advance(ctx, id, &outcome)
 		if err != nil {
 			s.log.ErrorContext(ctx, "advance rollout", "rollout_id", id, "err", err)
 			continue
 		}
 		s.pushAll(ctx, id, released)
+		if outcome != "" && s.OnOutcome != nil {
+			if r, err := s.Get(ctx, id); err == nil {
+				s.OnOutcome(ctx, outcome, r)
+			}
+		}
 	}
 }
 
 // advance performs one step of the rollout state machine and returns the
 // agents that must be pushed a config: the newly released batch, or on an
-// automatic rollback the agents being restored.
-func (s *Service) advance(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+// automatic rollback the agents being restored. outcome is set when this
+// call paused, rolled back or completed the rollout.
+func (s *Service) advance(ctx context.Context, id uuid.UUID, outcome *string) ([]uuid.UUID, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -498,13 +510,14 @@ func (s *Service) advance(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error
 		maxFailurePct     float64
 		autoRollback      bool
 		nextStep, ackStep int
+		selJSON           []byte
 	)
 	err = tx.QueryRow(ctx, `
 SELECT r.config_version_id, r.status::text, cv.body_hash, r.max_failure_pct::float8, r.auto_rollback,
-       r.current_step, r.ack_step
+       r.current_step, r.ack_step, r.selector
 FROM rollouts r JOIN config_versions cv ON cv.id = r.config_version_id
 WHERE r.id = $1 FOR UPDATE OF r SKIP LOCKED`, id).
-		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep)
+		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep, &selJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // another replica is advancing it
 	}
@@ -540,6 +553,24 @@ WHERE ra.rollout_id = $1 AND ra.instance_uid = a.instance_uid AND ra.status IN (
 		return nil, tx.Commit(ctx)
 	}
 
+	// Agents that started matching the target after the rollout began (new
+	// collectors, or ones whose attributes changed) join the next batch to
+	// be released, so a long rollout does not leave them behind.
+	var sel targeting.Selector
+	if err := json.Unmarshal(selJSON, &sel); err != nil {
+		return nil, fmt.Errorf("decode selector: %w", err)
+	}
+	where, args := sel.Where("a.attributes", 3)
+	_, err = tx.Exec(ctx, `
+INSERT INTO rollout_agents (rollout_id, instance_uid, step)
+SELECT $1, a.instance_uid, $2 FROM agents a
+WHERE `+where+` AND NOT EXISTS (
+    SELECT 1 FROM rollout_agents ra WHERE ra.rollout_id = $1 AND ra.instance_uid = a.instance_uid)`,
+		append([]any{id, nextStep}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("add newly matching agents: %w", err)
+	}
+
 	// 2. Judge the batch in flight.
 	if active := nextStep - 1; active >= 0 {
 		var failed, inFlight, attempted int
@@ -561,6 +592,7 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 				if err := auditSystem(ctx, tx, "rollout.auto_rollback", id, detail); err != nil {
 					return nil, err
 				}
+				*outcome = "rolled_back"
 				return restored, tx.Commit(ctx)
 			}
 			msg := "paused automatically: " + detail
@@ -570,6 +602,7 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 			if err := auditSystem(ctx, tx, "rollout.auto_pause", id, detail); err != nil {
 				return nil, err
 			}
+			*outcome = "paused"
 			return nil, tx.Commit(ctx)
 		}
 		if inFlight > 0 {
@@ -629,6 +662,7 @@ RETURNING ra.instance_uid, ra.status = 'offered'`, id, nextStep, versionID, acce
 	if n == 0 {
 		// Batches are contiguous, so an empty one means every agent is settled.
 		_, err = tx.Exec(ctx, `UPDATE rollouts SET status = 'completed', finished_at = now() WHERE id = $1`, id)
+		*outcome = "completed"
 	} else {
 		_, err = tx.Exec(ctx, `UPDATE rollouts SET current_step = current_step + 1 WHERE id = $1`, id)
 	}

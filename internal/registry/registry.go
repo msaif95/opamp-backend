@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/open-telemetry/opamp-go/protobufs"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/msaif95/opamp-backend/internal/logthrottle"
 )
 
 const (
@@ -90,6 +93,9 @@ type Event struct {
 type Identity struct {
 	AuthMode     string // mtls | api_key
 	CredentialID *uuid.UUID
+	// Set for mTLS: SHA-256 of the client certificate and its expiry.
+	CertFingerprint []byte
+	CertNotAfter    time.Time
 }
 
 // Registry is the agent registry service.
@@ -99,6 +105,8 @@ type Registry struct {
 	replicaID string
 	routeTTL  time.Duration
 
+	redisWarn *logthrottle.Throttle
+
 	// Agents that heartbeated since the last flush; see FlushHeartbeats.
 	hbMu       sync.Mutex
 	heartbeats map[uuid.UUID]struct{}
@@ -107,15 +115,70 @@ type Registry struct {
 // New creates a Registry. routeTTL bounds how long a routing entry survives
 // without a heartbeat from the owning replica.
 func New(db *pgxpool.Pool, rdb *redis.Client, replicaID string, routeTTL time.Duration) *Registry {
-	return &Registry{db: db, rdb: rdb, replicaID: replicaID, routeTTL: routeTTL, heartbeats: make(map[uuid.UUID]struct{})}
+	return &Registry{db: db, rdb: rdb, replicaID: replicaID, routeTTL: routeTTL,
+		heartbeats: make(map[uuid.UUID]struct{}), redisWarn: logthrottle.New(10 * time.Second)}
+}
+
+const (
+	replicaKeyPrefix = "opamp:replica:"
+	// ReplicaAnnounceInterval is how often a replica reports itself; it is
+	// forgotten after three missed reports.
+	ReplicaAnnounceInterval = 10 * time.Second
+)
+
+// Replica is one running backend instance, as last reported by itself.
+type Replica struct {
+	ID          string    `json:"id"`
+	Connections int       `json:"connections"`
+	StartedAt   time.Time `json:"started_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// AnnounceReplica records that this replica is alive and how many agent connections it holds.
+func (r *Registry) AnnounceReplica(ctx context.Context, connections int, startedAt time.Time) error {
+	b, _ := json.Marshal(Replica{ID: r.replicaID, Connections: connections, StartedAt: startedAt, UpdatedAt: time.Now().UTC()})
+	return r.rdb.Set(ctx, replicaKeyPrefix+r.replicaID, b, 3*ReplicaAnnounceInterval).Err()
+}
+
+// WithdrawReplica removes this replica from the list at shutdown.
+func (r *Registry) WithdrawReplica(ctx context.Context) error {
+	return r.rdb.Del(ctx, replicaKeyPrefix+r.replicaID).Err()
+}
+
+// Replicas lists the backend instances that reported recently, by ID.
+func (r *Registry) Replicas(ctx context.Context) ([]Replica, error) {
+	var keys []string
+	iter := r.rdb.Scan(ctx, 0, replicaKeyPrefix+"*", 100).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	vals, err := r.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	replicas := make([]Replica, 0, len(vals))
+	for _, v := range vals {
+		var rep Replica
+		if s, ok := v.(string); ok && json.Unmarshal([]byte(s), &rep) == nil {
+			replicas = append(replicas, rep)
+		}
+	}
+	sort.Slice(replicas, func(i, j int) bool { return replicas[i].ID < replicas[j].ID })
+	return replicas, nil
 }
 
 // HeartbeatFlushInterval is how often buffered heartbeats are written to
 // Postgres; last_seen can lag reality by this much.
 const HeartbeatFlushInterval = 5 * time.Second
 
-// isHeartbeat reports whether the message carries no state change.
-func isHeartbeat(msg *protobufs.AgentToServer) bool {
+// IsHeartbeat reports whether the message carries no state change.
+func IsHeartbeat(msg *protobufs.AgentToServer) bool {
 	return msg.AgentDescription == nil && msg.Health == nil && msg.EffectiveConfig == nil &&
 		msg.RemoteConfigStatus == nil && msg.PackageStatuses == nil && msg.AgentDisconnect == nil
 }
@@ -142,13 +205,24 @@ SELECT capabilities, desired_config_version_id, remote_config_hash, connected FR
 		return st, false, fmt.Errorf("load agent %s: %w", uid, err)
 	}
 	st.Capabilities = uint64(caps)
-	if err := r.rdb.Set(ctx, routeKeyPrefix+uid.String(), r.replicaID, r.routeTTL).Err(); err != nil {
-		return st, false, fmt.Errorf("set route %s: %w", uid, err)
-	}
 	r.hbMu.Lock()
 	r.heartbeats[uid] = struct{}{}
 	r.hbMu.Unlock()
 	return st, true, nil
+}
+
+// setRoute records which replica holds the agent's connection. A Redis
+// failure is logged, not returned: the agent's state lives in Postgres, and
+// failing its message would only make the whole fleet reconnect in a loop.
+// Without a route the agent misses pushes but still receives its config
+// with the response to its next message.
+func (r *Registry) setRoute(ctx context.Context, uid uuid.UUID) {
+	if err := r.rdb.Set(ctx, routeKeyPrefix+uid.String(), r.replicaID, r.routeTTL).Err(); err != nil && ctx.Err() == nil {
+		r.redisWarn.Do(func(suppressed int64) {
+			slog.WarnContext(ctx, "redis unavailable: agent routing not updated; pushes are delayed until agents next report",
+				"err", err, "similar_errors_suppressed", suppressed)
+		})
+	}
 }
 
 // FlushHeartbeats writes last_seen for every agent that heartbeated since
@@ -224,7 +298,12 @@ RETURNING capabilities, desired_config_version_id, remote_config_hash,
 // Report applies an AgentToServer status report. Fields the agent omitted
 // (unchanged since its last message) are left untouched.
 func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *protobufs.AgentToServer) (ConfigState, error) {
-	if isHeartbeat(msg) {
+	// The route is refreshed before touching Postgres: this replica holds the
+	// connection whether or not the database is reachable, and a live route
+	// is what stops the offline sweep from flapping the fleet after a
+	// database outage.
+	r.setRoute(ctx, uid)
+	if IsHeartbeat(msg) {
 		if st, ok, err := r.heartbeat(ctx, uid, msg); ok || err != nil {
 			return st, err
 		}
@@ -274,9 +353,6 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 	}
 	st.Capabilities = uint64(caps)
 
-	if err := r.rdb.Set(ctx, routeKeyPrefix+uid.String(), r.replicaID, r.routeTTL).Err(); err != nil {
-		return st, fmt.Errorf("set route %s: %w", uid, err)
-	}
 	// Plain heartbeats only refresh last_seen; publishing them would make
 	// every UI refetch constantly at fleet scale.
 	switch {
@@ -396,6 +472,8 @@ func (r *Registry) SubscribePush(ctx context.Context, fn func(uid uuid.UUID)) {
 // replica still owns it (the agent may already have reconnected elsewhere).
 func (r *Registry) Disconnected(ctx context.Context, uid uuid.UUID) error {
 	owned, err := releaseRoute.Run(ctx, r.rdb, []string{routeKeyPrefix + uid.String()}, r.replicaID).Int()
+	// If Redis cannot say who owns the agent, leave it to the offline sweep
+	// rather than risk marking offline an agent that reconnected elsewhere.
 	if err != nil {
 		return fmt.Errorf("release route %s: %w", uid, err)
 	}
@@ -424,16 +502,56 @@ func (r *Registry) Route(ctx context.Context, uid uuid.UUID) (string, error) {
 	return v, err
 }
 
+// sweepBatch bounds one sweep; the rest is picked up by the next one.
+const sweepBatch = 5000
+
 // SweepOffline marks agents not seen within offlineAfter as disconnected.
-// Covers replicas that died without running Disconnected. Every replica
-// runs it, so rows are locked in a fixed order and rows another replica is
-// already handling are skipped; unordered concurrent sweeps deadlock.
+// Covers replicas that died without running Disconnected.
+//
+// An agent whose last_seen is stale but which still has a live route in
+// Redis is left alone: after a Postgres outage every last_seen is stale
+// although the agents never went away, and sweeping them would flap the
+// whole fleet offline and back. If Redis cannot be asked, nothing is swept.
+//
+// Every replica runs the sweep, so rows are locked in a fixed order and rows
+// another replica is already handling are skipped; unordered concurrent
+// sweeps deadlock.
 func (r *Registry) SweepOffline(ctx context.Context, offlineAfter time.Duration) (int64, error) {
-	tag, err := r.db.Exec(ctx,
-		`UPDATE agents SET connected = FALSE WHERE instance_uid IN (
-    SELECT instance_uid FROM agents WHERE connected AND last_seen < now() - $1::interval
-    ORDER BY instance_uid FOR UPDATE SKIP LOCKED)`,
-		offlineAfter.String())
+	rows, err := r.db.Query(ctx, `
+SELECT instance_uid FROM agents WHERE connected AND last_seen < now() - $1::interval
+ORDER BY instance_uid LIMIT $2`, offlineAfter.String(), sweepBatch)
+	if err != nil {
+		return 0, err
+	}
+	candidates, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil || len(candidates) == 0 {
+		return 0, err
+	}
+
+	var gone []uuid.UUID
+	for chunk := range slices.Chunk(candidates, pushChunk) {
+		keys := make([]string, len(chunk))
+		for i, uid := range chunk {
+			keys[i] = routeKeyPrefix + uid.String()
+		}
+		routes, err := r.rdb.MGet(ctx, keys...).Result()
+		if err != nil {
+			return 0, fmt.Errorf("check routes before sweeping: %w", err)
+		}
+		for i, route := range routes {
+			if route == nil {
+				gone = append(gone, chunk[i])
+			}
+		}
+	}
+	if len(gone) == 0 {
+		return 0, nil
+	}
+	tag, err := r.db.Exec(ctx, `
+UPDATE agents SET connected = FALSE WHERE instance_uid IN (
+    SELECT instance_uid FROM agents
+    WHERE instance_uid = ANY($1) AND connected AND last_seen < now() - $2::interval
+    ORDER BY instance_uid FOR UPDATE SKIP LOCKED)`, gone, offlineAfter.String())
 	if err != nil {
 		return 0, err
 	}
@@ -460,8 +578,12 @@ const (
 type ListFilter struct {
 	// Attributes must all match exactly (JSONB containment).
 	Attributes map[string]string
-	Connected  *bool
-	Healthy    *bool
+	// Selector, if set, must also match (see targeting.Selector).
+	Selector interface {
+		Where(attributesColumn string, firstParam int) (string, []any)
+	}
+	Connected *bool
+	Healthy   *bool
 	// ConfigStatus filters on remote_config_status (unset, applied, applying, failed).
 	ConfigStatus *string
 	// Sort is SortName (default, stable between refreshes) or SortLastSeen.
@@ -483,6 +605,14 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 	const where = ` WHERE attributes @> $1::jsonb AND ($2::boolean IS NULL OR connected = $2)
     AND ($3::boolean IS NULL OR healthy = $3) AND ($4::text IS NULL OR remote_config_status::text = $4)`
 	args := []any{attrs, f.Connected, f.Healthy, f.ConfigStatus}
+	selWhere := "TRUE"
+	if f.Selector != nil {
+		var selArgs []any
+		selWhere, selArgs = f.Selector.Where("attributes", len(args)+1)
+		args = append(args, selArgs...)
+	}
+	filter := where + ` AND ` + selWhere
+	limitParams := fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 
 	dir := "ASC"
 	if f.Desc {
@@ -494,11 +624,11 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 	}
 
 	var total int
-	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents`+where, args...).Scan(&total); err != nil {
+	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents`+filter, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := r.db.Query(ctx,
-		`SELECT `+agentColumns+agentFrom+where+order+` LIMIT $5 OFFSET $6`,
+		`SELECT `+agentColumns+agentFrom+filter+order+limitParams,
 		append(args, f.Limit, f.Offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -544,6 +674,17 @@ SELECT count(*),
        count(*) FILTER (WHERE remote_config_status = 'failed')
 FROM agents`).Scan(&s.Total, &s.Connected, &s.Healthy, &s.Unhealthy, &s.ConfigFailed)
 	return s, err
+}
+
+// FleetHealth counts connected agents, connected agents reporting
+// themselves unhealthy, and agents that disconnected within recentWindow.
+func (r *Registry) FleetHealth(ctx context.Context, recentWindow time.Duration) (connected, unhealthy, recentlyOffline int, err error) {
+	err = r.db.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE connected),
+       count(*) FILTER (WHERE connected AND healthy = FALSE),
+       count(*) FILTER (WHERE NOT connected AND last_seen > now() - $1::interval)
+FROM agents`, recentWindow.String()).Scan(&connected, &unhealthy, &recentlyOffline)
+	return
 }
 
 // maxFacetValues excludes high-cardinality attributes (host names, instance

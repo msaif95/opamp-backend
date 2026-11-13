@@ -9,11 +9,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,8 +28,12 @@ import (
 
 const apiKeyPrefix = "opamp_"
 
-// ErrUnauthenticated is returned when an agent presents no valid credential.
-var ErrUnauthenticated = errors.New("unauthenticated")
+var (
+	// ErrUnauthenticated is returned when an agent presents no valid credential.
+	ErrUnauthenticated = errors.New("unauthenticated")
+	// ErrBadCertificate is returned when a certificate to revoke cannot be parsed.
+	ErrBadCertificate = errors.New("not a PEM-encoded X.509 certificate")
+)
 
 // AgentAuthenticator validates agent connections in either auth mode.
 type AgentAuthenticator struct {
@@ -64,14 +71,14 @@ func (a *AgentAuthenticator) authenticateCert(ctx context.Context, leaf *x509.Ce
 		`SELECT id, revoked_at FROM credentials WHERE kind = 'mtls_cert' AND key_hash = $1`, sum[:]).Scan(&id, &revoked)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return registry.Identity{AuthMode: "mtls"}, nil
+		return registry.Identity{AuthMode: "mtls", CertFingerprint: sum[:], CertNotAfter: leaf.NotAfter}, nil
 	case err != nil:
 		return registry.Identity{}, fmt.Errorf("lookup cert credential: %w", err)
 	case revoked != nil:
 		return registry.Identity{}, ErrUnauthenticated
 	}
 	a.touch(ctx, id)
-	return registry.Identity{AuthMode: "mtls", CredentialID: &id}, nil
+	return registry.Identity{AuthMode: "mtls", CredentialID: &id, CertFingerprint: sum[:], CertNotAfter: leaf.NotAfter}, nil
 }
 
 func (a *AgentAuthenticator) authenticateKey(ctx context.Context, key string) (registry.Identity, error) {
@@ -142,6 +149,84 @@ FROM credentials WHERE kind = 'api_key' ORDER BY created_at DESC`)
 	})
 }
 
+// Invalid reports which of the given credentials are no longer valid:
+// revoked or expired credential IDs, and revoked certificate fingerprints
+// (keyed by the raw fingerprint bytes). It is used to cut live connections
+// whose credential was withdrawn after they connected.
+func (a *AgentAuthenticator) Invalid(ctx context.Context, ids []uuid.UUID, fingerprints [][]byte) (map[uuid.UUID]bool, map[string]bool, error) {
+	rows, err := a.db.Query(ctx, `
+SELECT id, key_hash FROM credentials
+WHERE (id = ANY($1) OR (kind = 'mtls_cert' AND key_hash = ANY($2)))
+  AND (revoked_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= now()))`, ids, fingerprints)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	badIDs, badCerts := map[uuid.UUID]bool{}, map[string]bool{}
+	for rows.Next() {
+		var (
+			id   uuid.UUID
+			hash []byte
+		)
+		if err := rows.Scan(&id, &hash); err != nil {
+			return nil, nil, err
+		}
+		badIDs[id] = true
+		badCerts[string(hash)] = true
+	}
+	return badIDs, badCerts, rows.Err()
+}
+
+// RevokedCert is a client certificate that is refused despite chaining to the trusted CA.
+type RevokedCert struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Fingerprint string    `json:"fingerprint_sha256"`
+	Subject     string    `json:"subject"`
+	RevokedBy   string    `json:"revoked_by"`
+	RevokedAt   time.Time `json:"revoked_at"`
+}
+
+// RevokeCert blocks a client certificate by its PEM encoding. Revoking an
+// already revoked certificate is a no-op.
+func (a *AgentAuthenticator) RevokeCert(ctx context.Context, certPEM, name, revokedBy string) (*RevokedCert, error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, ErrBadCertificate
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, ErrBadCertificate
+	}
+	sum := sha256.Sum256(cert.Raw)
+	if name == "" {
+		name = cert.Subject.CommonName
+	}
+	rc := &RevokedCert{Fingerprint: hex.EncodeToString(sum[:]), Subject: cert.Subject.String()}
+	err = a.db.QueryRow(ctx, `
+INSERT INTO credentials (kind, name, key_hash, subject, created_by, expires_at, revoked_at)
+VALUES ('mtls_cert', $1, $2, $3, $4, $5, now())
+ON CONFLICT (key_hash) DO UPDATE SET revoked_at = COALESCE(credentials.revoked_at, now())
+RETURNING id, name, created_by, revoked_at`,
+		name, sum[:], rc.Subject, revokedBy, cert.NotAfter).Scan(&rc.ID, &rc.Name, &rc.RevokedBy, &rc.RevokedAt)
+	return rc, err
+}
+
+// ListRevokedCerts returns the blocked client certificates, newest first.
+func (a *AgentAuthenticator) ListRevokedCerts(ctx context.Context) ([]RevokedCert, error) {
+	rows, err := a.db.Query(ctx, `
+SELECT id, name, encode(key_hash, 'hex'), COALESCE(subject, ''), created_by, revoked_at
+FROM credentials WHERE kind = 'mtls_cert' AND revoked_at IS NOT NULL ORDER BY revoked_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (RevokedCert, error) {
+		var c RevokedCert
+		err := row.Scan(&c.ID, &c.Name, &c.Fingerprint, &c.Subject, &c.RevokedBy, &c.RevokedAt)
+		return c, err
+	})
+}
+
 // Revoke revokes a credential of either kind. Reports whether a row changed.
 func (a *AgentAuthenticator) Revoke(ctx context.Context, id uuid.UUID) (bool, error) {
 	tag, err := a.db.Exec(ctx, `UPDATE credentials SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL`, id)
@@ -150,7 +235,9 @@ func (a *AgentAuthenticator) Revoke(ctx context.Context, id uuid.UUID) (bool, er
 
 // ServerTLSConfig builds the OpAMP listener TLS config. When clientCAFile is
 // set, client certs are verified if presented (agents without one fall back
-// to API-key auth).
+// to API-key auth). Both the server certificate and the client CA bundle
+// are re-read when their files change, so cert-manager renewals and CA
+// rotation take effect without a restart.
 func ServerTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -164,16 +251,56 @@ func ServerTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error
 		return nil, fmt.Errorf("load server cert: %w", err)
 	}
 	if clientCAFile != "" {
-		pem, err := os.ReadFile(clientCAFile)
+		cas := &caBundle{path: clientCAFile}
+		pool, err := cas.pool()
 		if err != nil {
-			return nil, fmt.Errorf("read client CA: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("no certificates found in %s", clientCAFile)
+			return nil, err
 		}
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = tls.VerifyClientCertIfGiven
+		cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			pool, err := cas.pool()
+			if err != nil {
+				// Keep serving with the last good bundle rather than refusing every agent.
+				return nil, nil
+			}
+			c := cfg.Clone()
+			c.ClientCAs = pool
+			c.GetConfigForClient = nil
+			return c, nil
+		}
 	}
 	return cfg, nil
+}
+
+// caBundle is a CA file that is re-parsed only when it changes on disk.
+type caBundle struct {
+	path string
+
+	mu      sync.Mutex
+	modTime time.Time
+	size    int64
+	cached  *x509.CertPool
+}
+
+func (b *caBundle) pool() (*x509.CertPool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	info, err := os.Stat(b.path)
+	if err != nil {
+		return b.cached, fmt.Errorf("stat client CA: %w", err)
+	}
+	if b.cached != nil && info.ModTime().Equal(b.modTime) && info.Size() == b.size {
+		return b.cached, nil
+	}
+	data, err := os.ReadFile(b.path)
+	if err != nil {
+		return b.cached, fmt.Errorf("read client CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return b.cached, fmt.Errorf("no certificates found in %s", b.path)
+	}
+	b.cached, b.modTime, b.size = pool, info.ModTime(), info.Size()
+	return pool, nil
 }

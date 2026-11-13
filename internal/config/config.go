@@ -52,6 +52,20 @@ type Config struct {
 	// AgentOfflineAfter is how long without a heartbeat before an agent is marked offline.
 	AgentOfflineAfter time.Duration
 
+	// AlertWebhookURL receives rollout notifications as {"text": ...}
+	// (Slack-compatible). Empty disables alerting.
+	AlertWebhookURL string
+	// PublicURL is the console's base URL, used for links in notifications.
+	PublicURL string
+	// RebalanceEnabled lets an overloaded replica close some agent
+	// connections so they reconnect to less loaded replicas.
+	RebalanceEnabled bool
+	// Fleet-health alert thresholds, in percent; 0 disables the rule.
+	AlertOfflinePct   float64
+	AlertUnhealthyPct float64
+	// TrustProxyHeaders takes client addresses from X-Forwarded-For.
+	TrustProxyHeaders bool
+
 	MigrationsDir string
 	LogLevel      string
 }
@@ -78,6 +92,10 @@ func Load() (*Config, error) {
 		OktaAdminGroups:    list(env("OKTA_ADMIN_GROUPS", "")),
 		OktaOperatorGroups: list(env("OKTA_OPERATOR_GROUPS", "")),
 		OktaViewerGroups:   list(env("OKTA_VIEWER_GROUPS", "")),
+		AlertWebhookURL:    env("ALERT_WEBHOOK_URL", ""),
+		PublicURL:          strings.TrimRight(env("PUBLIC_URL", ""), "/"),
+		RebalanceEnabled:   env("REBALANCE_ENABLED", "true") == "true",
+		TrustProxyHeaders:  env("TRUST_PROXY_HEADERS", "false") == "true",
 		MigrationsDir:      env("MIGRATIONS_DIR", "migrations"),
 		LogLevel:           env("LOG_LEVEL", "info"),
 	}
@@ -85,6 +103,12 @@ func Load() (*Config, error) {
 	var err error
 	if c.PostgresMaxConns, err = strconv.Atoi(env("POSTGRES_MAX_CONNS", "10")); err != nil || c.PostgresMaxConns < 2 {
 		return nil, fmt.Errorf("POSTGRES_MAX_CONNS must be a number of at least 2")
+	}
+	if c.AlertOfflinePct, err = strconv.ParseFloat(env("ALERT_OFFLINE_PCT", "10"), 64); err != nil || c.AlertOfflinePct < 0 || c.AlertOfflinePct > 100 {
+		return nil, fmt.Errorf("ALERT_OFFLINE_PCT must be a percentage between 0 and 100")
+	}
+	if c.AlertUnhealthyPct, err = strconv.ParseFloat(env("ALERT_UNHEALTHY_PCT", "20"), 64); err != nil || c.AlertUnhealthyPct < 0 || c.AlertUnhealthyPct > 100 {
+		return nil, fmt.Errorf("ALERT_UNHEALTHY_PCT must be a percentage between 0 and 100")
 	}
 	if c.RedisDB, err = strconv.Atoi(env("REDIS_DB", "0")); err != nil {
 		return nil, fmt.Errorf("REDIS_DB: %w", err)

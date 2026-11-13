@@ -41,3 +41,26 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   of pausing. Rollback restores `rollout_agents.previous_config_version_id`; agents with no previous config keep
   the new one and are reported. Engine-initiated pauses/rollbacks are audited as actor `system`.
 - Groups (`internal/targeting/groups.go`) are saved selectors with live membership; rollouts snapshot the selector.
+- Multi-replica and scale testing: `scripts/replicas.sh up|down|kill`, `scripts/scale-probe.py`, and
+  `agentsim -backends ... -ramp ...`; procedure and results in `../opamp-deploy/docs/runbook.md`.
+- Heartbeats (messages with no state change) take a read-only path: liveness goes to Redis and `last_seen` is
+  flushed to Postgres in batches every 5 s. Do not add a per-heartbeat write.
+- Anything that updates many `agents` rows in one statement must lock them in `instance_uid` order (see the sweep,
+  heartbeat flush and rollout release); unordered multi-row updates deadlock across replicas.
+- Hardening: live connections are re-checked every 30 s and closed if their credential was revoked or expired
+  (`Manager.EnforceCredentials`); local login is rate-limited per client address in Redis; the client CA bundle and
+  server cert reload from disk; rollout pauses/rollbacks/failed completions go to `ALERT_WEBHOOK_URL`.
+- Self-telemetry (`internal/telemetry`) is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Keep its semconv import
+  on the same schema version as the OTel SDK's `resource.Default()` or the backend fails to start with it enabled.
+- System page (`GET /api/v1/system`, admin): static protection flags from config, live replicas (each replica
+  writes `opamp:replica:<id>` to Redis every 10 s with a 30 s TTL) and the last 100 alerts (`opamp:alerts` list;
+  recorded whether or not a webhook is configured). It reports only on/off flags, never secret values.
+- Tests: `make test` skips anything needing a database; `make test-integration` (after `make deps-up`) runs all of
+  them against a separate `opamp_test` database and Redis DB 15 via `internal/testdb`. New SQL needs an integration test.
+- Redis is best-effort: never fail an agent message because Redis is down (see `Registry.setRoute`), and readiness
+  checks Postgres only. Log lines that can repeat per agent message go through `internal/logthrottle`.
+- The offline sweep skips agents that still have a Redis route, so stale `last_seen` after a Postgres outage does not
+  flap the fleet. `Report` refreshes the route before touching Postgres for the same reason.
+- Rebalancing (`internal/connection/rebalance.go`) and fleet-health alerts (`internal/alert/health.go`) are pure
+  decision functions plus a small loop; keep the logic in the tested functions.
+- A running rollout picks up agents that start matching its selector (they join the next batch); a finished one does not.

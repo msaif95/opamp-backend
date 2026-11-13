@@ -55,6 +55,46 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, grp)
 }
 
+func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		Name        string             `json:"name"`
+		Description string             `json:"description"`
+		Selector    targeting.Selector `json:"selector"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Selector) == 0 {
+		writeError(w, http.StatusBadRequest, "a group needs a name and at least one attribute to match on")
+		return
+	}
+	if err := req.Selector.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	grp, err := s.Groups.Update(r.Context(), id, req.Name, req.Description, req.Selector)
+	switch {
+	case errors.Is(err, targeting.ErrGroupNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	case errors.Is(err, targeting.ErrGroupNameTaken):
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	case err != nil:
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "group.update", "group", id.String(),
+		map[string]any{"name": grp.Name, "selector": grp.Selector})
+	writeJSON(w, http.StatusOK, grp)
+}
+
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r, "id")
 	if !ok {

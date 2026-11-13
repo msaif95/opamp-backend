@@ -19,8 +19,13 @@ import (
 	"github.com/open-telemetry/opamp-go/protobufs"
 	"github.com/open-telemetry/opamp-go/server"
 	"github.com/open-telemetry/opamp-go/server/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/registry"
 )
 
@@ -30,6 +35,8 @@ const OpAMPPath = "/v1/opamp"
 // Authenticator resolves the identity of an incoming agent connection.
 type Authenticator interface {
 	Authenticate(ctx context.Context, r *http.Request) (registry.Identity, error)
+	// Invalid reports which credential IDs and certificate fingerprints have been revoked or have expired.
+	Invalid(ctx context.Context, ids []uuid.UUID, fingerprints [][]byte) (map[uuid.UUID]bool, map[string]bool, error)
 }
 
 // MessageHandler processes one OpAMP message.
@@ -46,6 +53,7 @@ type Disconnector interface {
 
 type connState struct {
 	uid     uuid.UUID
+	id      registry.Identity
 	lastSeq uint64
 	seen    bool
 }
@@ -63,16 +71,46 @@ type Manager struct {
 	mu    sync.Mutex
 	conns map[types.Connection]*connState
 	byUID map[uuid.UUID]types.Connection
+
+	disconnectErr *logthrottle.Throttle
+
+	messages     metric.Int64Counter
+	handleTime   metric.Float64Histogram
+	authFailures metric.Int64Counter
+	pushes       metric.Int64Counter
+	revoked      metric.Int64Counter
+	shed         metric.Int64Counter
+	tracer       trace.Tracer
 }
 
 // NewManager creates a Manager.
 func NewManager(auth Authenticator, handler MessageHandler, reg Disconnector, log *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		auth: auth, handler: handler, reg: reg, log: log,
 		opamp: server.New(opampLogger{log}),
 		conns: make(map[types.Connection]*connState),
 		byUID: make(map[uuid.UUID]types.Connection),
+
+		disconnectErr: logthrottle.New(10 * time.Second),
 	}
+	// Instruments are no-ops unless telemetry.Setup installed a meter provider.
+	meter := otel.Meter("github.com/msaif95/opamp-backend/connection")
+	m.messages, _ = meter.Int64Counter("opamp.agent.messages", metric.WithDescription("AgentToServer messages handled"))
+	m.handleTime, _ = meter.Float64Histogram("opamp.agent.message.duration", metric.WithUnit("s"),
+		metric.WithDescription("Time to handle one AgentToServer message"))
+	m.authFailures, _ = meter.Int64Counter("opamp.agent.auth.failures", metric.WithDescription("Rejected agent connections"))
+	m.pushes, _ = meter.Int64Counter("opamp.agent.pushes", metric.WithDescription("Server-initiated config pushes"))
+	m.revoked, _ = meter.Int64Counter("opamp.agent.credential.disconnects",
+		metric.WithDescription("Live connections closed because their credential was revoked or expired"))
+	m.shed, _ = meter.Int64Counter("opamp.agent.connections.shed",
+		metric.WithDescription("Connections closed on purpose so agents reconnect to another replica"))
+	m.tracer = otel.Tracer("github.com/msaif95/opamp-backend/connection")
+	_, _ = meter.Int64ObservableGauge("opamp.agent.connections", metric.WithDescription("Live WebSocket agent connections on this replica"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(int64(m.ConnectionCount()))
+			return nil
+		}))
+	return m
 }
 
 // Start begins serving OpAMP on addr. tlsCfg may be nil for plaintext (dev only).
@@ -144,6 +182,7 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 		status := http.StatusServiceUnavailable
 		if errors.Is(err, auth.ErrUnauthenticated) {
 			status = http.StatusUnauthorized
+			m.authFailures.Add(r.Context(), 1)
 		} else {
 			m.log.Error("agent authentication error", "remote", r.RemoteAddr, "err", err)
 		}
@@ -159,13 +198,28 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 		OnConnected: func(_ context.Context, conn types.Connection) {
 			if persistent {
 				m.mu.Lock()
-				m.conns[conn] = &connState{}
+				m.conns[conn] = &connState{id: id}
 				m.mu.Unlock()
 			}
 		},
 		OnMessage: func(ctx context.Context, conn types.Connection, msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			start := time.Now()
+			kind := "state"
+			if registry.IsHeartbeat(msg) {
+				kind = "heartbeat"
+			}
+			// Heartbeats are not traced: they are nearly all messages and carry nothing to investigate.
+			if kind == "state" {
+				var span trace.Span
+				ctx, span = m.tracer.Start(ctx, "opamp.agent.message", trace.WithSpanKind(trace.SpanKindServer))
+				defer span.End()
+			}
 			needFull := persistent && m.sequenceGap(conn, msg)
 			uid, resp := m.handler.Handle(ctx, id, msg, needFull)
+			trace.SpanFromContext(ctx).SetAttributes(attribute.String("opamp.instance_uid", uid.String()))
+			attrs := metric.WithAttributes(attribute.String("kind", kind))
+			m.messages.Add(ctx, 1, attrs)
+			m.handleTime.Record(ctx, time.Since(start).Seconds(), attrs)
 			if persistent && uid != uuid.Nil {
 				m.mu.Lock()
 				if st := m.conns[conn]; st != nil {
@@ -194,7 +248,9 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := m.reg.Disconnected(ctx, st.uid); err != nil {
-				m.log.Error("mark agent disconnected", "instance_uid", st.uid, "err", err)
+				m.disconnectErr.Do(func(suppressed int64) {
+					m.log.Error("mark agent disconnected", "instance_uid", st.uid, "err", err, "similar_errors_suppressed", suppressed)
+				})
 			}
 		},
 	}}
@@ -209,14 +265,70 @@ func (m *Manager) Push(ctx context.Context, uid uuid.UUID) {
 	if conn == nil {
 		return
 	}
+	ctx, span := m.tracer.Start(ctx, "opamp.agent.push", trace.WithAttributes(attribute.String("opamp.instance_uid", uid.String())))
+	defer span.End()
 	msg := m.handler.Offer(ctx, uid)
 	if msg == nil {
 		return
 	}
+	result := "sent"
 	if err := conn.Send(ctx, msg); err != nil {
 		// Not fatal: the config is offered again on the agent's next message.
 		m.log.WarnContext(ctx, "push to agent failed", "instance_uid", uid, "err", err)
+		result = "failed"
 	}
+	m.pushes.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
+
+// EnforceCredentials closes live connections whose credential was revoked
+// or has expired since they connected. Authentication only happens at
+// connect time, so without this a revoked agent would stay connected until
+// it next reconnected. It returns the number of connections closed.
+func (m *Manager) EnforceCredentials(ctx context.Context) (int, error) {
+	m.mu.Lock()
+	idSet, fpSet := map[uuid.UUID]struct{}{}, map[string]struct{}{}
+	for _, st := range m.conns {
+		if st.id.CredentialID != nil {
+			idSet[*st.id.CredentialID] = struct{}{}
+		}
+		if st.id.CertFingerprint != nil {
+			fpSet[string(st.id.CertFingerprint)] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+	if len(idSet)+len(fpSet) == 0 {
+		return 0, nil
+	}
+	ids := make([]uuid.UUID, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	fps := make([][]byte, 0, len(fpSet))
+	for fp := range fpSet {
+		fps = append(fps, []byte(fp))
+	}
+	badIDs, badCerts, err := m.auth.Invalid(ctx, ids, fps)
+	if err != nil {
+		return 0, err
+	}
+
+	now := time.Now()
+	var drop []types.Connection
+	m.mu.Lock()
+	for conn, st := range m.conns {
+		switch {
+		case st.id.CredentialID != nil && badIDs[*st.id.CredentialID],
+			st.id.CertFingerprint != nil && badCerts[string(st.id.CertFingerprint)],
+			!st.id.CertNotAfter.IsZero() && now.After(st.id.CertNotAfter):
+			drop = append(drop, conn)
+		}
+	}
+	m.mu.Unlock()
+	for _, conn := range drop {
+		_ = conn.Disconnect()
+	}
+	m.revoked.Add(ctx, int64(len(drop)))
+	return len(drop), nil
 }
 
 // sequenceGap records the message's sequence number and reports whether the

@@ -29,8 +29,17 @@ func (fakeAuth) Authenticate(_ context.Context, r *http.Request) (registry.Ident
 	if r.Header.Get("Authorization") != "Bearer good" {
 		return registry.Identity{}, auth.ErrUnauthenticated
 	}
-	return registry.Identity{AuthMode: "api_key"}, nil
+	return registry.Identity{AuthMode: "api_key", CredentialID: &goodCredential}, nil
 }
+
+func (fakeAuth) Invalid(context.Context, []uuid.UUID, [][]byte) (map[uuid.UUID]bool, map[string]bool, error) {
+	return revokedIDs, nil, nil
+}
+
+// revokedIDs is what fakeAuth.Invalid reports; tests set it.
+var revokedIDs map[uuid.UUID]bool
+
+var goodCredential = uuid.MustParse("11111111-1111-1111-1111-111111111111")
 
 type report struct {
 	uid   uuid.UUID
@@ -271,4 +280,26 @@ func TestRemoteConfigNotOfferedWithoutCapability(t *testing.T) {
 		t.Fatal("config offered to an agent that does not accept remote config")
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+func TestRevokedCredentialDisconnectsLiveAgent(t *testing.T) {
+	m, reg, url := startManager(t)
+	uid := uuid.New()
+	// The simulated agent would reconnect immediately; keep rejecting it by
+	// pointing it at a credential check that now fails.
+	c := startAgent(t, url, "good", uid, types.Callbacks{})
+	defer c.Stop(context.Background())
+	eventually(t, "agent report", func() bool { r, _ := reg.snapshot(); return len(r) > 0 })
+
+	if n, err := m.EnforceCredentials(context.Background()); err != nil || n != 0 {
+		t.Fatalf("valid credential: closed %d connections, err %v", n, err)
+	}
+
+	revokedIDs = map[uuid.UUID]bool{goodCredential: true}
+	t.Cleanup(func() { revokedIDs = nil })
+	n, err := m.EnforceCredentials(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("revoked credential: closed %d connections, err %v", n, err)
+	}
+	eventually(t, "disconnect recorded", func() bool { _, d := reg.snapshot(); return len(d) >= 1 && d[0] == uid })
 }

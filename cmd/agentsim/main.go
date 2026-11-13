@@ -46,6 +46,7 @@ func main() {
 	heartbeat := flag.Duration("heartbeat", 30*time.Second, "heartbeat interval")
 	unhealthyPct := flag.Int("unhealthy-pct", 0, "percentage of agents reporting unhealthy")
 	applyFailPct := flag.Int("apply-fail-pct", 0, "percentage of agents that fail to apply remote config")
+	name := flag.String("name", "sim", "name prefix; agents with the same name and index keep their identity across runs")
 	backends := flag.String("backends", "", "comma-separated host:port list; connections are spread across them and fail over to a live one, like an L4 load balancer")
 	ramp := flag.Int("ramp", 0, "agents started per second (0 = all at once)")
 	caFile := flag.String("ca", "", "CA bundle to verify the server (wss only)")
@@ -129,7 +130,7 @@ func main() {
 	for i := range *n {
 		// Derived from the index so that re-running the simulator reconnects
 		// the same agents instead of creating new ones.
-		uid := uuid.NewSHA1(uuid.NameSpaceDNS, fmt.Appendf(nil, "agentsim-%d", i))
+		uid := uuid.NewSHA1(uuid.NameSpaceDNS, fmt.Appendf(nil, "agent%s-%d", *name, i))
 		c := client.NewWebSocket(nil)
 		region := regions[i%len(regions)]
 		must(c.SetAgentDescription(&protobufs.AgentDescription{
@@ -139,7 +140,7 @@ func main() {
 				kv("service.instance.id", uid.String()),
 			},
 			NonIdentifyingAttributes: []*protobufs.KeyValue{
-				kv("host.name", fmt.Sprintf("sim-host-%05d", i)),
+				kv("host.name", fmt.Sprintf("%s-host-%05d", *name, i)),
 				kv("os.type", "linux"),
 				kv("region", region),
 				kv("cloud.provider", clouds[region]),
