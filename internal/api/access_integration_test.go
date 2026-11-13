@@ -222,6 +222,22 @@ func TestProjectAccess(t *testing.T) {
 	if got := names(list, "agents", "host"); !equal(got, []string{"a1"}) {
 		t.Errorf("fleet filtered by A's group = %v", got)
 	}
+	// The project and group filters narrow together: a group from one project filtered by another matches nothing.
+	_, list = h.call(admin, "GET", "/agents?group_id="+grp["id"].(string)+"&project_id="+A, nil)
+	if got := names(list, "agents", "host"); !equal(got, []string{"a1"}) {
+		t.Errorf("A's group within project A = %v", got)
+	}
+	// The summary cards follow the group as well.
+	_, sum := h.call(admin, "GET", "/summary?group_id="+grp["id"].(string), nil)
+	if sum["total"].(float64) != 1 {
+		t.Errorf("summary for A's group counts %v agents, want 1", sum["total"])
+	}
+	for _, other := range []string{B, "none"} {
+		_, list = h.call(admin, "GET", "/agents?group_id="+grp["id"].(string)+"&project_id="+other, nil)
+		if list["total"].(float64) != 0 {
+			t.Errorf("A's group filtered by project %s matched %v agents, want 0", other, list["total"])
+		}
+	}
 	code, ro := h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vA, "project_id": A, "all_agents": true, "selector": map[string]any{}})
 	h.expect("alice pushes to all of A", code, 201)
 	if ro["total_agents"].(float64) != 1 {

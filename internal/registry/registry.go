@@ -770,9 +770,16 @@ type Summary struct {
 }
 
 // Summarize returns fleet-wide counts.
-func (r *Registry) Summarize(ctx context.Context, scope Scope, project *ProjectRef) (Summary, error) {
+// selector, if set, narrows the counts to agents it matches (a group).
+func (r *Registry) Summarize(ctx context.Context, scope Scope, project *ProjectRef, selector interface {
+	Where(attributesColumn string, firstParam int) (string, []any)
+}) (Summary, error) {
 	var s Summary
 	cond, args := scopeWhere(scope, project, nil)
+	if selector != nil {
+		w, a := selector.Where("a.attributes", len(args)+1)
+		cond, args = cond+" AND "+w, append(args, a...)
+	}
 	err := r.db.QueryRow(ctx, `
 SELECT count(*),
        count(*) FILTER (WHERE connected),

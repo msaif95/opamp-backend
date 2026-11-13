@@ -228,7 +228,39 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sum, err := s.Registry.Summarize(r.Context(), scopeOf(r.Context()), project)
+	// ?group_id= narrows the counts to a group, the same way it narrows the agent list.
+	var selector targeting.Selector
+	if v := r.URL.Query().Get("group_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid group_id")
+			return
+		}
+		grp, err := s.Groups.Get(r.Context(), id)
+		if errors.Is(err, targeting.ErrGroupNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if err != nil {
+			s.internal(w, r, err)
+			return
+		}
+		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
+			return
+		}
+		if project != nil && !sameProject(project.ID, grp.ProjectID) {
+			writeJSON(w, http.StatusOK, registry.Summary{})
+			return
+		}
+		selector, project = grp.Selector, &registry.ProjectRef{ID: grp.ProjectID}
+	}
+	var sel interface {
+		Where(attributesColumn string, firstParam int) (string, []any)
+	}
+	if selector != nil {
+		sel = selector
+	}
+	sum, err := s.Registry.Summarize(r.Context(), scopeOf(r.Context()), project, sel)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -300,7 +332,12 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
 			return
 		}
-		// A group only ever matches its own project's agents.
+		// A group only ever matches its own project's agents. Combined with a
+		// project filter for a different project, nothing can match both.
+		if f.Project != nil && !sameProject(f.Project.ID, grp.ProjectID) {
+			writeJSON(w, http.StatusOK, map[string]any{"agents": []registry.Agent{}, "total": 0})
+			return
+		}
 		f.Selector, f.Project = grp.Selector, &registry.ProjectRef{ID: grp.ProjectID}
 	}
 	for _, kv := range q["attr"] {
