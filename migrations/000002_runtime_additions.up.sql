@@ -12,3 +12,7 @@ CREATE TABLE settings (
 ALTER TABLE agent_groups
     ADD COLUMN config_version_id UUID REFERENCES config_versions(id) ON DELETE SET NULL,
     ADD COLUMN config_set_at TIMESTAMPTZ;
+
+-- The pipeline as built in the console's config builder, when the version
+-- was made there; NULL for versions written as YAML.
+ALTER TABLE config_versions ADD COLUMN builder_spec JSONB;

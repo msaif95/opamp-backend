@@ -64,6 +64,9 @@ type Version struct {
 	Description  string    `json:"description"`
 	Origin       string    `json:"origin"`
 	GitCommitSHA *string   `json:"git_commit_sha"`
+	// BuilderSpec is the pipeline as built in the config builder, if this
+	// version was made there. Only populated when the body is.
+	BuilderSpec json.RawMessage `json:"builder_spec,omitempty"`
 	// AssignedCount is only populated by Service.Get.
 	AssignedCount int       `json:"assigned_agents,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -83,7 +86,8 @@ func NewService(db *pgxpool.Pool) *Service {
 }
 
 // Create creates a UI-authored template with its first version.
-func (s *Service) Create(ctx context.Context, name, description, body, author string) (*Template, *Version, error) {
+// builderSpec is the builder pipeline the body was rendered from, or nil for hand-written YAML.
+func (s *Service) Create(ctx context.Context, name, description, body, author string, builderSpec json.RawMessage) (*Template, *Version, error) {
 	if issues := Validate(body); HasErrors(issues) {
 		return nil, nil, &InvalidError{Issues: issues}
 	}
@@ -104,7 +108,7 @@ RETURNING id, created_at, updated_at`, name, description).Scan(&t.ID, &t.Created
 	if err != nil {
 		return nil, nil, err
 	}
-	v, err := insertVersion(ctx, tx, t.ID, 1, body, author, "Initial version")
+	v, err := insertVersion(ctx, tx, t.ID, 1, body, author, "Initial version", builderSpec)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -112,7 +116,7 @@ RETURNING id, created_at, updated_at`, name, description).Scan(&t.ID, &t.Created
 }
 
 // AddVersion appends a new version to a UI-authored template.
-func (s *Service) AddVersion(ctx context.Context, templateID uuid.UUID, body, description, author string) (*Version, error) {
+func (s *Service) AddVersion(ctx context.Context, templateID uuid.UUID, body, description, author string, builderSpec json.RawMessage) (*Version, error) {
 	if issues := Validate(body); HasErrors(issues) {
 		return nil, &InvalidError{Issues: issues}
 	}
@@ -149,7 +153,7 @@ SELECT version, body_hash FROM config_versions WHERE template_id = $1 ORDER BY v
 		return nil, ErrUnchanged
 	}
 
-	v, err := insertVersion(ctx, tx, templateID, latest+1, body, author, description)
+	v, err := insertVersion(ctx, tx, templateID, latest+1, body, author, description, builderSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -159,14 +163,14 @@ SELECT version, body_hash FROM config_versions WHERE template_id = $1 ORDER BY v
 	return v, tx.Commit(ctx)
 }
 
-func insertVersion(ctx context.Context, tx pgx.Tx, templateID uuid.UUID, n int, body, author, description string) (*Version, error) {
+func insertVersion(ctx context.Context, tx pgx.Tx, templateID uuid.UUID, n int, body, author, description string, builderSpec json.RawMessage) (*Version, error) {
 	sum := sha256.Sum256([]byte(body))
 	v := &Version{TemplateID: templateID, Version: n, Body: body, BodyHash: sum[:],
-		Author: author, Description: description, Origin: OriginUI}
+		Author: author, Description: description, Origin: OriginUI, BuilderSpec: builderSpec}
 	err := tx.QueryRow(ctx, `
-INSERT INTO config_versions (template_id, version, body, body_hash, author, description, origin)
-VALUES ($1, $2, $3, $4, $5, $6, 'ui') RETURNING id, created_at`,
-		templateID, n, body, sum[:], author, description).Scan(&v.ID, &v.CreatedAt)
+INSERT INTO config_versions (template_id, version, body, body_hash, author, description, origin, builder_spec)
+VALUES ($1, $2, $3, $4, $5, $6, 'ui', $7::jsonb) RETURNING id, created_at`,
+		templateID, n, body, sum[:], author, description, nullableJSON(builderSpec)).Scan(&v.ID, &v.CreatedAt)
 	return v, err
 }
 
@@ -231,18 +235,28 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Template, []Version, 
 }
 
 func versionSelect(withBody bool) string {
-	body := "''"
+	body, spec := "''", "NULL::jsonb"
 	if withBody {
-		body = "body"
+		body, spec = "body", "builder_spec"
 	}
 	return `SELECT id, template_id, version, ` + body + `, body_hash, author, COALESCE(description, ''),
-       origin::text, git_commit_sha, created_at FROM config_versions`
+       origin::text, git_commit_sha, created_at, ` + spec + ` FROM config_versions`
+}
+
+// nullableJSON stores an absent spec as SQL NULL rather than the JSON value null.
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return []byte(raw)
 }
 
 func scanVersion(row pgx.CollectableRow) (Version, error) {
 	var v Version
+	var spec []byte
 	err := row.Scan(&v.ID, &v.TemplateID, &v.Version, &v.Body, &v.BodyHash, &v.Author, &v.Description,
-		&v.Origin, &v.GitCommitSHA, &v.CreatedAt)
+		&v.Origin, &v.GitCommitSHA, &v.CreatedAt, &spec)
+	v.BuilderSpec = spec
 	return v, err
 }
 

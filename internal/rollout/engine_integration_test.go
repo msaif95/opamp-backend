@@ -67,11 +67,11 @@ func newEnv(t *testing.T) *env {
 	e.svc.OnOutcome = func(_ context.Context, outcome string, _ *Rollout) { e.outcomes = append(e.outcomes, outcome) }
 
 	configs := agentconfig.NewService(db)
-	tmpl, v1, err := configs.Create(ctx, "cfg", "", bodyV1, "tester")
+	tmpl, v1, err := configs.Create(ctx, "cfg", "", bodyV1, "tester", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, err := configs.AddVersion(ctx, tmpl.ID, bodyV1+"# v2\n", "", "tester")
+	v2, err := configs.AddVersion(ctx, tmpl.ID, bodyV1+"# v2\n", "", "tester", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

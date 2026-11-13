@@ -97,6 +97,8 @@ func (s *Server) Router() http.Handler {
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
+			r.Get("/configs/builder/catalog", s.builderCatalog)
+			r.Post("/configs/builder/render", s.builderRender)
 			r.Get("/configs/{id}", s.getConfig)
 			r.Get("/configs/{id}/versions/{version}", s.getConfigVersion)
 		})

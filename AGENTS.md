@@ -87,3 +87,10 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   script for it; labels are restricted to a safe alphabet because they land in shell and YAML.
 - Remote collector upgrades (OpAMP packages) are not built: the stock Supervisor refuses to start with
   `accepts_packages` (contrib issue #47272). Revisit when that lands.
+- Config builder (`internal/pipeline`): `catalog.go` lists source/processor/destination types with form fields;
+  `Render` turns a builder spec into collector YAML, one pipeline per signal that a source collects and a
+  destination accepts. The spec is stored on the version (`config_versions.builder_spec`) so it can be reopened.
+  Endpoints: `GET /configs/builder/catalog`, `POST /configs/builder/render`; `POST /configs` and
+  `/configs/{id}/versions` accept `builder` instead of `body`. When adding a catalog type, render it and run
+  `otelcol-contrib validate --config` on the result; all 15 current types passed that against contrib 0.164.0.
+- The second migration is `000002_runtime_additions` (settings, group config, builder spec).

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 )
 
@@ -72,8 +74,14 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name"`
 		Description string `json:"description"`
 		Body        string `json:"body"`
+		// Builder, if set, is a pipeline from the config builder; the body is rendered from it.
+		Builder *pipeline.Spec `json:"builder"`
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	spec, ok := s.renderBuilder(w, req.Builder, &req.Body)
+	if !ok {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
@@ -82,7 +90,7 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := auth.UserFrom(r.Context())
-	t, v, err := s.Configs.Create(r.Context(), req.Name, req.Description, req.Body, u.Subject)
+	t, v, err := s.Configs.Create(r.Context(), req.Name, req.Description, req.Body, u.Subject, spec)
 	if err != nil {
 		s.configError(w, r, err)
 		return
@@ -98,14 +106,19 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Body        string `json:"body"`
-		Description string `json:"description"`
+		Body        string         `json:"body"`
+		Description string         `json:"description"`
+		Builder     *pipeline.Spec `json:"builder"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
+	spec, ok := s.renderBuilder(w, req.Builder, &req.Body)
+	if !ok {
+		return
+	}
 	u, _ := auth.UserFrom(r.Context())
-	v, err := s.Configs.AddVersion(r.Context(), id, req.Body, req.Description, u.Subject)
+	v, err := s.Configs.AddVersion(r.Context(), id, req.Body, req.Description, u.Subject, spec)
 	if err != nil {
 		s.configError(w, r, err)
 		return
@@ -193,4 +206,40 @@ func nonNil[T any](s []T) []T {
 		return []T{}
 	}
 	return s
+}
+
+// builderCatalog lists the component types the config builder offers.
+func (s *Server) builderCatalog(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"types": pipeline.Catalog()})
+}
+
+// builderRender previews the collector YAML a builder pipeline produces, without saving anything.
+func (s *Server) builderRender(w http.ResponseWriter, r *http.Request) {
+	var spec pipeline.Spec
+	if !decode(w, r, &spec) {
+		return
+	}
+	body, issues := pipeline.Render(spec)
+	writeJSON(w, http.StatusOK, map[string]any{"body": body, "issues": nonNil(issues)})
+}
+
+// renderBuilder replaces *body with the YAML rendered from a builder
+// pipeline, if one was sent, and returns the pipeline to store alongside
+// it. It reports false after writing an error response.
+func (s *Server) renderBuilder(w http.ResponseWriter, spec *pipeline.Spec, body *string) (json.RawMessage, bool) {
+	if spec == nil {
+		return nil, true
+	}
+	rendered, issues := pipeline.Render(*spec)
+	if agentconfig.HasErrors(issues) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "the pipeline is not complete", "issues": issues})
+		return nil, false
+	}
+	*body = rendered
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return nil, false
+	}
+	return raw, true
 }
