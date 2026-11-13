@@ -143,6 +143,7 @@ func run() error {
 		settings.AlertDelivery:     {Available: cfg.AlertWebhookURL != "", Default: true},
 		settings.Telemetry:         {Available: telemetry.Enabled(), Default: true},
 		settings.Rebalancing:       {Available: true, Default: cfg.RebalanceEnabled},
+		settings.SecondApprover:    {Available: true, Default: false},
 		settings.FleetHealthAlerts: {Available: cfg.AlertOfflinePct > 0 || cfg.AlertUnhealthyPct > 0, Default: true},
 	}, log)
 	if err != nil {
@@ -293,6 +294,13 @@ func run() error {
 	apiTokens := auth.NewTokens(db)
 	sessions := auth.NewSessions(cfg.JWTSigningKey, cfg.LocalAdminPassword)
 	sessions.APITokens = apiTokens.Authenticate
+	sessions.Store, sessions.IdleTimeout, sessions.MaxAge = auth.NewRedisSessions(rdb), cfg.SessionIdleTimeout, cfg.SessionMaxAge
+	sessionWarn := logthrottle.New(10 * time.Second)
+	sessions.OnStoreError = func(err error) {
+		sessionWarn.Do(func(suppressed int64) {
+			log.Warn("redis unavailable: console sessions cannot be checked for sign-out or idleness", "err", err, "similar_errors_suppressed", suppressed)
+		})
+	}
 	var sso *auth.OIDC
 	if cfg.OktaIssuer != "" {
 		sso, err = auth.NewOIDC(ctx, auth.OIDCConfig{

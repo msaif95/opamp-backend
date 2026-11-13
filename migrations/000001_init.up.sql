@@ -359,3 +359,57 @@ CREATE TRIGGER agents_record_events_update AFTER UPDATE ON agents
         OR NEW.remote_config_status IS DISTINCT FROM OLD.remote_config_status
         OR NEW.remote_config_hash IS DISTINCT FROM OLD.remote_config_hash)
     EXECUTE FUNCTION record_agent_events();
+
+-- Audit integrity ------------------------------------------------------------
+-- Each audit event carries a hash of itself and the previous event's hash, so
+-- an edited, inserted or removed event breaks the chain (see audit_verify).
+-- Events cannot be updated, and can only be deleted by the retention job.
+ALTER TABLE audit_events ADD COLUMN prev_hash BYTEA, ADD COLUMN hash BYTEA;
+
+CREATE FUNCTION audit_event_hash(prev BYTEA, e audit_events) RETURNS BYTEA LANGUAGE sql IMMUTABLE AS $$
+    SELECT digest(COALESCE(prev, ''::bytea) || convert_to(concat_ws('|', e.id, extract(epoch FROM e.occurred_at), e.actor, e.actor_auth,
+        e.action, e.target_type, COALESCE(e.target_id, ''), e.details::text), 'UTF8'), 'sha256')
+$$;
+
+CREATE FUNCTION audit_events_chain() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    -- One writer at a time, and the ID is taken under the lock, so ID order is chain order.
+    PERFORM pg_advisory_xact_lock(727274);
+    NEW.id := nextval('audit_events_id_seq');
+    SELECT hash INTO NEW.prev_hash FROM audit_events ORDER BY id DESC LIMIT 1;
+    NEW.hash := audit_event_hash(NEW.prev_hash, NEW);
+    RETURN NEW;
+END $$;
+CREATE TRIGGER audit_events_chain BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION audit_events_chain();
+
+CREATE FUNCTION audit_events_protect() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' AND current_setting('opamp.audit_prune', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'audit events cannot be changed or deleted';
+END $$;
+CREATE TRIGGER audit_events_protect BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW EXECUTE FUNCTION audit_events_protect();
+CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_protect();
+
+-- audit_verify returns the ID of the first event that does not fit the chain,
+-- or NULL when the log is intact. The oldest kept event is taken as the start,
+-- because retention removes events from the old end.
+CREATE FUNCTION audit_verify() RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE
+    e audit_events;
+    prev BYTEA;
+    first BOOLEAN := TRUE;
+BEGIN
+    FOR e IN SELECT * FROM audit_events ORDER BY id LOOP
+        IF e.hash IS NULL THEN
+            CONTINUE; -- recorded before integrity checking existed
+        END IF;
+        IF (NOT first AND e.prev_hash IS DISTINCT FROM prev) OR e.hash IS DISTINCT FROM audit_event_hash(e.prev_hash, e) THEN
+            RETURN e.id;
+        END IF;
+        prev := e.hash;
+        first := FALSE;
+    END LOOP;
+    RETURN NULL;
+END $$;

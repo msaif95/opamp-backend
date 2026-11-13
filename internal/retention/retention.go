@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -57,6 +58,27 @@ func (j *Job) Run(ctx context.Context) {
 	}
 }
 
+// exec runs one delete. Audit events refuse deletion unless the transaction
+// declares itself the retention job (see the audit_events_protect trigger).
+func (j *Job) exec(ctx context.Context, audit bool, sql string, args ...any) (pgconn.CommandTag, error) {
+	if !audit {
+		return j.DB.Exec(ctx, sql, args...)
+	}
+	tx, err := j.DB.Begin(ctx)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL opamp.audit_prune = 'on'`); err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	tag, err := tx.Exec(ctx, sql, args...)
+	if err != nil {
+		return tag, err
+	}
+	return tag, tx.Commit(ctx)
+}
+
 // Prune deletes everything past its retention period.
 func (j *Job) Prune(ctx context.Context) error {
 	for _, rule := range []struct {
@@ -85,7 +107,7 @@ DELETE FROM agents WHERE instance_uid IN (
 		}
 		var total int64
 		for {
-			tag, err := j.DB.Exec(ctx, rule.sql, rule.days, batch)
+			tag, err := j.exec(ctx, rule.what == "audit events", rule.sql, rule.days, batch)
 			if err != nil {
 				return err
 			}

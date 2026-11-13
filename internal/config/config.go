@@ -22,6 +22,10 @@ type Config struct {
 	// Retention, in days; 0 keeps the data forever.
 	AuditRetentionDays   int
 	RolloutRetentionDays int
+	// SessionIdleTimeout signs a console user out after this long without
+	// activity; SessionMaxAge signs them out regardless.
+	SessionIdleTimeout time.Duration
+	SessionMaxAge      time.Duration
 	// AgentRetentionDays removes agents that have been offline this long.
 	AgentRetentionDays int
 	// AgentEventRetentionDays bounds each agent's history.
@@ -142,6 +146,12 @@ func Load() (*Config, error) {
 	}
 	if c.AgentOfflineAfter, err = time.ParseDuration(env("AGENT_OFFLINE_AFTER", "90s")); err != nil {
 		return nil, fmt.Errorf("AGENT_OFFLINE_AFTER: %w", err)
+	}
+	if c.SessionIdleTimeout, err = time.ParseDuration(env("SESSION_IDLE_TIMEOUT", "30m")); err != nil || c.SessionIdleTimeout < time.Minute {
+		return nil, fmt.Errorf("SESSION_IDLE_TIMEOUT must be a duration of at least 1m")
+	}
+	if c.SessionMaxAge, err = time.ParseDuration(env("SESSION_MAX_AGE", "8h")); err != nil || c.SessionMaxAge < c.SessionIdleTimeout || c.SessionMaxAge > 24*time.Hour {
+		return nil, fmt.Errorf("SESSION_MAX_AGE must be a duration between SESSION_IDLE_TIMEOUT and 24h")
 	}
 	for name, dst := range map[string]*int{
 		"AUDIT_RETENTION_DAYS": &c.AuditRetentionDays, "ROLLOUT_RETENTION_DAYS": &c.RolloutRetentionDays,

@@ -3,11 +3,13 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/rollout"
+	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
@@ -175,6 +177,13 @@ func (s *Server) rolloutAction(action string, do func(*Server, *http.Request, uu
 			return
 		}
 		if !s.allow(w, r, ro.ProjectID, auth.RoleOperator) {
+			return
+		}
+		// Separation of duties: continuing a push is a second person's decision.
+		// Pausing, aborting and rolling back stay open to everyone, as they only make things safer.
+		if u, _ := auth.UserFrom(r.Context()); action == "resume" && s.Settings.Enabled(settings.SecondApprover) &&
+			strings.EqualFold(u.Subject, ro.CreatedBy) {
+			writeError(w, http.StatusForbidden, "a second person must approve: you started this push, so someone else has to continue it")
 			return
 		}
 		if err := do(s, r, id); err != nil {

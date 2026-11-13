@@ -339,3 +339,27 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": nonNil(people)})
 }
+
+// logout ends the caller's session at once, rather than leaving the token valid until it expires.
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	u, _ := auth.UserFrom(r.Context())
+	if err := s.Sessions.End(r.Context(), u); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "auth.logout", "user", u.Subject, nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// endUserSessions signs a person out everywhere (admin), for example after they leave.
+func (s *Server) endUserSessions(w http.ResponseWriter, r *http.Request) {
+	subject := chi.URLParam(r, "subject")
+	n, err := s.Sessions.EndAll(r.Context(), subject)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "user.sessions.end", "user", strings.ToLower(subject), map[string]any{"sessions": n})
+	writeJSON(w, http.StatusOK, map[string]any{"sessions_ended": n})
+}

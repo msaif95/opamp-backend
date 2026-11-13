@@ -97,6 +97,7 @@ func (s *Server) Router() http.Handler {
 			// Any signed-in user; handlers filter and check by project.
 			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
 			r.Get("/auth/me", s.me)
+			r.Post("/auth/logout", s.logout)
 			r.Get("/projects", s.listProjects)
 			r.Get("/summary", s.summary)
 			r.Get("/agents", s.listAgents)
@@ -154,6 +155,7 @@ func (s *Server) Router() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.Sessions.Require(auth.RoleAdmin), s.withScope)
 			r.Get("/users", s.listUsers)
+			r.Delete("/users/{subject}/sessions", s.endUserSessions)
 			r.Post("/projects", s.createProject)
 			r.Delete("/projects/{id}", s.deleteProject)
 			r.Get("/projects/{id}/members", s.listProjectMembers)
@@ -162,6 +164,7 @@ func (s *Server) Router() http.Handler {
 			r.Put("/agents/{uid}/project", s.setAgentProject)
 			r.Put("/credentials/api-keys/{id}/project", s.setAPIKeyProject)
 			r.Get("/audit", s.listAudit)
+			r.Get("/audit/verify", s.verifyAudit)
 			r.Get("/system", s.system)
 			r.Get("/auth/tokens", s.listTokens)
 			r.Post("/auth/tokens", s.createToken)
@@ -596,6 +599,20 @@ VALUES ($1, $2, $3, $4, $5, $6::jsonb)`, actor, actorAuth, action, targetType, t
 	if err != nil {
 		s.Log.ErrorContext(ctx, "audit write failed", "action", action, "err", err)
 	}
+	// Also written to the log stream, so a log collector can ship the audit
+	// trail to a SIEM or append-only store outside this database.
+	s.Log.InfoContext(ctx, "audit", "audit", true, "actor", actor, "actor_auth", actorAuth, "action", action,
+		"target_type", targetType, "target_id", targetID, "details", json.RawMessage(b))
+}
+
+// verifyAudit checks the audit log's hash chain and reports the first event that does not fit, if any.
+func (s *Server) verifyAudit(w http.ResponseWriter, r *http.Request) {
+	var broken *int64
+	if err := s.DB.QueryRow(r.Context(), `SELECT audit_verify()`).Scan(&broken); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"intact": broken == nil, "first_broken_event_id": broken})
 }
 
 func (s *Server) internal(w http.ResponseWriter, r *http.Request, err error) {

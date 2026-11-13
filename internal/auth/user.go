@@ -36,6 +36,7 @@ type User struct {
 	Role     Role   `json:"role"`
 	// TokenProject is set for an API token bound to one project.
 	TokenProject *uuid.UUID `json:"-"`
+	sessionID    string
 }
 
 type claims struct {
@@ -59,11 +60,22 @@ type Sessions struct {
 	localAdminPassword string
 	// APITokens resolves a console API token to the user it acts as.
 	APITokens func(ctx context.Context, secret string) (User, error)
+
+	// Store, if set, makes sessions revocable and subject to IdleTimeout.
+	// Without it a session is valid until its token expires.
+	Store SessionStore
+	// IdleTimeout ends a session not used for this long; MaxAge ends it regardless.
+	IdleTimeout time.Duration
+	MaxAge      time.Duration
+	// OnStoreError is called when the store cannot be reached. The session
+	// is then accepted on its signature alone: failing closed would lock
+	// every administrator out of the console during a Redis outage.
+	OnStoreError func(err error)
 }
 
 // NewSessions creates a Sessions. An empty localAdminPassword disables local login.
 func NewSessions(key []byte, localAdminPassword string) *Sessions {
-	return &Sessions{key: key, localAdminPassword: localAdminPassword}
+	return &Sessions{key: key, localAdminPassword: localAdminPassword, IdleTimeout: 30 * time.Minute, MaxAge: sessionTTL}
 }
 
 // LocalEnabled reports whether the break-glass local admin login is configured.
@@ -84,14 +96,21 @@ func (s *Sessions) LocalLogin(username, password string) (string, User, error) {
 // Issue signs a session token for u.
 func (s *Sessions) Issue(u User) (string, error) {
 	now := time.Now()
+	id := uuid.NewString()
+	if s.Store != nil {
+		if err := s.Store.Start(context.Background(), id, strings.ToLower(u.Subject), s.IdleTimeout); err != nil {
+			return "", err
+		}
+	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims{
 		Provider: u.Provider,
 		Role:     u.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    sessionIssuer,
+			ID:        id,
 			Subject:   u.Subject,
 			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(sessionTTL)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(s.MaxAge)),
 		},
 	}).SignedString(s.key)
 }
@@ -104,7 +123,37 @@ func (s *Sessions) Verify(token string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	return User{Subject: c.Subject, Provider: c.Provider, Role: c.Role}, nil
+	if s.Store != nil {
+		live, err := s.Store.Touch(context.Background(), c.ID, s.IdleTimeout)
+		switch {
+		case err != nil:
+			if s.OnStoreError != nil {
+				s.OnStoreError(err)
+			}
+		case !live:
+			return User{}, ErrSessionEnded
+		}
+	}
+	return User{Subject: c.Subject, Provider: c.Provider, Role: c.Role, sessionID: c.ID}, nil
+}
+
+// ErrSessionEnded is returned for a session that was signed out, ended by an administrator or left idle too long.
+var ErrSessionEnded = errors.New("session ended")
+
+// End signs out the session behind u.
+func (s *Sessions) End(ctx context.Context, u User) error {
+	if s.Store == nil || u.sessionID == "" {
+		return nil
+	}
+	return s.Store.End(ctx, u.sessionID)
+}
+
+// EndAll signs a person out everywhere and returns how many sessions were ended.
+func (s *Sessions) EndAll(ctx context.Context, subject string) (int, error) {
+	if s.Store == nil {
+		return 0, nil
+	}
+	return s.Store.EndAll(ctx, strings.ToLower(subject))
 }
 
 type userKey struct{}

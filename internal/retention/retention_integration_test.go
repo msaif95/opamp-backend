@@ -60,3 +60,44 @@ func TestPruneDeletesOnlyWhatIsPastRetention(t *testing.T) {
 		t.Error("retention of 0 days deleted data")
 	}
 }
+
+func TestAuditLogIsTamperEvident(t *testing.T) {
+	db, _ := testdb.Open(t)
+	ctx := context.Background()
+	for _, actor := range []string{"a", "b", "c"} {
+		if _, err := db.Exec(ctx, `INSERT INTO audit_events (actor, actor_auth, action, target_type) VALUES ($1, 'local', 'x', 'y')`, actor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verify := func() *int64 {
+		t.Helper()
+		var broken *int64
+		if err := db.QueryRow(ctx, `SELECT audit_verify()`).Scan(&broken); err != nil {
+			t.Fatal(err)
+		}
+		return broken
+	}
+	if b := verify(); b != nil {
+		t.Fatalf("untouched log reported broken at %d", *b)
+	}
+	// Ordinary sessions can neither edit nor delete events.
+	if _, err := db.Exec(ctx, `UPDATE audit_events SET actor = 'mallory'`); err == nil {
+		t.Fatal("audit event was updated")
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM audit_events`); err == nil {
+		t.Fatal("audit event was deleted")
+	}
+	// Someone with database superpowers who bypasses the guard is still caught by the chain.
+	var second int64
+	_ = db.QueryRow(ctx, `SELECT id FROM audit_events WHERE actor = 'b'`).Scan(&second)
+	tx, _ := db.Begin(ctx)
+	_, _ = tx.Exec(ctx, `ALTER TABLE audit_events DISABLE TRIGGER audit_events_protect`)
+	_, _ = tx.Exec(ctx, `UPDATE audit_events SET actor = 'mallory' WHERE id = $1`, second)
+	_, _ = tx.Exec(ctx, `ALTER TABLE audit_events ENABLE TRIGGER audit_events_protect`)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if b := verify(); b == nil || *b != second {
+		t.Fatalf("edited event not detected: %v", b)
+	}
+}
