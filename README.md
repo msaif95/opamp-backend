@@ -275,6 +275,12 @@ with `sudo`). The labels decide which groups the collector falls into.
 
 Collectors authenticate with an API key or, when a client CA is configured, a client certificate.
 
+### Kubernetes collectors
+
+Collectors run by the OpenTelemetry Operator connect through its OpAMP Bridge (`opamp-deploy/examples/kubernetes-bridge.yaml`).
+The bridge appears in the fleet as one entry; its page lists the cluster's collectors with pod health, and "Set config"
+gives a managed collector a config version, which the operator rolls out. Bridges are not part of groups or bulk pushes.
+
 ### Configs
 
 - **Build a config** from sources, processors and destinations chosen from a catalog. The collector YAML is
@@ -384,4 +390,4 @@ to collectors, so it is safe to run on every merge; `push` is the deliberate ste
   with a newer version instead.
 - Viewing sample telemetry from a collector, and previewing a processor's effect before a push.
 - Renewing collectors' own client certificates automatically.
-- Kubernetes-native collectors through the OpenTelemetry Operator.
+- Bulk pushes and groups for Kubernetes collectors; they are configured one at a time.

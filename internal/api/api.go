@@ -124,6 +124,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/secrets/names", s.secretNames)
 			r.Get("/agents/{uid}/metrics", s.agentMetrics)
 			r.Get("/agents/{uid}/events", s.agentEvents)
+			r.Get("/agents/{uid}/collectors", s.bridgeCollectors)
 			r.Get("/agents/{uid}/logs", s.agentLogs)
 			r.Get("/agents/{uid}/traces", s.agentTraces)
 			r.Get("/agents/{uid}/metrics/all", s.agentAllMetrics)
@@ -140,6 +141,7 @@ func (s *Server) Router() http.Handler {
 		r.Group(func(r chi.Router) {
 			// Changes: each handler checks the operator role in the resource's project.
 			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
+			r.Put("/agents/{uid}/collectors/config", s.setBridgeCollectorConfig)
 			r.Post("/configs", s.createConfig)
 			r.Post("/configs/builder/library", s.saveLibraryItem)
 			r.Put("/configs/builder/library/{id}", s.saveLibraryItem)
@@ -476,7 +478,7 @@ func (s *Server) pauseAgent(paused bool) http.HandlerFunc {
 		case errors.Is(err, registry.ErrNotFound):
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
-		case errors.Is(err, registry.ErrNoConfig), errors.Is(err, registry.ErrRemoteConfigUnsupported):
+		case errors.Is(err, registry.ErrNoConfig), errors.Is(err, registry.ErrRemoteConfigUnsupported), errors.Is(err, registry.ErrBridge):
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		case err != nil:

@@ -489,3 +489,65 @@ func TestSearchBreakdownAndTrend(t *testing.T) {
 		t.Fatalf("trend = %+v", points)
 	}
 }
+
+// A Kubernetes OpAMP Bridge is recognised by the attribute it reports, keeps
+// one file per collector, takes configs per collector and stays out of
+// whole-agent assignment.
+func TestBridge(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	uid := uuid.New()
+	msg := fullReport("bridge-pod")
+	msg.AgentDescription.NonIdentifyingAttributes = append(msg.AgentDescription.NonIdentifyingAttributes, kv("opentelemetry.io/opamp.bridge.mode", "operator"))
+	msg.EffectiveConfig = &protobufs.EffectiveConfig{ConfigMap: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{
+		"apps/web":   {Body: []byte("kind: OpenTelemetryCollector\nmetadata: {name: web, namespace: apps}\n")},
+		"apps/other": {Body: []byte("kind: OpenTelemetryCollector\nmetadata: {name: other, namespace: apps}\n")},
+	}}}
+	st, err := r.Report(ctx, uid, registry.Identity{AuthMode: "api_key"}, msg)
+	if err != nil || !st.Bridge {
+		t.Fatalf("bridge not recognised: %+v, %v", st, err)
+	}
+	a, _ := r.Get(ctx, uid)
+	if a.ConnectorType != "k8s_bridge" {
+		t.Fatalf("connector type = %s", a.ConnectorType)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO config_templates (id, name) VALUES ('00000000-0000-0000-0000-0000000000aa', 'gw')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO config_versions (id, template_id, version, body, body_hash, author)
+		VALUES ('00000000-0000-0000-0000-0000000000bb', '00000000-0000-0000-0000-0000000000aa', 2, 'receivers: {}', 'h', 'a')`); err != nil {
+		t.Fatal(err)
+	}
+	version := uuid.MustParse("00000000-0000-0000-0000-0000000000bb")
+	// A bridge cannot be given one config for the whole agent, nor be paused.
+	if err := r.SetDesiredConfig(ctx, uid, version); !errors.Is(err, registry.ErrBridge) {
+		t.Fatalf("whole-agent assign: %v", err)
+	}
+	if err := r.SetPaused(ctx, uid, true); !errors.Is(err, registry.ErrBridge) {
+		t.Fatalf("pause: %v", err)
+	}
+	if err := r.SetBridgeConfig(ctx, uid, "apps/web", &version, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	files, _, assigned, err := r.BridgeState(ctx, uid)
+	if err != nil || len(files) != 2 || len(assigned) != 1 || assigned["apps/web"].TemplateName != "gw" || assigned["apps/web"].Version != 2 || assigned["apps/web"].Body != "receivers: {}" {
+		t.Fatalf("state: %d files, %+v, %v", len(files), assigned, err)
+	}
+	// A later message without an effective config keeps the files.
+	mustReport(t, r, uid, &protobufs.AgentToServer{Capabilities: acceptsRemoteConfig, Health: &protobufs.ComponentHealth{Healthy: true}})
+	if files, _, _, _ = r.BridgeState(ctx, uid); len(files) != 2 {
+		t.Fatalf("files lost: %v", files)
+	}
+	if err := r.SetBridgeConfig(ctx, uid, "apps/web", nil, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, assigned, _ = r.BridgeState(ctx, uid); len(assigned) != 0 {
+		t.Fatalf("assignment not removed: %+v", assigned)
+	}
+	// An ordinary collector is not a bridge.
+	other := uuid.New()
+	mustReport(t, r, other, fullReport("host-1"))
+	if _, _, _, err := r.BridgeState(ctx, other); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("ordinary collector treated as a bridge: %v", err)
+	}
+}

@@ -231,6 +231,9 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("carol reads agent traces", first(h.call(carol, "GET", "/agents/"+a1+"/traces", nil)), 404)
 	h.expect("carol reads all agent metrics", first(h.call(carol, "GET", "/agents/"+a1+"/metrics/all", nil)), 404)
 	h.expect("alice reads traces of an agent in B", first(h.call(alice, "GET", "/agents/"+b1+"/traces", nil)), 200)
+	h.expect("carol lists a bridge's collectors", first(h.call(carol, "GET", "/agents/"+a1+"/collectors", nil)), 404)
+	h.expect("viewer sets a bridge collector config in B", first(h.call(alice, "PUT", "/agents/"+b1+"/collectors/config", map[string]any{"collector": "x/y"})), 403)
+	h.expect("collectors of an ordinary agent", first(h.call(alice, "GET", "/agents/"+a1+"/collectors", nil)), 404)
 	h.expect("carol reads agent logs", first(h.call(carol, "GET", "/agents/"+a1+"/logs", nil)), 404)
 	h.expect("alice reads logs of an agent in B", first(h.call(alice, "GET", "/agents/"+b1+"/logs", nil)), 200)
 

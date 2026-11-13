@@ -71,6 +71,10 @@ func (f *fakeRegistry) Report(_ context.Context, uid uuid.UUID, id registry.Iden
 	return f.state, nil
 }
 
+func (f *fakeRegistry) BridgeState(context.Context, uuid.UUID) (map[string]string, []byte, map[string]registry.BridgeAssignment, error) {
+	return nil, nil, nil, nil
+}
+
 func (f *fakeRegistry) ConfigState(context.Context, uuid.UUID) (registry.ConfigState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

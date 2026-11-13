@@ -160,3 +160,10 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   forwarded unchanged to `OWN_TRACES_ENDPOINT` if set). All in Redis, secrets redacted. The stock Supervisor
   (checked at v0.164.0) supports all three; it has no code for "other connection settings" and only relays custom
   messages to collector components.
+- Kubernetes (`internal/k8sbridge`): an OpAMP Bridge is one agent (`connector_type = k8s_bridge`, detected by the
+  `opentelemetry.io/opamp.bridge.mode` attribute) reporting one file per OpenTelemetryCollector ("namespace/name" ->
+  resource YAML, kept in `agents.effective_files`). Configs are assigned per collector (`bridge_collector_configs`,
+  `PUT /agents/{uid}/collectors/config`); `Handler.bridgeConfig` sends EVERY managed collector back (the bridge
+  deletes managed ones missing from a remote config), rebuilt from name/namespace/labels/spec so the hash is stable.
+  Nothing is sent to a bridge with no assignment. Bridges are excluded from rollouts, group configs, whole-agent
+  assign and pause. Tested against operator chart 0.129.0 (app 0.162.0) on docker-desktop.

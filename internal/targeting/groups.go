@@ -184,6 +184,10 @@ func scanGroup(row pgx.CollectableRow) (Group, error) {
 	return grp, json.Unmarshal(sel, &grp.Selector)
 }
 
+// NotBridge excludes Kubernetes OpAMP Bridges, which take one config per
+// collector they manage and so cannot be part of a bulk push.
+const NotBridge = "connector_type <> 'k8s_bridge'"
+
 // WhereIn is Where confined to one project's agents (nil: unassigned
 // agents). A selector never reaches across projects.
 func (s Selector) WhereIn(attributesColumn, projectColumn string, project *uuid.UUID, firstParam int) (string, []any) {

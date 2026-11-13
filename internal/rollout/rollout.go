@@ -225,7 +225,7 @@ VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, 'running', $9, now(), $10) RETURN
 	if p.CanarySteps != nil {
 		var total int
 		countWhere, countArgs := sel.WhereIn("attributes", "project_id", p.ProjectID, 1)
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM agents WHERE `+countWhere, countArgs...).Scan(&total); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM agents WHERE `+countWhere+` AND `+targeting.NotBridge, countArgs...).Scan(&total); err != nil {
 			return nil, err
 		}
 		stepExpr, stepArg = `(SELECT count(*) FROM unnest($2::int[]) AS bound WHERE bound < rn)::int`, stepBounds(p.CanarySteps, total)
@@ -233,7 +233,7 @@ VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, 'running', $9, now(), $10) RETURN
 	tag, err := tx.Exec(ctx, `
 INSERT INTO rollout_agents (rollout_id, instance_uid, step)
 SELECT $1, instance_uid, `+stepExpr+`
-FROM (SELECT instance_uid, row_number() OVER (ORDER BY random()) AS rn FROM agents WHERE `+where+`) t`,
+FROM (SELECT instance_uid, row_number() OVER (ORDER BY random()) AS rn FROM agents WHERE `+where+` AND `+targeting.NotBridge+`) t`,
 		append([]any{id, stepArg}, args...)...)
 	if err != nil {
 		return nil, err
@@ -594,7 +594,7 @@ ORDER BY g.name`)
 		rows, err := s.db.Query(ctx, `
 UPDATE agents SET desired_config_version_id = $1 WHERE instance_uid IN (
     SELECT instance_uid FROM agents
-    WHERE desired_config_version_id IS NULL AND capabilities & $2 <> 0 AND `+where+`
+    WHERE desired_config_version_id IS NULL AND capabilities & $2 <> 0 AND `+targeting.NotBridge+` AND `+where+`
     ORDER BY instance_uid LIMIT $3 FOR UPDATE SKIP LOCKED)
 RETURNING instance_uid`, append([]any{g.versionID, acceptsRemoteConfig, reconcileBatch}, args...)...)
 		if err != nil {

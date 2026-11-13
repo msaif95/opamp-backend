@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS bridge_collector_configs;
 DROP TABLE IF EXISTS fleet_samples;
 DROP TABLE IF EXISTS secrets;
 DROP TRIGGER IF EXISTS agents_record_events_update ON agents;

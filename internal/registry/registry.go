@@ -22,6 +22,7 @@ import (
 	"github.com/open-telemetry/opamp-go/protobufs"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/msaif95/opamp-backend/internal/k8sbridge"
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
 )
 
@@ -58,6 +59,8 @@ type ConfigState struct {
 	RemoteConfigHash       []byte
 	// Paused agents are sent an empty pipeline instead of their assigned config.
 	Paused bool
+	// Bridge is true for a Kubernetes OpAMP Bridge, whose config is built per collector (see internal/k8sbridge).
+	Bridge bool
 }
 
 // Agent is the API/storage representation of one collector instance.
@@ -204,8 +207,9 @@ func (r *Registry) heartbeat(ctx context.Context, uid uuid.UUID, msg *protobufs.
 		connected bool
 	)
 	err = r.db.QueryRow(ctx, `
-SELECT capabilities, desired_config_version_id, remote_config_hash, connected, paused FROM agents WHERE instance_uid = $1`,
-		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected, &st.Paused)
+SELECT capabilities, desired_config_version_id, remote_config_hash, connected, paused, connector_type = 'k8s_bridge'
+FROM agents WHERE instance_uid = $1`,
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected, &st.Paused, &st.Bridge)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!connected || uint64(caps) != msg.Capabilities)) {
 		return st, false, nil
 	}
@@ -272,13 +276,14 @@ INSERT INTO agents (
     healthy, health_status, health_last_error, health,
     effective_config_hash, effective_config,
     remote_config_hash, remote_config_status, remote_config_error,
-    connected, sequence_num, last_seen, project_id)
+    connected, sequence_num, last_seen, project_id, connector_type, effective_files)
 VALUES (
     $1, $2::auth_mode, $3, COALESCE($4::jsonb, '{}'::jsonb), $5, $6,
     $7, $8, $9, $10::jsonb,
     $11, $12,
     $13, COALESCE($14::remote_config_status, 'unset'), $15,
-    TRUE, $16, now(), (SELECT project_id FROM credentials WHERE id = $3))
+    TRUE, $16, now(), (SELECT project_id FROM credentials WHERE id = $3),
+    COALESCE($17::connector_type, 'supervisor'), $18::jsonb)
 ON CONFLICT (instance_uid) DO UPDATE SET
     auth_mode             = EXCLUDED.auth_mode,
     credential_id         = EXCLUDED.credential_id,
@@ -300,11 +305,13 @@ ON CONFLICT (instance_uid) DO UPDATE SET
     remote_config_hash    = CASE WHEN $14::remote_config_status IS NULL THEN agents.remote_config_hash ELSE $13 END,
     remote_config_status  = COALESCE($14::remote_config_status, agents.remote_config_status),
     remote_config_error   = CASE WHEN $14::remote_config_status IS NULL THEN agents.remote_config_error ELSE $15 END,
+    connector_type        = COALESCE($17::connector_type, agents.connector_type),
+    effective_files       = COALESCE($18::jsonb, agents.effective_files),
     connected             = TRUE,
     sequence_num          = EXCLUDED.sequence_num,
     last_seen             = now()
 RETURNING capabilities, desired_config_version_id, remote_config_hash, paused,
-          COALESCE((SELECT connected FROM prev), FALSE)`
+          COALESCE((SELECT connected FROM prev), FALSE), connector_type = 'k8s_bridge'`
 
 // Report applies an AgentToServer status report. Fields the agent omitted
 // (unchanged since its last message) are left untouched.
@@ -325,6 +332,8 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		healthy                            *bool
 		effHash, remoteHash                []byte
 		effBody, remoteStatus, remoteError *string
+		connector                          *string
+		effFiles                           []byte
 	)
 
 	if d := msg.GetAgentDescription(); d != nil {
@@ -332,6 +341,11 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		attrs, _ = json.Marshal(m)
 		if v, ok := m["service.version"]; ok {
 			version = &v
+		}
+		// Only a Kubernetes OpAMP Bridge reports this attribute.
+		if _, ok := m[k8sbridge.ModeAttribute]; ok {
+			kind := "k8s_bridge"
+			connector = &kind
 		}
 	}
 	if h := msg.GetHealth(); h != nil {
@@ -342,6 +356,12 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		body := RenderConfigMap(c)
 		sum := sha256.Sum256([]byte(body))
 		effBody, effHash = &body, sum[:]
+		// Kept per file as well: a bridge reports one file per collector it watches.
+		files := make(map[string]string, len(c.ConfigMap))
+		for name, f := range c.ConfigMap {
+			files[name] = string(f.Body)
+		}
+		effFiles, _ = json.Marshal(files)
 	}
 	if s := msg.GetRemoteConfigStatus(); s != nil {
 		status := remoteStatusName(s.Status)
@@ -358,7 +378,7 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		healthy, healthStatus, healthErr, health,
 		effHash, effBody,
 		remoteHash, remoteStatus, remoteError,
-		int64(msg.SequenceNum)).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &wasConnected)
+		int64(msg.SequenceNum), connector, effFiles).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &wasConnected, &st.Bridge)
 	if err != nil {
 		return st, fmt.Errorf("upsert agent %s: %w", uid, err)
 	}
@@ -382,8 +402,9 @@ func (r *Registry) ConfigState(ctx context.Context, uid uuid.UUID) (ConfigState,
 		caps int64
 	)
 	err := r.db.QueryRow(ctx, `
-SELECT capabilities, desired_config_version_id, remote_config_hash, paused FROM agents WHERE instance_uid = $1`,
-		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused)
+SELECT capabilities, desired_config_version_id, remote_config_hash, paused, connector_type = 'k8s_bridge'
+FROM agents WHERE instance_uid = $1`,
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &st.Bridge)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, ErrNotFound
 	}
@@ -397,14 +418,18 @@ SELECT capabilities, desired_config_version_id, remote_config_hash, paused FROM 
 func (r *Registry) SetDesiredConfig(ctx context.Context, uid, versionID uuid.UUID) error {
 	tag, err := r.db.Exec(ctx, `
 UPDATE agents SET desired_config_version_id = $2
-WHERE instance_uid = $1 AND capabilities & $3 <> 0`,
+WHERE instance_uid = $1 AND capabilities & $3 <> 0 AND connector_type <> 'k8s_bridge'`,
 		uid, versionID, int64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig))
 	if err != nil {
 		return fmt.Errorf("assign config to %s: %w", uid, err)
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := r.ConfigState(ctx, uid); err != nil {
+		st, err := r.ConfigState(ctx, uid)
+		if err != nil {
 			return err
+		}
+		if st.Bridge {
+			return ErrBridge
 		}
 		return ErrRemoteConfigUnsupported
 	}
@@ -487,6 +512,77 @@ WHERE instance_uid = $1 AND ($2 <= 0 OR id < $2) ORDER BY id DESC LIMIT $3`, uid
 	})
 }
 
+// BridgeAssignment is the config assigned to one collector behind a bridge.
+type BridgeAssignment struct {
+	VersionID    uuid.UUID `json:"version_id"`
+	TemplateID   uuid.UUID `json:"template_id"`
+	TemplateName string    `json:"template_name"`
+	Version      int       `json:"version"`
+	SetBy        string    `json:"set_by"`
+	SetAt        time.Time `json:"set_at"`
+	// Body is the collector config (not returned by the API).
+	Body string `json:"-"`
+}
+
+// BridgeState returns what a bridge last reported (one file per collector,
+// and its health as JSON) and the config assigned to each collector.
+func (r *Registry) BridgeState(ctx context.Context, uid uuid.UUID) (files map[string]string, health []byte, assigned map[string]BridgeAssignment, err error) {
+	var raw []byte
+	err = r.db.QueryRow(ctx, `SELECT effective_files, health FROM agents WHERE instance_uid = $1 AND connector_type = 'k8s_bridge'`, uid).Scan(&raw, &health)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	files = map[string]string{}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &files); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	rows, err := r.db.Query(ctx, `
+SELECT b.collector_key, cv.id, cv.template_id, ct.name, cv.version, b.set_by, b.set_at, cv.body
+FROM bridge_collector_configs b JOIN config_versions cv ON cv.id = b.config_version_id JOIN config_templates ct ON ct.id = cv.template_id
+WHERE b.instance_uid = $1`, uid)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+	assigned = map[string]BridgeAssignment{}
+	for rows.Next() {
+		var (
+			key string
+			a   BridgeAssignment
+		)
+		if err := rows.Scan(&key, &a.VersionID, &a.TemplateID, &a.TemplateName, &a.Version, &a.SetBy, &a.SetAt, &a.Body); err != nil {
+			return nil, nil, nil, err
+		}
+		assigned[key] = a
+	}
+	return files, health, assigned, rows.Err()
+}
+
+// SetBridgeConfig assigns a config version to one collector behind a bridge
+// (nil removes the assignment; the collector keeps the config it has) and
+// asks the replica holding the bridge's connection to push.
+func (r *Registry) SetBridgeConfig(ctx context.Context, uid uuid.UUID, key string, versionID *uuid.UUID, by string) error {
+	var err error
+	if versionID == nil {
+		_, err = r.db.Exec(ctx, `DELETE FROM bridge_collector_configs WHERE instance_uid = $1 AND collector_key = $2`, uid, key)
+	} else {
+		_, err = r.db.Exec(ctx, `
+INSERT INTO bridge_collector_configs (instance_uid, collector_key, config_version_id, set_by) VALUES ($1, $2, $3, $4)
+ON CONFLICT (instance_uid, collector_key) DO UPDATE SET config_version_id = EXCLUDED.config_version_id, set_by = EXCLUDED.set_by, set_at = now()`,
+			uid, key, *versionID, by)
+	}
+	if err != nil {
+		return err
+	}
+	r.publish(ctx, "agent.updated", uid)
+	return r.RequestPush(ctx, uid)
+}
+
 // ProjectOf returns the project an agent belongs to (nil for unassigned).
 func (r *Registry) ProjectOf(ctx context.Context, uid uuid.UUID) (*uuid.UUID, error) {
 	var project *uuid.UUID
@@ -512,13 +608,17 @@ func (r *Registry) SetProject(ctx context.Context, uid uuid.UUID, project *uuid.
 	return nil
 }
 
+// ErrBridge is returned for actions that apply to a single collector when the agent is a Kubernetes OpAMP Bridge.
+var ErrBridge = errors.New("this is a Kubernetes OpAMP Bridge: assign configs to its collectors on its Kubernetes tab")
+
 // ErrNoConfig is returned when pausing an agent that has no assigned config to come back to.
 var ErrNoConfig = errors.New("assign a config to this collector before pausing it, so there is something to resume to")
 
 // SetPaused stops or resumes collection on an agent and pushes the change.
 func (r *Registry) SetPaused(ctx context.Context, uid uuid.UUID, paused bool) error {
 	tag, err := r.db.Exec(ctx, `
-UPDATE agents SET paused = $2 WHERE instance_uid = $1 AND capabilities & $3 <> 0 AND desired_config_version_id IS NOT NULL`,
+UPDATE agents SET paused = $2 WHERE instance_uid = $1 AND capabilities & $3 <> 0 AND desired_config_version_id IS NOT NULL
+    AND connector_type <> 'k8s_bridge'`,
 		uid, paused, int64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig))
 	if err != nil {
 		return err
@@ -527,6 +627,9 @@ UPDATE agents SET paused = $2 WHERE instance_uid = $1 AND capabilities & $3 <> 0
 		st, err := r.ConfigState(ctx, uid)
 		if err != nil {
 			return err
+		}
+		if st.Bridge {
+			return ErrBridge
 		}
 		if st.DesiredConfigVersionID == nil {
 			return ErrNoConfig

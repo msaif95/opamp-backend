@@ -191,7 +191,7 @@ func (s *Server) assignConfig(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, "agent not found")
 		return
-	case errors.Is(err, registry.ErrRemoteConfigUnsupported):
+	case errors.Is(err, registry.ErrRemoteConfigUnsupported), errors.Is(err, registry.ErrBridge):
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	case err != nil:

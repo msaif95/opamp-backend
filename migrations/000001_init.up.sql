@@ -440,3 +440,19 @@ CREATE TABLE fleet_samples (
     config_failed INTEGER NOT NULL
 );
 CREATE INDEX fleet_samples_at_idx ON fleet_samples (at);
+
+-- Kubernetes (OpAMP Bridge) ---------------------------------------------------
+-- A bridge is one agent that reports and manages several OpenTelemetryCollector
+-- resources. effective_files keeps what it reports per collector ("namespace/name"
+-- -> the resource as YAML); bridge_collector_configs is the config assigned to
+-- each collector from the console.
+ALTER TABLE agents ADD COLUMN effective_files JSONB;
+
+CREATE TABLE bridge_collector_configs (
+    instance_uid      UUID NOT NULL REFERENCES agents(instance_uid) ON DELETE CASCADE,
+    collector_key     TEXT NOT NULL,
+    config_version_id UUID NOT NULL REFERENCES config_versions(id) ON DELETE CASCADE,
+    set_by            TEXT NOT NULL,
+    set_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (instance_uid, collector_key)
+);

@@ -8,12 +8,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/open-telemetry/opamp-go/protobufs"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
+	"github.com/msaif95/opamp-backend/internal/k8sbridge"
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
 	"github.com/msaif95/opamp-backend/internal/registry"
 )
@@ -46,6 +48,7 @@ var pausedHash = sha256.Sum256([]byte(PausedConfig))
 type Registry interface {
 	Report(ctx context.Context, uid uuid.UUID, id registry.Identity, msg *protobufs.AgentToServer) (registry.ConfigState, error)
 	ConfigState(ctx context.Context, uid uuid.UUID) (registry.ConfigState, error)
+	BridgeState(ctx context.Context, uid uuid.UUID) (map[string]string, []byte, map[string]registry.BridgeAssignment, error)
 }
 
 // ConfigSource resolves config versions.
@@ -154,7 +157,56 @@ func (h *Handler) Offer(ctx context.Context, uid uuid.UUID) *protobufs.ServerToA
 // config and has not yet acknowledged this exact version. An agent that
 // reported the same hash as APPLYING or FAILED is not re-offered it: retry
 // policy belongs to the rollout engine, not the transport.
+// bridgeConfig builds what a Kubernetes OpAMP Bridge should apply: every
+// managed collector it reported, with the assigned config put in place where
+// there is one. Nil means there is nothing to send.
+func (h *Handler) bridgeConfig(ctx context.Context, uid uuid.UUID, st registry.ConfigState) *protobufs.AgentRemoteConfig {
+	if st.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig) == 0 {
+		return nil
+	}
+	files, _, assigned, err := h.reg.BridgeState(ctx, uid)
+	if err != nil {
+		h.log.ErrorContext(ctx, "load bridge state", "instance_uid", uid, "err", err)
+		return nil
+	}
+	bodies := make(map[string]string, len(assigned))
+	for key, a := range assigned {
+		bodies[key] = a.Body
+		if h.ResolveSecrets != nil {
+			if bodies[key], err = h.ResolveSecrets(ctx, a.TemplateID, a.Body); err != nil {
+				h.log.ErrorContext(ctx, "config not sent to bridge: a secret it refers to could not be resolved", "instance_uid", uid, "collector", key, "err", err)
+				return nil
+			}
+		}
+	}
+	// Collectors without an assignment are sent back as reported. A reported
+	// config in which a secret was hidden cannot be sent back: the collector
+	// would get the placeholder instead of the value.
+	for key, body := range files {
+		if _, ok := assigned[key]; !ok && strings.Contains(body, "${secret:") {
+			h.log.ErrorContext(ctx, "config not sent to bridge: a collector without an assigned config uses a secret; assign it a config", "instance_uid", uid, "collector", key)
+			return nil
+		}
+	}
+	out, hash, err := k8sbridge.Desired(files, bodies)
+	if err != nil {
+		h.log.ErrorContext(ctx, "build bridge config", "instance_uid", uid, "err", err)
+		return nil
+	}
+	if out == nil || bytes.Equal(hash, st.RemoteConfigHash) {
+		return nil
+	}
+	cfg := &protobufs.AgentRemoteConfig{ConfigHash: hash, Config: &protobufs.AgentConfigMap{ConfigMap: map[string]*protobufs.AgentConfigObject{}}}
+	for key, body := range out {
+		cfg.Config.ConfigMap[key] = &protobufs.AgentConfigObject{Body: body, ContentType: "yaml"}
+	}
+	return cfg
+}
+
 func (h *Handler) pendingConfig(ctx context.Context, uid uuid.UUID, st registry.ConfigState) *protobufs.AgentRemoteConfig {
+	if st.Bridge {
+		return h.bridgeConfig(ctx, uid, st)
+	}
 	if st.DesiredConfigVersionID == nil ||
 		st.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig) == 0 {
 		return nil
