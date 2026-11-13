@@ -65,8 +65,10 @@ type Rollout struct {
 	CanarySteps   []int32 `json:"canary_steps_pct"`
 	MaxFailurePct float64 `json:"max_failure_pct"`
 	// AutoRollback rolls the rollout back instead of pausing when a batch exceeds MaxFailurePct.
-	AutoRollback bool   `json:"auto_rollback"`
-	Status       string `json:"status"`
+	AutoRollback bool `json:"auto_rollback"`
+	// ManualApproval pauses after every batch until an operator resumes.
+	ManualApproval bool   `json:"manual_approval"`
+	Status         string `json:"status"`
 	// BatchesReleased is how many batches have been sent so far.
 	BatchesReleased int        `json:"batches_released"`
 	TotalBatches    int        `json:"total_batches"`
@@ -137,7 +139,9 @@ type Params struct {
 	CanarySteps   []int
 	MaxFailurePct float64
 	AutoRollback  bool
-	CreatedBy     string
+	// ManualApproval pauses after every batch until an operator resumes.
+	ManualApproval bool
+	CreatedBy      string
 }
 
 func (p Params) validate() error {
@@ -203,9 +207,9 @@ func (s *Service) Create(ctx context.Context, p Params) (*Rollout, error) {
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
 INSERT INTO rollouts (config_version_id, selector, group_id, batch_size, canary_steps_pct, max_failure_pct,
-                      auto_rollback, status, created_by, started_at)
-VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, 'running', $8, now()) RETURNING id`,
-		versionID, selJSON, p.GroupID, batchSize, steps, maxFailurePct, p.AutoRollback, createdBy).Scan(&id)
+                      auto_rollback, manual_approval, status, created_by, started_at)
+VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, 'running', $9, now()) RETURNING id`,
+		versionID, selJSON, p.GroupID, batchSize, steps, maxFailurePct, p.AutoRollback, p.ManualApproval, createdBy).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +245,7 @@ FROM (SELECT instance_uid, row_number() OVER (ORDER BY random()) AS rn FROM agen
 
 const rolloutSelect = `
 SELECT r.id, r.config_version_id, cv.template_id, ct.name, cv.version, r.selector, r.group_id, g.name, r.batch_size,
-       r.canary_steps_pct, r.max_failure_pct::float8, r.auto_rollback, r.status::text, r.current_step, r.created_by, r.created_at, r.finished_at, r.error,
+       r.canary_steps_pct, r.max_failure_pct::float8, r.auto_rollback, r.manual_approval, r.status::text, r.current_step, r.created_by, r.created_at, r.finished_at, r.error,
        COALESCE((SELECT jsonb_object_agg(status, n) FROM (
            SELECT status::text, count(*) AS n FROM rollout_agents WHERE rollout_id = r.id GROUP BY status) c), '{}'::jsonb),
        COALESCE((SELECT max(step) + 1 FROM rollout_agents WHERE rollout_id = r.id), 0)
@@ -256,7 +260,7 @@ func scanRollout(row pgx.CollectableRow) (Rollout, error) {
 		sel, counts []byte
 	)
 	err := row.Scan(&r.ID, &r.ConfigVersionID, &r.ConfigID, &r.ConfigName, &r.ConfigVersion, &sel, &r.GroupID, &r.GroupName,
-		&r.BatchSize, &r.CanarySteps, &r.MaxFailurePct, &r.AutoRollback, &r.Status, &r.BatchesReleased, &r.CreatedBy, &r.CreatedAt, &r.FinishedAt, &r.Error,
+		&r.BatchSize, &r.CanarySteps, &r.MaxFailurePct, &r.AutoRollback, &r.ManualApproval, &r.Status, &r.BatchesReleased, &r.CreatedBy, &r.CreatedAt, &r.FinishedAt, &r.Error,
 		&counts, &r.TotalBatches)
 	if err != nil {
 		return r, err
@@ -575,13 +579,14 @@ func (s *Service) advance(ctx context.Context, id uuid.UUID, outcome *string) ([
 		autoRollback      bool
 		nextStep, ackStep int
 		selJSON           []byte
+		manualApproval    bool
 	)
 	err = tx.QueryRow(ctx, `
 SELECT r.config_version_id, r.status::text, cv.body_hash, r.max_failure_pct::float8, r.auto_rollback,
-       r.current_step, r.ack_step, r.selector
+       r.current_step, r.ack_step, r.selector, r.manual_approval
 FROM rollouts r JOIN config_versions cv ON cv.id = r.config_version_id
 WHERE r.id = $1 FOR UPDATE OF r SKIP LOCKED`, id).
-		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep, &selJSON)
+		Scan(&versionID, &status, &hash, &maxFailurePct, &autoRollback, &nextStep, &ackStep, &selJSON, &manualApproval)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // another replica is advancing it
 	}
@@ -671,6 +676,23 @@ FROM rollout_agents WHERE rollout_id = $1 AND step = $2`, id, active).Scan(&fail
 		}
 		if inFlight > 0 {
 			return nil, tx.Commit(ctx)
+		}
+		// The batch is settled and within its failure limit. With manual
+		// approval, wait here; Resume acknowledges this batch and lets the next one go.
+		if manualApproval && active > ackStep {
+			var pending int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM rollout_agents WHERE rollout_id = $1 AND status = 'pending'`, id).Scan(&pending); err != nil {
+				return nil, err
+			}
+			if pending > 0 {
+				msg := fmt.Sprintf("waiting for approval: batch %d is done (%d of %d agents failed); %d agents are still waiting",
+					active+1, failed, attempted, pending)
+				if _, err := tx.Exec(ctx, `UPDATE rollouts SET status = 'paused', error = $2 WHERE id = $1`, id, msg); err != nil {
+					return nil, err
+				}
+				*outcome = "awaiting_approval"
+				return nil, tx.Commit(ctx)
+			}
 		}
 	}
 

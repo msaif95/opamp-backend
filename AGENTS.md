@@ -106,3 +106,5 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Collector charts: the same intake also reads `otelcol_process_cpu_seconds`, `process_memory_rss` and
   `process_runtime_heap_alloc_bytes`, and keeps up to 180 points per agent in a Redis list (`opamp:history:<uid>`,
   about 3 hours). `GET /api/v1/agents/{uid}/metrics` serves them; the UI charts them with recharts.
+- Approval stages: a rollout with `manual_approval` pauses after every settled batch (error text starts with
+  "waiting for approval", outcome `awaiting_approval`, which also raises an alert); `Resume` approves the next batch.

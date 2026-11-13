@@ -478,3 +478,48 @@ func TestGroupConfigReachesAgentsThatJoinAfterTheRollout(t *testing.T) {
 		t.Fatal("group config not cleared")
 	}
 }
+
+func TestManualApprovalWaitsAfterEveryBatch(t *testing.T) {
+	e := newEnv(t)
+	e.agents(5)
+	r := e.start(Params{VersionID: e.v2.ID, BatchSize: 2, MaxFailurePct: 100, ManualApproval: true})
+
+	// Batch 1 goes out without approval; once it settles the rollout waits.
+	e.svc.tick(ctx)
+	e.applied(e.v2, e.push.take()...)
+	e.svc.tick(ctx)
+	e.expect(r.ID, "paused", map[string]int{"applied": 2, "pending": 3})
+	if got := e.get(r.ID); got.Error == nil || !strings.Contains(*got.Error, "waiting for approval: batch 1 is done") {
+		t.Fatalf("reason = %v", got.Error)
+	}
+	e.svc.tick(ctx)
+	if extra := e.push.take(); len(extra) != 0 {
+		t.Fatal("released a batch without approval")
+	}
+
+	// Each approval releases exactly one batch.
+	if err := e.svc.Resume(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.tick(ctx)
+	second := e.push.take()
+	if len(second) != 2 {
+		t.Fatalf("approval released %d agents, want 2", len(second))
+	}
+	e.applied(e.v2, second...)
+	e.svc.tick(ctx)
+	e.expect(r.ID, "paused", map[string]int{"applied": 4, "pending": 1})
+
+	// After the last batch there is nothing left to approve: it completes on its own.
+	if err := e.svc.Resume(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.svc.tick(ctx)
+	e.applied(e.v2, e.push.take()...)
+	e.svc.tick(ctx)
+	e.svc.tick(ctx)
+	e.expect(r.ID, "completed", map[string]int{"applied": 5})
+	if !slices.Equal(e.outcomes, []string{"awaiting_approval", "awaiting_approval", "completed"}) {
+		t.Fatalf("outcomes = %v", e.outcomes)
+	}
+}

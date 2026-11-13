@@ -28,3 +28,6 @@ CREATE TABLE library_components (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (kind, name)
 );
+
+-- Stop after every batch and wait for an operator to approve the next one.
+ALTER TABLE rollouts ADD COLUMN manual_approval BOOLEAN NOT NULL DEFAULT FALSE;

@@ -51,6 +51,8 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 		CanarySteps   []int      `json:"canary_steps_pct"`
 		MaxFailurePct float64    `json:"max_failure_pct"`
 		AutoRollback  bool       `json:"auto_rollback"`
+		// ManualApproval pauses after every batch until someone resumes.
+		ManualApproval bool `json:"manual_approval"`
 	}{BatchSize: rollout.DefaultBatchSize, MaxFailurePct: rollout.DefaultMaxFailurePct}
 	if !decode(w, r, &req) {
 		return
@@ -84,6 +86,7 @@ func (s *Server) createRollout(w http.ResponseWriter, r *http.Request) {
 	ro, err := s.Rollouts.Create(r.Context(), rollout.Params{
 		VersionID: v.ID, Selector: req.Selector, GroupID: req.GroupID, BatchSize: req.BatchSize,
 		CanarySteps: req.CanarySteps, MaxFailurePct: req.MaxFailurePct, AutoRollback: req.AutoRollback, CreatedBy: u.Subject,
+		ManualApproval: req.ManualApproval,
 	})
 	switch {
 	case errors.Is(err, rollout.ErrNoAgents):
