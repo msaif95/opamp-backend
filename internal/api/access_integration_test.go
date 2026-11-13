@@ -19,6 +19,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
@@ -126,7 +127,10 @@ func TestProjectAccess(t *testing.T) {
 		Tokens: tokens, Projects: projects, Secrets: secretStore, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
 		Throughput: func(context.Context, uuid.UUID) (*throughputSample, error) { return nil, nil },
 		History:    func(context.Context, uuid.UUID) ([]throughputPoint, error) { return nil, nil },
-		Ready:      func(context.Context) error { return nil },
+		Logs: func(context.Context, uuid.UUID, int) ([]ownlogs.Line, error) {
+			return []ownlogs.Line{{Message: "hello"}}, nil
+		},
+		Ready: func(context.Context) error { return nil },
 	}).Router())
 	defer h.srv.Close()
 
@@ -218,6 +222,8 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("alice reads unassigned config", first(h.call(alice, "GET", "/configs/"+cU, nil)), 404)
 	h.expect("bob reads project config", first(h.call(bob, "GET", "/configs/"+cA+"/versions/1", nil)), 404)
 	h.expect("carol reads agent metrics", first(h.call(carol, "GET", "/agents/"+a1+"/metrics", nil)), 404)
+	h.expect("carol reads agent logs", first(h.call(carol, "GET", "/agents/"+a1+"/logs", nil)), 404)
+	h.expect("alice reads logs of an agent in B", first(h.call(alice, "GET", "/agents/"+b1+"/logs", nil)), 200)
 
 	// --- Changes need the operator role in that project.
 	h.expect("alice creates config in A", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML, "project_id": A})), 201)

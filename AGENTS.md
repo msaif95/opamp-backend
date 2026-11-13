@@ -153,3 +153,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   single YAML-safe token (`checkValue`). Any new path that sends or stores a config body must go through these.
 - Stores: outside dev mode `Validate` requires TLS to Postgres and Redis unless `ALLOW_UNENCRYPTED_STORES=true`.
 - `second_approver` switch: the starter of a rollout cannot `resume` it (checked in `rolloutAction`).
+- Own telemetry: `handler.OwnTelemetry` (wired in main) makes one `ConnectionSettingsOffers` per connection from the
+  agent's capabilities: metrics -> `/v1/metrics` (`internal/throughput`), logs -> `/v1/logs` (`internal/ownlogs`,
+  newest 500 lines per agent in Redis for 24h, secrets redacted, `GET /agents/{uid}/logs`), traces -> the
+  deployment's `OWN_TRACES_ENDPOINT` directly. The stock Supervisor (checked at v0.164.0) supports all three; it has
+  no code for "other connection settings", and only relays custom messages to collector components.

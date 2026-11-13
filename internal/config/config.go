@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -26,6 +27,12 @@ type Config struct {
 	// activity; SessionMaxAge signs them out regardless.
 	SessionIdleTimeout time.Duration
 	SessionMaxAge      time.Duration
+	// OwnTracesEndpoint is where collectors that report their own traces are
+	// told to send them (an OTLP/HTTP traces URL, typically the tracing
+	// backend's .../v1/traces). OwnTracesHeaders are sent with them, e.g. an
+	// API key. Empty endpoint: collectors are not asked for traces.
+	OwnTracesEndpoint string
+	OwnTracesHeaders  map[string]string
 	// SecretsKey encrypts secrets referenced from configs; empty disables them.
 	SecretsKey string
 	// AgentRetentionDays removes agents that have been offline this long.
@@ -120,6 +127,7 @@ func Load() (*Config, error) {
 		RedisTLS:               env("REDIS_TLS", "false") == "true",
 		RedisPassword:          env("REDIS_PASSWORD", ""),
 		SecretsKey:             env("SECRETS_ENCRYPTION_KEY", ""),
+		OwnTracesEndpoint:      env("OWN_TRACES_ENDPOINT", ""),
 		AllowUnencryptedStores: env("ALLOW_UNENCRYPTED_STORES", "false") == "true",
 		JWTSigningKey:          []byte(env("JWT_SIGNING_KEY", "")),
 		LocalAdminPassword:     env("LOCAL_ADMIN_PASSWORD", ""),
@@ -158,6 +166,22 @@ func Load() (*Config, error) {
 	}
 	if c.AgentOfflineAfter, err = time.ParseDuration(env("AGENT_OFFLINE_AFTER", "90s")); err != nil {
 		return nil, fmt.Errorf("AGENT_OFFLINE_AFTER: %w", err)
+	}
+	if c.OwnTracesEndpoint != "" {
+		if u, perr := url.Parse(c.OwnTracesEndpoint); perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("OWN_TRACES_ENDPOINT must be an http(s) URL such as https://traces.example.com/v1/traces")
+		}
+	}
+	// "Name=value,Other=value"; a value may itself contain "=".
+	if raw := env("OWN_TRACES_HEADERS", ""); raw != "" {
+		c.OwnTracesHeaders = map[string]string{}
+		for _, pair := range strings.Split(raw, ",") {
+			k, v, ok := strings.Cut(pair, "=")
+			if k = strings.TrimSpace(k); !ok || k == "" {
+				return nil, fmt.Errorf("OWN_TRACES_HEADERS must look like Name=value,Other=value")
+			}
+			c.OwnTracesHeaders[k] = strings.TrimSpace(v)
+		}
 	}
 	if c.SessionIdleTimeout, err = time.ParseDuration(env("SESSION_IDLE_TIMEOUT", "30m")); err != nil || c.SessionIdleTimeout < time.Minute {
 		return nil, fmt.Errorf("SESSION_IDLE_TIMEOUT must be a duration of at least 1m")

@@ -189,6 +189,7 @@ Remove it with `scripts/deploy.sh dev delete`.
 | `JWT_SIGNING_KEY` | yes | Signs console sessions; 32+ random bytes |
 | `SECRETS_ENCRYPTION_KEY` | for config secrets | Encrypts secrets referenced from configs; 32+ random characters. Keep a copy: without it stored secrets are unreadable |
 | `REDIS_PASSWORD` | if Redis needs one | Redis authentication |
+| `OWN_TRACES_HEADERS` | optional | Headers collectors send with their own traces, e.g. `X-Api-Key=...` |
 | `OKTA_CLIENT_SECRET` | with Okta | Okta application secret |
 | `LOCAL_ADMIN_PASSWORD` | optional | Break-glass admin login; 16+ characters |
 | `ALERT_WEBHOOK_URL` | optional | Slack-compatible webhook for alerts |
@@ -208,6 +209,7 @@ The script refuses a values file that still contains `CHANGE`. The main values:
 |---|---|
 | `replicaCount` | Backend replicas; plan about 5,000 collectors each and never fewer than 3 |
 | `agentEndpointUrl` | `wss://…/v1/opamp` as collectors reach it; written into install scripts |
+| `ownTracesEndpoint` | Your tracing backend's OTLP/HTTP URL; collectors send their own traces straight there |
 | `service.opampType` | How the agent port is exposed; use a layer-4 load balancer |
 | `ui.ingress.*` | Console hostname and TLS |
 | `okta.*` | Issuer, client ID, redirect URL and the groups that grant admin, operator and viewer |
@@ -216,7 +218,7 @@ The script refuses a values file that still contains `CHANGE`. The main values:
 | `networkPolicy.enabled` | Restrict the console API to the console pods |
 
 **Networking:** collectors reach the backend through a layer-4 load balancer, never an HTTP ingress, because TLS and
-client certificates must arrive at the backend untouched. Both `/v1/opamp` and `/v1/metrics` are served on that
+client certificates must arrive at the backend untouched. `/v1/opamp`, `/v1/metrics` and `/v1/logs` are served on that
 port. The console is exposed over HTTPS through the ingress.
 
 **After deploying:** sign in, open Admin → System and confirm the protections you expect are on. Day-to-day
@@ -236,6 +238,8 @@ Everything is set through environment variables (the chart sets them from values
   `key=value` attribute filters.
 - **Collector page, Overview tab:** identity, attributes, the assigned and effective config, and charts of the
   collector's own CPU, memory and throughput for the last three hours.
+- **Collector page, Logs tab:** the collector's own recent log lines (newest 500, kept a day), filterable by level
+  and text, for working out why it is unhealthy or rejected a config.
 - **Collector page, Activity tab:** a timeline of everything that happened to it: connected, offline, healthy,
   unhealthy, config assigned, applied or failed (naming the config and version), collection stopped or resumed,
   and collector upgrades. Kept for 90 days by default.

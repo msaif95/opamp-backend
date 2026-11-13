@@ -22,6 +22,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
@@ -54,7 +55,9 @@ type Server struct {
 	// Throughput returns an agent's latest pipeline rates, or nil.
 	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
 	// History returns an agent's recent CPU, memory and throughput samples.
-	History  func(ctx context.Context, uid uuid.UUID) ([]throughput.Point, error)
+	History func(ctx context.Context, uid uuid.UUID) ([]throughput.Point, error)
+	// Logs returns a collector's most recent own log lines, newest first.
+	Logs     func(ctx context.Context, uid uuid.UUID, limit int) ([]ownlogs.Line, error)
 	Settings *settings.Store
 	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
@@ -116,6 +119,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/secrets/names", s.secretNames)
 			r.Get("/agents/{uid}/metrics", s.agentMetrics)
 			r.Get("/agents/{uid}/events", s.agentEvents)
+			r.Get("/agents/{uid}/logs", s.agentLogs)
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
@@ -499,6 +503,24 @@ func (s *Server) agentEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": nonNil(events)})
+}
+
+// agentLogs returns the collector's own recent log lines, newest first.
+func (s *Server) agentLogs(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	if _, ok := s.allowAgent(w, r, uid, auth.RoleViewer); !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	lines, err := s.Logs(r.Context(), uid, limit)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": nonNil(lines), "kept": ownlogs.Keep, "kept_hours": int(ownlogs.TTL.Hours())})
 }
 
 // agentMetrics returns the agent's recent CPU, memory and throughput samples for charts.

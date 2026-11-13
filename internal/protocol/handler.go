@@ -61,6 +61,10 @@ type Handler struct {
 	// OwnMetrics, if set, returns where an agent should send its own
 	// metrics; it is offered to agents that report them.
 	OwnMetrics func(uid uuid.UUID) *protobufs.ConnectionSettingsOffers
+	// OwnTelemetry, if set, replaces OwnMetrics: it returns where an agent
+	// with the given capabilities should send its own metrics, logs and
+	// traces, or nil when there is nothing to offer.
+	OwnTelemetry func(uid uuid.UUID, capabilities uint64) *protobufs.ConnectionSettingsOffers
 	// ResolveSecrets, if set, replaces ${secret:NAME} references in a config body just before it is sent.
 	ResolveSecrets func(ctx context.Context, templateID uuid.UUID, body string) (string, error)
 	// RedactSecrets, if set, hides secret values in the effective config an
@@ -118,8 +122,11 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 	resp.RemoteConfig = h.pendingConfig(ctx, uid, state)
 	// Offered with every full report (the first message of a connection); the
 	// offer's hash lets the agent ignore one it already applied.
-	if h.OwnMetrics != nil && msg.AgentDescription != nil &&
-		msg.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics) != 0 {
+	switch {
+	case msg.AgentDescription == nil:
+	case h.OwnTelemetry != nil:
+		resp.ConnectionSettings = h.OwnTelemetry(uid, msg.Capabilities)
+	case h.OwnMetrics != nil && msg.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics) != 0:
 		resp.ConnectionSettings = h.OwnMetrics(uid)
 	}
 	if needFullState {

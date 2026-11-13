@@ -184,6 +184,8 @@ __TLS__capabilities:
   reports_health: true
   reports_heartbeat: true
   reports_own_metrics: true
+  reports_own_logs: true
+  reports_own_traces: true
   accepts_restart_command: true
 agent:
   executable: __DIR__/otelcol-contrib

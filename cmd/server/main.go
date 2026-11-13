@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -18,6 +20,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/open-telemetry/opamp-go/protobufs"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/msaif95/opamp-backend/internal/access"
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
@@ -28,6 +33,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/connection"
 	"github.com/msaif95/opamp-backend/internal/events"
 	"github.com/msaif95/opamp-backend/internal/logthrottle"
+	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/protocol"
 	"github.com/msaif95/opamp-backend/internal/registry"
@@ -126,7 +132,43 @@ func run() error {
 	configs := agentconfig.NewService(db)
 	tput := throughput.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
 	handler := protocol.NewHandler(reg, configs, log)
-	handler.OwnMetrics = tput.Offer
+	collectorLogs := ownlogs.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
+	// One offer covering whichever of its own metrics, logs and traces a
+	// collector says it can report: metrics and logs come to this backend,
+	// traces go straight to the tracing backend named in the deployment.
+	var ownTraces *protobufs.TelemetryConnectionSettings
+	if cfg.OwnTracesEndpoint != "" {
+		ownTraces = &protobufs.TelemetryConnectionSettings{DestinationEndpoint: cfg.OwnTracesEndpoint, Headers: &protobufs.Headers{}}
+		names := make([]string, 0, len(cfg.OwnTracesHeaders))
+		for name := range cfg.OwnTracesHeaders {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			ownTraces.Headers.Headers = append(ownTraces.Headers.Headers, &protobufs.Header{Key: name, Value: cfg.OwnTracesHeaders[name]})
+		}
+	}
+	handler.OwnTelemetry = func(uid uuid.UUID, caps uint64) *protobufs.ConnectionSettingsOffers {
+		can := func(c protobufs.AgentCapabilities) bool { return caps&uint64(c) != 0 }
+		offer := &protobufs.ConnectionSettingsOffers{}
+		if m := tput.Offer(uid); m != nil && can(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics) {
+			offer.OwnMetrics = m.OwnMetrics
+		}
+		if can(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnLogs) {
+			offer.OwnLogs = collectorLogs.Settings(uid)
+		}
+		if can(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnTraces) {
+			offer.OwnTraces = ownTraces
+		}
+		if offer.OwnMetrics == nil && offer.OwnLogs == nil && offer.OwnTraces == nil {
+			return nil
+		}
+		// The hash lets a collector skip an offer it already applied.
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(offer)
+		sum := sha256.Sum256(raw)
+		offer.Hash = sum[:]
+		return offer
+	}
 	secretStore, err := secrets.New(db, cfg.SecretsKey)
 	if err != nil {
 		return err
@@ -142,6 +184,14 @@ func run() error {
 		return secretStore.Resolve(ctx, project, body)
 	}
 	if secretStore.Enabled() {
+		// A collector may log a header it was sent; hide secret values there too.
+		collectorLogs.Redact = func(ctx context.Context, uid uuid.UUID, text string) (string, error) {
+			project, err := reg.ProjectOf(ctx, uid)
+			if err != nil {
+				return "", err
+			}
+			return secretStore.Redact(ctx, project, text)
+		}
 		handler.RedactSecrets = func(ctx context.Context, uid uuid.UUID, body string) (string, error) {
 			project, err := reg.ProjectOf(ctx, uid)
 			if errors.Is(err, registry.ErrNotFound) {
@@ -154,7 +204,7 @@ func run() error {
 		}
 	}
 	conns := connection.NewManager(agentAuth, handler, reg, log)
-	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput}
+	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput, ownlogs.IntakePath: collectorLogs}
 
 	var tlsCfg *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -384,7 +434,7 @@ func run() error {
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
 			},
-			Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
+			Logs: collectorLogs.Recent, Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
 			// Postgres only. A Redis outage degrades pushes and live updates but
 			// agents and the console keep working, and marking every replica
 			// unready would turn that into a full outage.
