@@ -71,6 +71,13 @@ type Config struct {
 	AlertWebhookURL string
 	// PublicURL is the console's base URL, used for links in notifications.
 	PublicURL string
+	// AgentEndpointURL is the OpAMP URL collectors use to reach this
+	// deployment from outside, e.g. wss://opamp-agents.example.com/v1/opamp.
+	// It is written into generated install commands.
+	AgentEndpointURL string
+	// AgentCAFile is the CA collectors must trust to verify that endpoint;
+	// defaults to TLSClientCAFile, which holds the same CA in the Helm chart.
+	AgentCAFile string
 	// RebalanceEnabled lets an overloaded replica close some agent
 	// connections so they reconnect to less loaded replicas.
 	RebalanceEnabled bool
@@ -108,6 +115,8 @@ func Load() (*Config, error) {
 		OktaViewerGroups:   list(env("OKTA_VIEWER_GROUPS", "")),
 		AlertWebhookURL:    env("ALERT_WEBHOOK_URL", ""),
 		PublicURL:          strings.TrimRight(env("PUBLIC_URL", ""), "/"),
+		AgentEndpointURL:   env("AGENT_ENDPOINT_URL", ""),
+		AgentCAFile:        env("AGENT_CA_FILE", env("TLS_CLIENT_CA_FILE", "")),
 		RebalanceEnabled:   env("REBALANCE_ENABLED", "true") == "true",
 		TrustProxyHeaders:  env("TRUST_PROXY_HEADERS", "false") == "true",
 		DevMode:            env("DEV_MODE", "false") == "true",
@@ -150,6 +159,12 @@ func Load() (*Config, error) {
 	if c.TLSClientCAFile != "" && c.TLSCertFile == "" {
 		return nil, fmt.Errorf("TLS_CLIENT_CA_FILE requires TLS_CERT_FILE/TLS_KEY_FILE")
 	}
+	if c.AgentEndpointURL == "" && c.DevMode {
+		c.AgentEndpointURL = "ws://localhost" + c.OpAMPListenAddr + "/v1/opamp"
+	}
+	if c.AgentEndpointURL != "" && !strings.HasPrefix(c.AgentEndpointURL, "ws://") && !strings.HasPrefix(c.AgentEndpointURL, "wss://") {
+		return nil, fmt.Errorf("AGENT_ENDPOINT_URL must start with ws:// or wss://")
+	}
 	return c, c.validateProduction()
 }
 
@@ -171,6 +186,9 @@ func (c *Config) validateProduction() error {
 	}
 	if c.LocalAdminPassword != "" && len(c.LocalAdminPassword) < minAdminPasswordLen {
 		problems = append(problems, fmt.Sprintf("LOCAL_ADMIN_PASSWORD is shorter than %d characters", minAdminPasswordLen))
+	}
+	if strings.HasPrefix(c.AgentEndpointURL, "ws://") {
+		problems = append(problems, "AGENT_ENDPOINT_URL must use wss")
 	}
 	if c.OktaIssuer != "" && !strings.HasPrefix(c.OktaIssuer, "https://") {
 		problems = append(problems, "OKTA_ISSUER must use https")

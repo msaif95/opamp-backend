@@ -297,6 +297,7 @@ func run() error {
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
 			Alerts: alertStore, Settings: switches,
+			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
 			Status: api.SystemStatus{
 				SSOIssuer: cfg.OktaIssuer, Version: version, DevMode: cfg.DevMode,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,

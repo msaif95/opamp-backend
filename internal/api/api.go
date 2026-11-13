@@ -42,6 +42,7 @@ type Server struct {
 	Log    *slog.Logger
 	// Status describes how this deployment is configured, for the System page.
 	Status   SystemStatus
+	Install  InstallConfig
 	Settings *settings.Store
 	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
@@ -134,6 +135,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/credentials/api-keys", s.listAPIKeys)
 			r.Post("/credentials/api-keys", s.issueAPIKey)
 			r.Delete("/credentials/{id}", s.revokeCredential)
+			r.Post("/agents/install-command", s.installCommand)
 			r.Get("/credentials/revoked-certs", s.listRevokedCerts)
 			r.Post("/credentials/revoked-certs", s.revokeCert)
 		})

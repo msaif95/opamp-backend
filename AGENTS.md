@@ -81,3 +81,9 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   on the group. `rollout.Service.ReconcileGroups` (every engine tick) then gives it to matching agents that have no
   config, but only once a rollout of that version to the group has completed; never while one is running, paused,
   aborted or rolled back. It does not replace a config an agent already has.
+- Stock OpAMP Supervisor is supported and was tested end to end (opampsupervisor + otelcol-contrib 0.164.0): connect,
+  attributes, health, remote config apply, and FAILED reporting when the collector rejects a config.
+  `POST /api/v1/agents/install-command` (admin, `internal/api/install.go`) issues an API key and returns an install
+  script for it; labels are restricted to a safe alphabet because they land in shell and YAML.
+- Remote collector upgrades (OpAMP packages) are not built: the stock Supervisor refuses to start with
+  `accepts_packages` (contrib issue #47272). Revisit when that lands.
