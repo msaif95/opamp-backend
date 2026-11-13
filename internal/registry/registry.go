@@ -451,6 +451,42 @@ func (r *Registry) RequestPush(ctx context.Context, uids ...uuid.UUID) error {
 	return nil
 }
 
+// HistoryEvent is one entry in an agent's history. Events are written by a database
+// trigger on the agents table (see the migration), not by this package.
+type HistoryEvent struct {
+	ID         int64     `json:"id"`
+	OccurredAt time.Time `json:"occurred_at"`
+	// Kind is one of: first_seen, connected, offline, healthy, unhealthy,
+	// config_assigned, config_unassigned, config_applied, config_failed,
+	// collection_stopped, collection_resumed, collector_version_changed.
+	Kind   string         `json:"kind"`
+	Detail map[string]any `json:"detail"`
+}
+
+// Events returns an agent's history, newest first. before, if positive,
+// returns only events older than that event ID (for paging).
+func (r *Registry) Events(ctx context.Context, uid uuid.UUID, before int64, limit int) ([]HistoryEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := r.db.Query(ctx, `
+SELECT id, occurred_at, kind, detail FROM agent_events
+WHERE instance_uid = $1 AND ($2 <= 0 OR id < $2) ORDER BY id DESC LIMIT $3`, uid, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (HistoryEvent, error) {
+		var (
+			e   HistoryEvent
+			raw []byte
+		)
+		if err := row.Scan(&e.ID, &e.OccurredAt, &e.Kind, &raw); err != nil {
+			return e, err
+		}
+		return e, json.Unmarshal(raw, &e.Detail)
+	})
+}
+
 // ProjectOf returns the project an agent belongs to (nil for unassigned).
 func (r *Registry) ProjectOf(ctx context.Context, uid uuid.UUID) (*uuid.UUID, error) {
 	var project *uuid.UUID

@@ -93,3 +93,87 @@ CREATE UNIQUE INDEX library_components_project_kind_name_key ON library_componen
 -- The global role a person had at their last sign-in, for the Users page.
 -- Okta decides it from groups on every sign-in; this is only a record.
 ALTER TABLE users ADD COLUMN global_role TEXT NOT NULL DEFAULT '';
+
+-- Per-agent history: every change of connection, health, config and
+-- collector version, for the Activity tab on the agent page. Written by a
+-- trigger so no code path that changes an agent can forget to record it.
+CREATE TABLE agent_events (
+    id           BIGSERIAL PRIMARY KEY,
+    instance_uid UUID NOT NULL REFERENCES agents(instance_uid) ON DELETE CASCADE,
+    occurred_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    kind         TEXT NOT NULL,
+    detail       JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX agent_events_agent_idx ON agent_events (instance_uid, id DESC);
+CREATE INDEX agent_events_time_idx ON agent_events (occurred_at);
+
+CREATE FUNCTION record_agent_events() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    cfg JSONB;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO agent_events (instance_uid, kind, detail)
+        VALUES (NEW.instance_uid, 'first_seen', jsonb_strip_nulls(jsonb_build_object('collector_version', NEW.agent_version)));
+    END IF;
+
+    IF NEW.connected AND (TG_OP = 'INSERT' OR NOT OLD.connected) THEN
+        INSERT INTO agent_events (instance_uid, kind) VALUES (NEW.instance_uid, 'connected');
+    ELSIF TG_OP = 'UPDATE' AND OLD.connected AND NOT NEW.connected THEN
+        INSERT INTO agent_events (instance_uid, kind) VALUES (NEW.instance_uid, 'offline');
+    END IF;
+
+    IF NEW.healthy IS NOT NULL AND (TG_OP = 'INSERT' OR NEW.healthy IS DISTINCT FROM OLD.healthy) THEN
+        INSERT INTO agent_events (instance_uid, kind, detail)
+        VALUES (NEW.instance_uid, CASE WHEN NEW.healthy THEN 'healthy' ELSE 'unhealthy' END,
+                jsonb_strip_nulls(jsonb_build_object('status', NULLIF(NEW.health_status, ''), 'error', NULLIF(NEW.health_last_error, ''))));
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND NEW.agent_version IS DISTINCT FROM OLD.agent_version AND OLD.agent_version IS NOT NULL THEN
+        INSERT INTO agent_events (instance_uid, kind, detail)
+        VALUES (NEW.instance_uid, 'collector_version_changed', jsonb_build_object('from', OLD.agent_version, 'to', NEW.agent_version));
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND NEW.desired_config_version_id IS DISTINCT FROM OLD.desired_config_version_id THEN
+        SELECT jsonb_build_object('config', ct.name, 'version', cv.version) INTO cfg
+        FROM config_versions cv JOIN config_templates ct ON ct.id = cv.template_id WHERE cv.id = NEW.desired_config_version_id;
+        INSERT INTO agent_events (instance_uid, kind, detail)
+        VALUES (NEW.instance_uid, CASE WHEN NEW.desired_config_version_id IS NULL THEN 'config_unassigned' ELSE 'config_assigned' END,
+                COALESCE(cfg, '{}'::jsonb));
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND NEW.paused IS DISTINCT FROM OLD.paused THEN
+        INSERT INTO agent_events (instance_uid, kind)
+        VALUES (NEW.instance_uid, CASE WHEN NEW.paused THEN 'collection_stopped' ELSE 'collection_resumed' END);
+    END IF;
+
+    -- What the collector reports about applying a config. The config is found
+    -- by the hash it reports, preferring the one currently assigned.
+    IF NEW.remote_config_status IN ('applied', 'failed')
+       AND (TG_OP = 'INSERT' OR NEW.remote_config_status IS DISTINCT FROM OLD.remote_config_status
+            OR NEW.remote_config_hash IS DISTINCT FROM OLD.remote_config_hash) THEN
+        cfg := NULL;
+        SELECT jsonb_build_object('config', ct.name, 'version', cv.version) INTO cfg
+        FROM config_versions cv JOIN config_templates ct ON ct.id = cv.template_id
+        WHERE cv.body_hash = NEW.remote_config_hash
+        ORDER BY (cv.id IS NOT DISTINCT FROM NEW.desired_config_version_id) DESC, cv.created_at DESC LIMIT 1;
+        INSERT INTO agent_events (instance_uid, kind, detail)
+        VALUES (NEW.instance_uid, 'config_' || NEW.remote_config_status::text,
+                COALESCE(cfg, CASE WHEN NEW.paused THEN '{"paused": true}'::jsonb ELSE '{}'::jsonb END)
+                || jsonb_strip_nulls(jsonb_build_object('error',
+                       CASE WHEN NEW.remote_config_status = 'failed' THEN NULLIF(NEW.remote_config_error, '') END)));
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER agents_record_events_insert AFTER INSERT ON agents
+    FOR EACH ROW EXECUTE FUNCTION record_agent_events();
+-- Heartbeats only move last_seen, so the common update does not fire this.
+CREATE TRIGGER agents_record_events_update AFTER UPDATE ON agents
+    FOR EACH ROW WHEN (
+        NEW.connected IS DISTINCT FROM OLD.connected OR NEW.healthy IS DISTINCT FROM OLD.healthy
+        OR NEW.agent_version IS DISTINCT FROM OLD.agent_version
+        OR NEW.desired_config_version_id IS DISTINCT FROM OLD.desired_config_version_id
+        OR NEW.paused IS DISTINCT FROM OLD.paused
+        OR NEW.remote_config_status IS DISTINCT FROM OLD.remote_config_status
+        OR NEW.remote_config_hash IS DISTINCT FROM OLD.remote_config_hash)
+    EXECUTE FUNCTION record_agent_events();

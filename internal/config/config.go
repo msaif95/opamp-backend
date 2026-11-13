@@ -24,6 +24,8 @@ type Config struct {
 	RolloutRetentionDays int
 	// AgentRetentionDays removes agents that have been offline this long.
 	AgentRetentionDays int
+	// AgentEventRetentionDays bounds each agent's history.
+	AgentEventRetentionDays int
 
 	// ReplicaID uniquely identifies this backend instance in the Redis routing table.
 	ReplicaID string
@@ -143,9 +145,9 @@ func Load() (*Config, error) {
 	}
 	for name, dst := range map[string]*int{
 		"AUDIT_RETENTION_DAYS": &c.AuditRetentionDays, "ROLLOUT_RETENTION_DAYS": &c.RolloutRetentionDays,
-		"AGENT_RETENTION_DAYS": &c.AgentRetentionDays,
+		"AGENT_RETENTION_DAYS": &c.AgentRetentionDays, "AGENT_EVENT_RETENTION_DAYS": &c.AgentEventRetentionDays,
 	} {
-		def := map[string]string{"AUDIT_RETENTION_DAYS": "0", "ROLLOUT_RETENTION_DAYS": "180", "AGENT_RETENTION_DAYS": "30"}[name]
+		def := map[string]string{"AUDIT_RETENTION_DAYS": "0", "ROLLOUT_RETENTION_DAYS": "180", "AGENT_RETENTION_DAYS": "30", "AGENT_EVENT_RETENTION_DAYS": "90"}[name]
 		if *dst, err = strconv.Atoi(env(name, def)); err != nil || *dst < 0 {
 			return nil, fmt.Errorf("%s must be a number of days, 0 or more", name)
 		}

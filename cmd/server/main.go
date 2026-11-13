@@ -220,7 +220,7 @@ func run() error {
 
 	go (&retention.Job{
 		DB: db, Redis: rdb, Log: log,
-		AuditDays: cfg.AuditRetentionDays, RolloutDays: cfg.RolloutRetentionDays, AgentDays: cfg.AgentRetentionDays,
+		AuditDays: cfg.AuditRetentionDays, RolloutDays: cfg.RolloutRetentionDays, AgentDays: cfg.AgentRetentionDays, AgentEventDays: cfg.AgentEventRetentionDays,
 	}).Run(ctx)
 
 	go (&alert.HealthMonitor{

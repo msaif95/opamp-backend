@@ -107,6 +107,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/rollouts/{id}", s.getRollout)
 			r.Get("/agents/{uid}", s.getAgent)
 			r.Get("/agents/{uid}/metrics", s.agentMetrics)
+			r.Get("/agents/{uid}/events", s.agentEvents)
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
@@ -453,6 +454,25 @@ func (s *Server) pauseAgent(paused bool) http.HandlerFunc {
 
 // capAcceptsRestart is the OpAMP AcceptsRestartCommand capability bit.
 const capAcceptsRestart = 0x400
+
+// agentEvents returns the agent's history, newest first: ?before=<event id>&limit=.
+func (s *Server) agentEvents(w http.ResponseWriter, r *http.Request) {
+	uid, ok := pathUUID(w, r, "uid")
+	if !ok {
+		return
+	}
+	if _, ok := s.allowAgent(w, r, uid, auth.RoleViewer); !ok {
+		return
+	}
+	before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	events, err := s.Registry.Events(r.Context(), uid, before, limit)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": nonNil(events)})
+}
 
 // agentMetrics returns the agent's recent CPU, memory and throughput samples for charts.
 func (s *Server) agentMetrics(w http.ResponseWriter, r *http.Request) {

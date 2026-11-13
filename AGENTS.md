@@ -132,3 +132,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - `opampctl --project <name>` (or `OPAMP_PROJECT`) selects the project commands act in.
 - `GET /api/v1/users` (admin) lists everyone who signed in (table `users`, updated by `Projects.RecordSignIn` on
   local and Okta sign-in) plus people added to a project before their first sign-in, with their memberships.
+- Agent history (`agent_events`, `GET /api/v1/agents/{uid}/events`, viewer in the agent's project): written by the
+  `record_agent_events` trigger on `agents`, so every code path is covered; heartbeats do not fire it. Kinds:
+  first_seen, connected, offline, healthy, unhealthy, config_assigned/unassigned, config_applied/failed (with
+  config name, version, error), collection_stopped/resumed, collector_version_changed. Pruned after
+  `AGENT_EVENT_RETENTION_DAYS` (90). A new tracked column needs the trigger's WHEN clause and body updated.

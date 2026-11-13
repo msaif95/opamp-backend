@@ -28,12 +28,14 @@ type Job struct {
 	AuditDays   int
 	RolloutDays int
 	AgentDays   int
+	// AgentEventDays bounds each agent's history (the Activity tab).
+	AgentEventDays int
 }
 
 // Run prunes shortly after start and then every few hours until ctx is
 // cancelled. Every replica runs it; a Redis lock lets one do the work.
 func (j *Job) Run(ctx context.Context) {
-	if j.AuditDays+j.RolloutDays+j.AgentDays == 0 {
+	if j.AuditDays+j.RolloutDays+j.AgentDays+j.AgentEventDays == 0 {
 		return
 	}
 	timer := time.NewTimer(time.Minute)
@@ -65,6 +67,9 @@ func (j *Job) Prune(ctx context.Context) error {
 		{"audit events", j.AuditDays, `
 DELETE FROM audit_events WHERE id IN (
     SELECT id FROM audit_events WHERE occurred_at < now() - make_interval(days => $1) LIMIT $2)`},
+		{"agent history", j.AgentEventDays, `
+DELETE FROM agent_events WHERE id IN (
+    SELECT id FROM agent_events WHERE occurred_at < now() - make_interval(days => $1) LIMIT $2)`},
 		// Only finished rollouts; their per-agent rows go with them.
 		{"rollouts", j.RolloutDays, `
 DELETE FROM rollouts WHERE id IN (
