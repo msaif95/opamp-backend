@@ -50,7 +50,13 @@ type Config struct {
 	// replicas x PostgresMaxConns stays below the server's max_connections.
 	PostgresMaxConns int
 	RedisAddr        string
-	RedisDB          int
+	// RedisTLS encrypts the Redis connection; RedisPassword authenticates it.
+	RedisTLS      bool
+	RedisPassword string
+	// AllowUnencryptedStores accepts Postgres or Redis without TLS outside dev
+	// mode, for clusters where a service mesh already encrypts that traffic.
+	AllowUnencryptedStores bool
+	RedisDB                int
 
 	// JWTSigningKey signs human-session JWTs and agent JWTs.
 	JWTSigningKey []byte
@@ -101,34 +107,37 @@ type Config struct {
 func Load() (*Config, error) {
 	host, _ := os.Hostname()
 	c := &Config{
-		ReplicaID:          env("OPAMP_REPLICA_ID", host),
-		OpAMPListenAddr:    env("OPAMP_LISTEN_ADDR", ":4320"),
-		APIListenAddr:      env("API_LISTEN_ADDR", ":8080"),
-		TLSCertFile:        env("TLS_CERT_FILE", ""),
-		TLSKeyFile:         env("TLS_KEY_FILE", ""),
-		TLSClientCAFile:    env("TLS_CLIENT_CA_FILE", ""),
-		PostgresDSN:        env("POSTGRES_DSN", "postgres://opamp:opamp@localhost:5432/opamp?sslmode=disable"),
-		RedisAddr:          env("REDIS_ADDR", "localhost:6379"),
-		JWTSigningKey:      []byte(env("JWT_SIGNING_KEY", "")),
-		LocalAdminPassword: env("LOCAL_ADMIN_PASSWORD", ""),
-		OktaIssuer:         env("OKTA_ISSUER", ""),
-		OktaClientID:       env("OKTA_CLIENT_ID", ""),
-		OktaClientSecret:   env("OKTA_CLIENT_SECRET", ""),
-		OktaRedirectURL:    env("OKTA_REDIRECT_URL", ""),
-		OktaGroupsClaim:    env("OKTA_GROUPS_CLAIM", "groups"),
-		OktaAdminGroups:    list(env("OKTA_ADMIN_GROUPS", "")),
-		OktaOperatorGroups: list(env("OKTA_OPERATOR_GROUPS", "")),
-		OktaViewerGroups:   list(env("OKTA_VIEWER_GROUPS", "")),
-		AlertWebhookURL:    env("ALERT_WEBHOOK_URL", ""),
-		PublicURL:          strings.TrimRight(env("PUBLIC_URL", ""), "/"),
-		AgentEndpointURL:   env("AGENT_ENDPOINT_URL", ""),
-		AgentCAFile:        env("AGENT_CA_FILE", env("TLS_CLIENT_CA_FILE", "")),
-		RebalanceEnabled:   env("REBALANCE_ENABLED", "true") == "true",
-		TrustProxyHeaders:  env("TRUST_PROXY_HEADERS", "false") == "true",
-		DevMode:            env("DEV_MODE", "false") == "true",
-		AgentTLSUpstream:   env("AGENT_TLS_TERMINATED_UPSTREAM", "false") == "true",
-		MigrationsDir:      env("MIGRATIONS_DIR", "migrations"),
-		LogLevel:           env("LOG_LEVEL", "info"),
+		ReplicaID:              env("OPAMP_REPLICA_ID", host),
+		OpAMPListenAddr:        env("OPAMP_LISTEN_ADDR", ":4320"),
+		APIListenAddr:          env("API_LISTEN_ADDR", ":8080"),
+		TLSCertFile:            env("TLS_CERT_FILE", ""),
+		TLSKeyFile:             env("TLS_KEY_FILE", ""),
+		TLSClientCAFile:        env("TLS_CLIENT_CA_FILE", ""),
+		PostgresDSN:            env("POSTGRES_DSN", "postgres://opamp:opamp@localhost:5432/opamp?sslmode=disable"),
+		RedisAddr:              env("REDIS_ADDR", "localhost:6379"),
+		RedisTLS:               env("REDIS_TLS", "false") == "true",
+		RedisPassword:          env("REDIS_PASSWORD", ""),
+		AllowUnencryptedStores: env("ALLOW_UNENCRYPTED_STORES", "false") == "true",
+		JWTSigningKey:          []byte(env("JWT_SIGNING_KEY", "")),
+		LocalAdminPassword:     env("LOCAL_ADMIN_PASSWORD", ""),
+		OktaIssuer:             env("OKTA_ISSUER", ""),
+		OktaClientID:           env("OKTA_CLIENT_ID", ""),
+		OktaClientSecret:       env("OKTA_CLIENT_SECRET", ""),
+		OktaRedirectURL:        env("OKTA_REDIRECT_URL", ""),
+		OktaGroupsClaim:        env("OKTA_GROUPS_CLAIM", "groups"),
+		OktaAdminGroups:        list(env("OKTA_ADMIN_GROUPS", "")),
+		OktaOperatorGroups:     list(env("OKTA_OPERATOR_GROUPS", "")),
+		OktaViewerGroups:       list(env("OKTA_VIEWER_GROUPS", "")),
+		AlertWebhookURL:        env("ALERT_WEBHOOK_URL", ""),
+		PublicURL:              strings.TrimRight(env("PUBLIC_URL", ""), "/"),
+		AgentEndpointURL:       env("AGENT_ENDPOINT_URL", ""),
+		AgentCAFile:            env("AGENT_CA_FILE", env("TLS_CLIENT_CA_FILE", "")),
+		RebalanceEnabled:       env("REBALANCE_ENABLED", "true") == "true",
+		TrustProxyHeaders:      env("TRUST_PROXY_HEADERS", "false") == "true",
+		DevMode:                env("DEV_MODE", "false") == "true",
+		AgentTLSUpstream:       env("AGENT_TLS_TERMINATED_UPSTREAM", "false") == "true",
+		MigrationsDir:          env("MIGRATIONS_DIR", "migrations"),
+		LogLevel:               env("LOG_LEVEL", "info"),
 	}
 
 	var err error
@@ -193,6 +202,17 @@ func (c *Config) validateProduction() error {
 		problems = append(problems, "agent connections would be plaintext: set TLS_CERT_FILE and TLS_KEY_FILE, "+
 			"or AGENT_TLS_TERMINATED_UPSTREAM=true if a load balancer terminates TLS")
 	}
+	if !c.AllowUnencryptedStores {
+		if !c.PostgresEncrypted() {
+			problems = append(problems, "the Postgres connection is not encrypted: use sslmode=require or stricter in POSTGRES_DSN")
+		}
+		if !c.RedisTLS {
+			problems = append(problems, "the Redis connection is not encrypted: set REDIS_TLS=true")
+		}
+		if !c.PostgresEncrypted() || !c.RedisTLS {
+			problems = append(problems, "(set ALLOW_UNENCRYPTED_STORES=true only if the network path to the stores is encrypted another way)")
+		}
+	}
 	if strings.Contains(strings.ToLower(string(c.JWTSigningKey)), "dev-only") {
 		problems = append(problems, "JWT_SIGNING_KEY is the development key")
 	}
@@ -218,6 +238,16 @@ func (c *Config) validateProduction() error {
 }
 
 const minAdminPasswordLen = 16
+
+// PostgresEncrypted reports whether the DSN demands TLS to the database.
+func (c *Config) PostgresEncrypted() bool {
+	for _, mode := range []string{"sslmode=require", "sslmode=verify-ca", "sslmode=verify-full"} {
+		if strings.Contains(c.PostgresDSN, mode) {
+			return true
+		}
+	}
+	return false
+}
 
 // MTLSEnabled reports whether agent client-cert verification is configured.
 func (c *Config) MTLSEnabled() bool { return c.TLSClientCAFile != "" }

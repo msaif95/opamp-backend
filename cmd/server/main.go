@@ -110,7 +110,11 @@ func run() error {
 			log.Warn("redis client", "msg", msg, "similar_messages_suppressed", suppressed)
 		})
 	}))
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB})
+	redisOpts := &redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB, Password: cfg.RedisPassword}
+	if cfg.RedisTLS {
+		redisOpts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	rdb := redis.NewClient(redisOpts)
 	defer rdb.Close()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return err
@@ -138,6 +142,7 @@ func run() error {
 		settings.LocalLogin: {Available: cfg.LocalAdminPassword != "", Default: true},
 		// Switching TLS at runtime would drop every agent and, when off, send
 		// their credentials in plaintext; it stays a deployment decision.
+		settings.StoreEncryption:   {Available: cfg.PostgresEncrypted() && cfg.RedisTLS, Default: true, Locked: true},
 		settings.AgentTLS:          {Available: tlsCfg != nil || cfg.AgentTLSUpstream, Default: true, Locked: true},
 		settings.AgentMTLS:         {Available: cfg.MTLSEnabled(), Default: true},
 		settings.AlertDelivery:     {Available: cfg.AlertWebhookURL != "", Default: true},

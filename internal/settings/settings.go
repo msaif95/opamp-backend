@@ -18,9 +18,11 @@ import (
 
 // Keys of the switchable protections.
 const (
-	SSO               = "sso"
-	LocalLogin        = "local_login"
-	AgentTLS          = "agent_tls"
+	SSO        = "sso"
+	LocalLogin = "local_login"
+	AgentTLS   = "agent_tls"
+	// StoreEncryption reports whether the connections to Postgres and Redis use TLS.
+	StoreEncryption   = "store_encryption"
 	AgentMTLS         = "agent_mtls"
 	AlertDelivery     = "alert_delivery"
 	Telemetry         = "telemetry"
@@ -161,7 +163,7 @@ func (s *Store) Func(key string) func() bool {
 
 // List returns every protection's state in a stable order.
 func (s *Store) List() []State {
-	order := []string{SSO, LocalLogin, AgentTLS, AgentMTLS, AlertDelivery, Telemetry, Rebalancing, FleetHealthAlerts, SecondApprover}
+	order := []string{SSO, LocalLogin, AgentTLS, StoreEncryption, AgentMTLS, AlertDelivery, Telemetry, Rebalancing, FleetHealthAlerts, SecondApprover}
 	out := make([]State, 0, len(order))
 	s.mu.RLock()
 	defer s.mu.RUnlock()

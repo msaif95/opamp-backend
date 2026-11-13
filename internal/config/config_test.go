@@ -11,6 +11,7 @@ func TestProductionGuards(t *testing.T) {
 	base := map[string]string{
 		"JWT_SIGNING_KEY": strongKey, "LOCAL_ADMIN_PASSWORD": "a-long-break-glass-password",
 		"TLS_CERT_FILE": "/tls/tls.crt", "TLS_KEY_FILE": "/tls/tls.key",
+		"POSTGRES_DSN": "postgres://u:p@db/opamp?sslmode=verify-full", "REDIS_TLS": "true",
 	}
 	for name, tc := range map[string]struct {
 		set     map[string]string
@@ -26,10 +27,13 @@ func TestProductionGuards(t *testing.T) {
 		"nobody can sign in":            {map[string]string{"LOCAL_ADMIN_PASSWORD": ""}, "no sign-in method"},
 		"dev mode allows all of it":     {map[string]string{"DEV_MODE": "true", "TLS_CERT_FILE": "", "TLS_KEY_FILE": "", "LOCAL_ADMIN_PASSWORD": "admin", "JWT_SIGNING_KEY": "dev-only-signing-key-do-not-use-in-prod"}, ""},
 		"short signing key even in dev": {map[string]string{"DEV_MODE": "true", "JWT_SIGNING_KEY": "short"}, "at least 32 bytes"},
+		"postgres without tls":          {map[string]string{"POSTGRES_DSN": "postgres://u:p@db/opamp?sslmode=disable"}, "Postgres connection is not encrypted"},
+		"redis without tls":             {map[string]string{"REDIS_TLS": "false"}, "Redis connection is not encrypted"},
+		"stores encrypted by a mesh":    {map[string]string{"REDIS_TLS": "false", "POSTGRES_DSN": "postgres://u:p@db/opamp", "ALLOW_UNENCRYPTED_STORES": "true"}, ""},
 		"negative retention":            {map[string]string{"AUDIT_RETENTION_DAYS": "-1"}, "AUDIT_RETENTION_DAYS"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, k := range []string{"DEV_MODE", "AGENT_TLS_TERMINATED_UPSTREAM", "OKTA_ISSUER", "OKTA_REDIRECT_URL", "AUDIT_RETENTION_DAYS", "TLS_CLIENT_CA_FILE"} {
+			for _, k := range []string{"ALLOW_UNENCRYPTED_STORES", "DEV_MODE", "AGENT_TLS_TERMINATED_UPSTREAM", "OKTA_ISSUER", "OKTA_REDIRECT_URL", "AUDIT_RETENTION_DAYS", "TLS_CLIENT_CA_FILE"} {
 				t.Setenv(k, "")
 			}
 			t.Setenv("DEV_MODE", "false")
