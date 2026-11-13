@@ -242,6 +242,23 @@ Everything is set through environment variables (the chart sets them from values
 - **Restart** the collector process, or **Stop collection** (the collector stays connected but collects nothing
   until resumed).
 
+### Finding your way around
+
+- **Overview** is the landing page: headline counts with 24-hour trends, collectors needing attention, bulk pushes
+  waiting on someone, recent pushes and (for admins) alerts.
+- **Search** (`/` or Ctrl/⌘+K) finds collectors by host name, IP address, instance UID or any attribute, plus
+  configs, groups and pages. The Fleet page has the same free-text search as a filter.
+- **Topology** lays the fleet out by the attributes collectors report (region, data centre, cluster, …), one or two
+  levels deep, coloured by health. It is a logical map; collectors do not report coordinates.
+- **Compare** two collectors side by side (tick two on the Fleet page, or "Compare with…" on a collector): state,
+  attributes, running config as a diff, and process metrics.
+- **Notifications** appear when a bulk push changes state, when collectors go offline, turn unhealthy or fail a
+  config, and for alerts.
+- **Export** the filtered collector list (Fleet → Export) or the audit log as CSV or JSON.
+- **Keyboard:** `?` lists the shortcuts (`j`/`k` rows, `g` then a letter to jump to a page).
+- A bulk push page shows a **timeline** of its batches, and the YAML editor completes `${secret:` with the
+  project's secret names.
+
 ### Adding collectors
 
 Fleet → **Add collectors** (admins). Choose the platform, collector version, project and labels; the console issues
