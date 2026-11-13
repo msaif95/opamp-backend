@@ -108,6 +108,8 @@ func (s *Server) Router() http.Handler {
 			r.Put("/agents/{uid}/config", s.assignConfig)
 			r.Post("/groups", s.createGroup)
 			r.Put("/groups/{id}", s.updateGroup)
+			r.Put("/groups/{id}/config", s.setGroupConfig)
+			r.Delete("/groups/{id}/config", s.clearGroupConfig)
 			r.Delete("/groups/{id}", s.deleteGroup)
 			r.Post("/rollouts", s.createRollout)
 			r.Post("/rollouts/{id}/rollback", s.rolloutAction("rollback", func(s *Server, r *http.Request, id uuid.UUID) error {

@@ -417,3 +417,64 @@ func TestCreateRejectsEmptyTarget(t *testing.T) {
 		t.Fatalf("a rollout with no agents was left behind: %+v", list)
 	}
 }
+
+func TestGroupConfigReachesAgentsThatJoinAfterTheRollout(t *testing.T) {
+	e := newEnv(t)
+	groups := targeting.NewGroups(e.db)
+	grp, err := groups.Create(ctx, "prod", "", targeting.Selector{"env": {"prod"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := e.agents(2)
+	r := e.start(Params{VersionID: e.v2.ID, GroupID: &grp.ID, MaxFailurePct: 100})
+	if err := groups.SetConfig(ctx, grp.ID, &e.v2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := groups.Get(ctx, grp.ID); got.Config == nil || got.Config.Version != 2 || got.Config.TemplateName != "cfg" {
+		t.Fatalf("group config = %+v", got.Config)
+	}
+
+	// While the rollout is running the group hands nothing out by itself:
+	// a late agent joins the rollout's next batch instead.
+	e.svc.tick(ctx)
+	e.push.take()
+	e.applied(e.v2, members...)
+	e.svc.tick(ctx)
+	e.svc.tick(ctx)
+	e.expect(r.ID, "completed", map[string]int{"applied": 2})
+
+	// After it completed, new matching agents get the config without a new rollout.
+	late := e.agent("prod", accepts)
+	other := e.agent("dev", accepts)
+	incapable := e.agent("prod", 0)
+	e.push.take()
+	e.svc.tick(ctx)
+	if pushed := e.push.take(); len(pushed) != 1 || pushed[0] != late {
+		t.Fatalf("pushed %v, want only the late matching agent", pushed)
+	}
+	if d := e.desired(late); d == nil || *d != e.v2.ID {
+		t.Fatal("late agent not given the group config")
+	}
+	if e.desired(other) != nil || e.desired(incapable) != nil {
+		t.Fatal("config given to an agent outside the group or one that cannot accept it")
+	}
+
+	// A rolled-back version must not keep spreading.
+	if err := e.svc.Rollback(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.push.take()
+	afterRollback := e.agent("prod", accepts)
+	e.svc.tick(ctx)
+	if e.desired(afterRollback) != nil {
+		t.Fatal("group handed out a config whose rollout was rolled back")
+	}
+
+	// Clearing the group config stops it too, and agents keep what they have.
+	if err := groups.SetConfig(ctx, grp.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := groups.Get(ctx, grp.ID); got.Config != nil {
+		t.Fatal("group config not cleared")
+	}
+}

@@ -77,3 +77,7 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   deployment configured (`Definition.Available`); agent TLS is `Locked`; the last working sign-in method cannot be
   switched off. Add a new protection by adding a key, a `Definition` in `cmd/server/main.go` and UI copy in
   `opamp-ui/src/features/system/System.tsx`.
+- Group configs ("fleets"): `PUT /api/v1/groups/{id}/config` starts a rollout to the group and records the version
+  on the group. `rollout.Service.ReconcileGroups` (every engine tick) then gives it to matching agents that have no
+  config, but only once a rollout of that version to the group has completed; never while one is running, paused,
+  aborted or rolled back. It does not replace a config an agent already has.

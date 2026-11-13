@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 )
 
@@ -111,5 +114,86 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	u, _ := auth.UserFrom(r.Context())
 	s.audit(r.Context(), u.Subject, u.Provider, "group.delete", "group", id.String(), nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// setGroupConfig makes the group own a config version and rolls it out to
+// the group's current members in batches. Agents that match the group later
+// receive it automatically once that rollout has completed.
+func (s *Server) setGroupConfig(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	req := struct {
+		ConfigVersionID uuid.UUID `json:"config_version_id"`
+		BatchSize       int       `json:"batch_size"`
+		CanarySteps     []int     `json:"canary_steps_pct"`
+		MaxFailurePct   float64   `json:"max_failure_pct"`
+		AutoRollback    bool      `json:"auto_rollback"`
+	}{BatchSize: rollout.DefaultBatchSize, MaxFailurePct: rollout.DefaultMaxFailurePct}
+	if !decode(w, r, &req) {
+		return
+	}
+	grp, err := s.Groups.Get(r.Context(), id)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	v, err := s.Configs.Version(r.Context(), req.ConfigVersionID)
+	if err != nil {
+		s.configError(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	// The rollout is created first: if its parameters are rejected the group is left untouched.
+	ro, err := s.Rollouts.Create(r.Context(), rollout.Params{
+		VersionID: v.ID, Selector: grp.Selector, GroupID: &id, BatchSize: req.BatchSize,
+		CanarySteps: req.CanarySteps, MaxFailurePct: req.MaxFailurePct, AutoRollback: req.AutoRollback, CreatedBy: u.Subject,
+	})
+	switch {
+	case errors.Is(err, rollout.ErrInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	case errors.Is(err, rollout.ErrNoAgents):
+		ro = nil // an empty group needs no rollout; agents that join later get the config
+	case err != nil:
+		s.internal(w, r, err)
+		return
+	}
+	if err := s.Groups.SetConfig(r.Context(), id, &v.ID); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	details := map[string]any{"config_id": v.TemplateID, "version": v.Version, "version_id": v.ID}
+	if ro != nil {
+		details["rollout_id"] = ro.ID
+		details["agents"] = ro.TotalAgents
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "group.config.set", "group", id.String(), details)
+	writeJSON(w, http.StatusOK, map[string]any{"rollout": ro})
+}
+
+// clearGroupConfig stops the group handing out a config. Agents keep the config they have.
+func (s *Server) clearGroupConfig(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	err := s.Groups.SetConfig(r.Context(), id, nil)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "group.config.clear", "group", id.String(), nil)
 	w.WriteHeader(http.StatusNoContent)
 }

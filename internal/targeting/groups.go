@@ -27,7 +27,27 @@ type Group struct {
 	// Members is the number of agents currently matching the selector.
 	Members   int       `json:"members"`
 	CreatedAt time.Time `json:"created_at"`
+	// Config is the config this group owns, if any. Agents that match the
+	// group and have no config of their own are given it automatically.
+	Config *GroupConfig `json:"config"`
 }
+
+// GroupConfig identifies the config version a group owns.
+type GroupConfig struct {
+	VersionID    uuid.UUID `json:"version_id"`
+	TemplateID   uuid.UUID `json:"template_id"`
+	TemplateName string    `json:"template_name"`
+	Version      int       `json:"version"`
+	SetAt        time.Time `json:"set_at"`
+}
+
+const (
+	groupColumns = `g.id, g.name, COALESCE(g.description, ''), g.selector, g.created_at,
+       g.config_version_id, cv.template_id, ct.name, cv.version, g.config_set_at`
+	groupJoins = `
+LEFT JOIN config_versions cv ON cv.id = g.config_version_id
+LEFT JOIN config_templates ct ON ct.id = cv.template_id`
+)
 
 // Groups stores saved selectors.
 type Groups struct{ db *pgxpool.Pool }
@@ -38,7 +58,7 @@ func NewGroups(db *pgxpool.Pool) *Groups { return &Groups{db: db} }
 // List returns all groups by name with their current member counts.
 func (g *Groups) List(ctx context.Context) ([]Group, error) {
 	rows, err := g.db.Query(ctx, `
-SELECT id, name, COALESCE(description, ''), selector, created_at FROM agent_groups ORDER BY name`)
+SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` ORDER BY g.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +78,7 @@ SELECT id, name, COALESCE(description, ''), selector, created_at FROM agent_grou
 // Get returns one group (without a member count).
 func (g *Groups) Get(ctx context.Context, id uuid.UUID) (*Group, error) {
 	rows, err := g.db.Query(ctx, `
-SELECT id, name, COALESCE(description, ''), selector, created_at FROM agent_groups WHERE id = $1`, id)
+SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` WHERE g.id = $1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +126,20 @@ WHERE id = $1 RETURNING created_at`, id, name, description, selJSON).Scan(&grp.C
 	return grp, err
 }
 
+// SetConfig makes the group own a config version, or none when versionID is nil.
+func (g *Groups) SetConfig(ctx context.Context, id uuid.UUID, versionID *uuid.UUID) error {
+	tag, err := g.db.Exec(ctx, `
+UPDATE agent_groups SET config_version_id = $2, config_set_at = CASE WHEN $2::uuid IS NULL THEN NULL ELSE now() END, updated_at = now()
+WHERE id = $1`, id, versionID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrGroupNotFound
+	}
+	return nil
+}
+
 // Delete removes a group. Past rollouts keep their own copy of the selector.
 func (g *Groups) Delete(ctx context.Context, id uuid.UUID) error {
 	tag, err := g.db.Exec(ctx, `DELETE FROM agent_groups WHERE id = $1`, id)
@@ -123,8 +157,18 @@ func scanGroup(row pgx.CollectableRow) (Group, error) {
 		grp Group
 		sel []byte
 	)
-	if err := row.Scan(&grp.ID, &grp.Name, &grp.Description, &sel, &grp.CreatedAt); err != nil {
+	var (
+		versionID, templateID *uuid.UUID
+		templateName          *string
+		version               *int
+		setAt                 *time.Time
+	)
+	if err := row.Scan(&grp.ID, &grp.Name, &grp.Description, &sel, &grp.CreatedAt,
+		&versionID, &templateID, &templateName, &version, &setAt); err != nil {
 		return grp, err
+	}
+	if versionID != nil && templateID != nil && setAt != nil {
+		grp.Config = &GroupConfig{VersionID: *versionID, TemplateID: *templateID, TemplateName: *templateName, Version: *version, SetAt: *setAt}
 	}
 	return grp, json.Unmarshal(sel, &grp.Selector)
 }

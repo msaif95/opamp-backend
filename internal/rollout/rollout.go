@@ -490,6 +490,70 @@ WHERE r.status = 'running' OR (r.status IN ('paused', 'aborted') AND EXISTS (
 			}
 		}
 	}
+	if err := s.ReconcileGroups(ctx); err != nil && ctx.Err() == nil {
+		s.log.ErrorContext(ctx, "assign group configs", "err", err)
+	}
+}
+
+// reconcileBatch bounds how many agents one group is given its config per tick.
+const reconcileBatch = 1000
+
+// ReconcileGroups gives each group's config to agents that match the group
+// and have no config assigned: collectors that connected, or started
+// matching, after the group's rollout finished.
+//
+// It only acts once a rollout of that exact version to the group has
+// completed (or when the group was empty and none was needed). While a
+// rollout is running, late agents join it instead; if it was paused, aborted
+// or rolled back, the version is suspect and must not spread on its own.
+// An agent matching several groups gets the config of the first by name.
+func (s *Service) ReconcileGroups(ctx context.Context) error {
+	rows, err := s.db.Query(ctx, `
+SELECT g.id, g.selector, g.config_version_id FROM agent_groups g
+WHERE g.config_version_id IS NOT NULL AND (
+    EXISTS (SELECT 1 FROM rollouts r WHERE r.group_id = g.id AND r.config_version_id = g.config_version_id AND r.status = 'completed')
+    OR NOT EXISTS (SELECT 1 FROM rollouts r WHERE r.group_id = g.id AND r.config_version_id = g.config_version_id))
+ORDER BY g.name`)
+	if err != nil {
+		return err
+	}
+	type group struct {
+		id, versionID uuid.UUID
+		sel           []byte
+	}
+	groups, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (group, error) {
+		var g group
+		err := row.Scan(&g.id, &g.sel, &g.versionID)
+		return g, err
+	})
+	if err != nil {
+		return err
+	}
+	for _, g := range groups {
+		var sel targeting.Selector
+		if err := json.Unmarshal(g.sel, &sel); err != nil {
+			return err
+		}
+		where, args := sel.Where("attributes", 4)
+		rows, err := s.db.Query(ctx, `
+UPDATE agents SET desired_config_version_id = $1 WHERE instance_uid IN (
+    SELECT instance_uid FROM agents
+    WHERE desired_config_version_id IS NULL AND capabilities & $2 <> 0 AND `+where+`
+    ORDER BY instance_uid LIMIT $3 FOR UPDATE SKIP LOCKED)
+RETURNING instance_uid`, append([]any{g.versionID, acceptsRemoteConfig, reconcileBatch}, args...)...)
+		if err != nil {
+			return fmt.Errorf("assign config of group %s: %w", g.id, err)
+		}
+		assigned, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+		if err != nil {
+			return fmt.Errorf("assign config of group %s: %w", g.id, err)
+		}
+		if len(assigned) > 0 {
+			s.log.InfoContext(ctx, "gave group config to newly matching agents", "group_id", g.id, "agents", len(assigned))
+			s.pushAll(ctx, g.id, assigned)
+		}
+	}
+	return nil
 }
 
 // advance performs one step of the rollout state machine and returns the
