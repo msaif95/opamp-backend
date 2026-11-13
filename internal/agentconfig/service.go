@@ -5,6 +5,7 @@ package agentconfig
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -46,8 +47,10 @@ type Template struct {
 	Origin        string    `json:"origin"`
 	LatestVersion int       `json:"latest_version"`
 	AssignedCount int       `json:"assigned_agents"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// AssignedByVersion maps a version number to the agents assigned to it.
+	AssignedByVersion map[int]int `json:"assigned_by_version"`
+	CreatedAt         time.Time   `json:"created_at"`
+	UpdatedAt         time.Time   `json:"updated_at"`
 }
 
 // Version is one immutable revision of a template.
@@ -61,7 +64,9 @@ type Version struct {
 	Description  string    `json:"description"`
 	Origin       string    `json:"origin"`
 	GitCommitSHA *string   `json:"git_commit_sha"`
-	CreatedAt    time.Time `json:"created_at"`
+	// AssignedCount is only populated by Service.Get.
+	AssignedCount int       `json:"assigned_agents,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // Service is the config management service.
@@ -88,7 +93,7 @@ func (s *Service) Create(ctx context.Context, name, description, body, author st
 	}
 	defer tx.Rollback(ctx)
 
-	t := &Template{Name: name, Description: description, Origin: OriginUI, LatestVersion: 1}
+	t := &Template{Name: name, Description: description, Origin: OriginUI, LatestVersion: 1, AssignedByVersion: map[int]int{}}
 	err = tx.QueryRow(ctx, `
 INSERT INTO config_templates (name, description, origin) VALUES ($1, $2, 'ui')
 RETURNING id, created_at, updated_at`, name, description).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
@@ -168,15 +173,28 @@ VALUES ($1, $2, $3, $4, $5, $6, 'ui') RETURNING id, created_at`,
 const templateSelect = `
 SELECT t.id, t.name, COALESCE(t.description, ''), t.origin::text,
        COALESCE((SELECT max(version) FROM config_versions v WHERE v.template_id = t.id), 0),
-       (SELECT count(*) FROM agents a JOIN config_versions v ON v.id = a.desired_config_version_id
-        WHERE v.template_id = t.id),
+       COALESCE((SELECT jsonb_object_agg(version, n) FROM (
+           SELECT v.version, count(*) AS n FROM agents a JOIN config_versions v ON v.id = a.desired_config_version_id
+           WHERE v.template_id = t.id GROUP BY v.version) c), '{}'::jsonb),
        t.created_at, t.updated_at
 FROM config_templates t`
 
 func scanTemplate(row pgx.CollectableRow) (Template, error) {
-	var t Template
-	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &t.AssignedCount, &t.CreatedAt, &t.UpdatedAt)
-	return t, err
+	var (
+		t        Template
+		assigned []byte
+	)
+	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &assigned, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return t, err
+	}
+	if err := json.Unmarshal(assigned, &t.AssignedByVersion); err != nil {
+		return t, err
+	}
+	for _, n := range t.AssignedByVersion {
+		t.AssignedCount += n
+	}
+	return t, nil
 }
 
 // List returns all templates ordered by name.
@@ -206,6 +224,9 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Template, []Version, 
 		return nil, nil, err
 	}
 	versions, err := pgx.CollectRows(rows, scanVersion)
+	for i := range versions {
+		versions[i].AssignedCount = t.AssignedByVersion[versions[i].Version]
+	}
 	return &t, versions, err
 }
 

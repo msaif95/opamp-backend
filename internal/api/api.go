@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -129,8 +130,9 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sum)
 }
 
-// listAgents supports ?limit=&offset=&connected=true|false and attribute
-// filters as repeated ?attr=key=value.
+// listAgents supports ?limit=&offset=, the filters ?connected= and ?healthy=
+// (true|false), ?config_status= and repeated ?attr=key=value, and ordering
+// with ?sort=name|last_seen and ?order=asc|desc.
 func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := registry.ListFilter{Attributes: map[string]string{}}
@@ -139,13 +141,36 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	if f.Offset < 0 {
 		f.Offset = 0
 	}
-	if v := q.Get("connected"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "connected must be true or false")
+	for name, dst := range map[string]**bool{"connected": &f.Connected, "healthy": &f.Healthy} {
+		if v := q.Get(name); v != "" {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, name+" must be true or false")
+				return
+			}
+			*dst = &b
+		}
+	}
+	if v := q.Get("config_status"); v != "" {
+		if !slices.Contains([]string{"unset", "applied", "applying", "failed"}, v) {
+			writeError(w, http.StatusBadRequest, "config_status must be unset, applied, applying or failed")
 			return
 		}
-		f.Connected = &b
+		f.ConfigStatus = &v
+	}
+	switch f.Sort = q.Get("sort"); f.Sort {
+	case "", registry.SortName, registry.SortLastSeen:
+	default:
+		writeError(w, http.StatusBadRequest, "sort must be name or last_seen")
+		return
+	}
+	switch q.Get("order") {
+	case "", "asc":
+	case "desc":
+		f.Desc = true
+	default:
+		writeError(w, http.StatusBadRequest, "order must be asc or desc")
+		return
 	}
 	for _, kv := range q["attr"] {
 		k, v, ok := strings.Cut(kv, "=")

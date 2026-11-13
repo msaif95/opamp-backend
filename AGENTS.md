@@ -30,3 +30,6 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   failure threshold, pause/resume/abort). The engine ticks every 2s on every replica and advances each rollout
   under a row lock. `GET /api/v1/agents/facets` lists low-cardinality attributes for building selectors.
 - Do not pipe `agentsim` through `head`: it dies of SIGPIPE once the pipe closes. Redirect to a file instead.
+- Agent events (`opamp:agent-events`) are published only for real changes (connect, disconnect, description,
+  health, effective config, remote config status), never for plain heartbeats; the UI relies on this to stay calm.
+- `GET /api/v1/agents` defaults to a stable order by `host.name`; `sort=last_seen` reorders on every heartbeat.

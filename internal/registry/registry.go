@@ -104,6 +104,7 @@ func New(db *pgxpool.Pool, rdb *redis.Client, replicaID string, routeTTL time.Du
 }
 
 const upsertSQL = `
+WITH prev AS (SELECT connected FROM agents WHERE instance_uid = $1)
 INSERT INTO agents (
     instance_uid, auth_mode, credential_id, attributes, capabilities, agent_version,
     healthy, health_status, health_last_error, health,
@@ -134,7 +135,8 @@ ON CONFLICT (instance_uid) DO UPDATE SET
     connected             = TRUE,
     sequence_num          = EXCLUDED.sequence_num,
     last_seen             = now()
-RETURNING capabilities, desired_config_version_id, remote_config_hash`
+RETURNING capabilities, desired_config_version_id, remote_config_hash,
+          COALESCE((SELECT connected FROM prev), FALSE)`
 
 // Report applies an AgentToServer status report. Fields the agent omitted
 // (unchanged since its last message) are left untouched.
@@ -169,15 +171,16 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 	}
 
 	var (
-		st   ConfigState
-		caps int64
+		st           ConfigState
+		caps         int64
+		wasConnected bool
 	)
 	err := r.db.QueryRow(ctx, upsertSQL,
 		uid, id.AuthMode, id.CredentialID, attrs, int64(msg.Capabilities), version,
 		healthy, healthStatus, healthErr, health,
 		effHash, effBody,
 		remoteHash, remoteStatus, remoteError,
-		int64(msg.SequenceNum)).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash)
+		int64(msg.SequenceNum)).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &wasConnected)
 	if err != nil {
 		return st, fmt.Errorf("upsert agent %s: %w", uid, err)
 	}
@@ -186,7 +189,14 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 	if err := r.rdb.Set(ctx, routeKeyPrefix+uid.String(), r.replicaID, r.routeTTL).Err(); err != nil {
 		return st, fmt.Errorf("set route %s: %w", uid, err)
 	}
-	r.publish(ctx, "agent.updated", uid)
+	// Plain heartbeats only refresh last_seen; publishing them would make
+	// every UI refetch constantly at fleet scale.
+	switch {
+	case !wasConnected:
+		r.publish(ctx, "agent.connected", uid)
+	case attrs != nil || health != nil || effBody != nil || remoteStatus != nil:
+		r.publish(ctx, "agent.updated", uid)
+	}
 	return st, nil
 }
 
@@ -310,13 +320,25 @@ const agentFrom = ` FROM agents a
     LEFT JOIN config_versions cv ON cv.id = a.desired_config_version_id
     LEFT JOIN config_templates ct ON ct.id = cv.template_id`
 
-// ListFilter narrows List results.
+// Sort orders for List.
+const (
+	SortName     = "name"
+	SortLastSeen = "last_seen"
+)
+
+// ListFilter narrows and orders List results.
 type ListFilter struct {
 	// Attributes must all match exactly (JSONB containment).
 	Attributes map[string]string
 	Connected  *bool
-	Limit      int
-	Offset     int
+	Healthy    *bool
+	// ConfigStatus filters on remote_config_status (unset, applied, applying, failed).
+	ConfigStatus *string
+	// Sort is SortName (default, stable between refreshes) or SortLastSeen.
+	Sort   string
+	Desc   bool
+	Limit  int
+	Offset int
 }
 
 // List returns agents matching the filter, plus the total match count.
@@ -328,15 +350,26 @@ func (r *Registry) List(ctx context.Context, f ListFilter) ([]Agent, int, error)
 	if len(f.Attributes) > 0 {
 		attrs, _ = json.Marshal(f.Attributes)
 	}
-	const where = ` WHERE attributes @> $1::jsonb AND ($2::boolean IS NULL OR connected = $2)`
+	const where = ` WHERE attributes @> $1::jsonb AND ($2::boolean IS NULL OR connected = $2)
+    AND ($3::boolean IS NULL OR healthy = $3) AND ($4::text IS NULL OR remote_config_status::text = $4)`
+	args := []any{attrs, f.Connected, f.Healthy, f.ConfigStatus}
+
+	dir := "ASC"
+	if f.Desc {
+		dir = "DESC"
+	}
+	order := ` ORDER BY attributes->>'host.name' ` + dir + ` NULLS LAST, instance_uid`
+	if f.Sort == SortLastSeen {
+		order = ` ORDER BY last_seen ` + dir + `, instance_uid`
+	}
 
 	var total int
-	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents`+where, attrs, f.Connected).Scan(&total); err != nil {
+	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM agents`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := r.db.Query(ctx,
-		`SELECT `+agentColumns+agentFrom+where+` ORDER BY last_seen DESC, instance_uid LIMIT $3 OFFSET $4`,
-		attrs, f.Connected, f.Limit, f.Offset)
+		`SELECT `+agentColumns+agentFrom+where+order+` LIMIT $5 OFFSET $6`,
+		append(args, f.Limit, f.Offset)...)
 	if err != nil {
 		return nil, 0, err
 	}
