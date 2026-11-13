@@ -20,7 +20,8 @@ import (
 // ServerCapabilities advertised to every agent.
 const ServerCapabilities = uint64(protobufs.ServerCapabilities_ServerCapabilities_AcceptsStatus |
 	protobufs.ServerCapabilities_ServerCapabilities_AcceptsEffectiveConfig |
-	protobufs.ServerCapabilities_ServerCapabilities_OffersRemoteConfig)
+	protobufs.ServerCapabilities_ServerCapabilities_OffersRemoteConfig |
+	protobufs.ServerCapabilities_ServerCapabilities_OffersConnectionSettings)
 
 const configContentType = "text/yaml"
 
@@ -40,6 +41,9 @@ type Handler struct {
 	reg     Registry
 	configs ConfigSource
 	log     *slog.Logger
+	// OwnMetrics, if set, returns where an agent should send its own
+	// metrics; it is offered to agents that report them.
+	OwnMetrics func(uid uuid.UUID) *protobufs.ConnectionSettingsOffers
 	// During a database outage every agent message fails the same way.
 	reportErr *logthrottle.Throttle
 }
@@ -77,6 +81,12 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 	}
 
 	resp.RemoteConfig = h.pendingConfig(ctx, uid, state)
+	// Offered with every full report (the first message of a connection); the
+	// offer's hash lets the agent ignore one it already applied.
+	if h.OwnMetrics != nil && msg.AgentDescription != nil &&
+		msg.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics) != 0 {
+		resp.ConnectionSettings = h.OwnMetrics(uid)
+	}
 	if needFullState {
 		resp.Flags = uint64(protobufs.ServerToAgentFlags_ServerToAgentFlags_ReportFullState)
 	}

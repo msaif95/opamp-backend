@@ -36,6 +36,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/store"
 	"github.com/msaif95/opamp-backend/internal/targeting"
 	"github.com/msaif95/opamp-backend/internal/telemetry"
+	"github.com/msaif95/opamp-backend/internal/throughput"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...".
@@ -117,7 +118,11 @@ func run() error {
 	reg := registry.New(db, rdb, cfg.ReplicaID, cfg.AgentOfflineAfter)
 	agentAuth := auth.NewAgentAuthenticator(db)
 	configs := agentconfig.NewService(db)
-	conns := connection.NewManager(agentAuth, protocol.NewHandler(reg, configs, log), reg, log)
+	tput := throughput.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
+	handler := protocol.NewHandler(reg, configs, log)
+	handler.OwnMetrics = tput.Offer
+	conns := connection.NewManager(agentAuth, handler, reg, log)
+	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput}
 
 	var tlsCfg *tls.Config
 	if cfg.TLSCertFile != "" {
@@ -298,7 +303,8 @@ func run() error {
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
 			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
 			Alerts: alertStore, Settings: switches,
-			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
+			Throughput: tput.Latest,
+			Install:    api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
 			Status: api.SystemStatus{
 				SSOIssuer: cfg.OktaIssuer, Version: version, DevMode: cfg.DevMode,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,

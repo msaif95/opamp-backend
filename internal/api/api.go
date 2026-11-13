@@ -26,6 +26,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/settings"
 	"github.com/msaif95/opamp-backend/internal/targeting"
+	"github.com/msaif95/opamp-backend/internal/throughput"
 )
 
 // Server holds the API dependencies.
@@ -43,10 +44,12 @@ type Server struct {
 	Events http.Handler
 	Log    *slog.Logger
 	// Status describes how this deployment is configured, for the System page.
-	Status   SystemStatus
-	Install  InstallConfig
-	Settings *settings.Store
-	Alerts   *alert.Store
+	Status  SystemStatus
+	Install InstallConfig
+	// Throughput returns an agent's latest pipeline rates, or nil.
+	Throughput func(ctx context.Context, uid uuid.UUID) (*throughput.Sample, error)
+	Settings   *settings.Store
+	Alerts     *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
 	// TrustProxyHeaders makes the client address come from X-Forwarded-For.
@@ -302,7 +305,12 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, a)
+	// Best effort: a Redis problem must not hide the agent.
+	sample, _ := s.Throughput(r.Context(), uid)
+	writeJSON(w, http.StatusOK, struct {
+		*registry.Agent
+		Throughput *throughput.Sample `json:"throughput"`
+	}{a, sample})
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {

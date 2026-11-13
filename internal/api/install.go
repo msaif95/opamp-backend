@@ -176,6 +176,7 @@ __TLS__capabilities:
   reports_effective_config: true
   reports_health: true
   reports_heartbeat: true
+  reports_own_metrics: true
 agent:
   executable: __DIR__/otelcol-contrib
 __DESCRIPTION__storage:

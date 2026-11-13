@@ -98,3 +98,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   A spec component may carry `library: <id>`; `Library.Resolve` substitutes the item's current settings at render and
   save time, and the stored spec keeps only the reference. Saved config versions are never rewritten when an item
   changes: a config picks the change up the next time it is saved.
+- Throughput (`internal/throughput`): agents that advertise ReportsOwnMetrics are offered OpAMP own-metrics
+  connection settings pointing at `/v1/metrics` on the agent listener (derived from `AGENT_ENDPOINT_URL`), with an
+  HMAC token per agent. The intake keeps only the latest sample per agent in Redis (5 min TTL) and derives rates
+  from the collector's `otelcol_receiver_*` / `otelcol_exporter_*` counters. Shown on agent detail as `throughput`.
+  Verified with opampsupervisor + otelcol-contrib 0.164.0; the collector reports about once a minute.

@@ -73,6 +73,8 @@ type Manager struct {
 	byUID map[uuid.UUID]types.Connection
 
 	disconnectErr *logthrottle.Throttle
+	// Extra handlers served on the agent listener next to the OpAMP endpoint. Set before Start.
+	Extra map[string]http.Handler
 
 	messages     metric.Int64Counter
 	handleTime   metric.Float64Histogram
@@ -124,6 +126,9 @@ func (m *Manager) Start(addr string, tlsCfg *tls.Config) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(OpAMPPath, handler)
+	for path, h := range m.Extra {
+		mux.Handle(path, h)
+	}
 	m.httpSrv = &http.Server{
 		Handler:           mux,
 		ConnContext:       connContext,
