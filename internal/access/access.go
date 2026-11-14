@@ -97,6 +97,9 @@ type Project struct {
 	Description string    `json:"description"`
 	CreatedBy   string    `json:"created_by"`
 	CreatedAt   time.Time `json:"created_at"`
+	// DeletedAt is set once the project has been deleted; it is then kept only as a record.
+	DeletedAt *time.Time `json:"deleted_at"`
+	DeletedBy *string    `json:"deleted_by"`
 	// Counts are only populated by List.
 	Members int `json:"members"`
 	Agents  int `json:"agents"`
@@ -138,7 +141,9 @@ func (p *Projects) Resolve(ctx context.Context, u auth.User) (Scope, error) {
 	if u.Provider == "token" {
 		return s, nil // a token is not a person and has no memberships
 	}
-	rows, err := p.db.Query(ctx, `SELECT project_id, role::text FROM project_members WHERE subject = $1`, normalize(u.Subject))
+	rows, err := p.db.Query(ctx, `
+SELECT m.project_id, m.role::text FROM project_members m JOIN projects p ON p.id = m.project_id
+WHERE m.subject = $1 AND p.deleted_at IS NULL`, normalize(u.Subject))
 	if err != nil {
 		return Scope{}, err
 	}
@@ -159,33 +164,35 @@ func (p *Projects) Resolve(ctx context.Context, u auth.User) (Scope, error) {
 // IsMember reports whether the subject belongs to any project.
 func (p *Projects) IsMember(ctx context.Context, subject string) (bool, error) {
 	var ok bool
-	err := p.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM project_members WHERE subject = $1)`, normalize(subject)).Scan(&ok)
+	err := p.db.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM project_members m JOIN projects p ON p.id = m.project_id WHERE m.subject = $1 AND p.deleted_at IS NULL)`, normalize(subject)).Scan(&ok)
 	return ok, err
 }
 
-// List returns the projects the scope may view, by name.
-func (p *Projects) List(ctx context.Context, s Scope) ([]Project, error) {
+// List returns the projects the scope may view, by name. Deleted projects
+// are left out unless includeDeleted is set.
+func (p *Projects) List(ctx context.Context, s Scope, includeDeleted bool) ([]Project, error) {
 	// Unassigned is not a project, so only real memberships (or admin) list anything.
 	where, args := Scope{Admin: s.Admin, Projects: s.Projects}.Where("p.id", 1)
 	rows, err := p.db.Query(ctx, `
-SELECT p.id, p.name, p.description, p.created_by, p.created_at,
+SELECT p.id, p.name, p.description, p.created_by, p.created_at, p.deleted_at, p.deleted_by,
        (SELECT count(*) FROM project_members m WHERE m.project_id = p.id),
        (SELECT count(*) FROM agents a WHERE a.project_id = p.id)
-FROM projects p WHERE `+where+` ORDER BY p.name`, args...)
+FROM projects p WHERE `+where+` AND (p.deleted_at IS NULL OR $`+fmt.Sprint(len(args)+1)+`) ORDER BY p.deleted_at IS NOT NULL, p.name`, append(args, includeDeleted)...)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Project, error) {
 		var pr Project
-		err := row.Scan(&pr.ID, &pr.Name, &pr.Description, &pr.CreatedBy, &pr.CreatedAt, &pr.Members, &pr.Agents)
+		err := row.Scan(&pr.ID, &pr.Name, &pr.Description, &pr.CreatedBy, &pr.CreatedAt, &pr.DeletedAt, &pr.DeletedBy, &pr.Members, &pr.Agents)
 		return pr, err
 	})
 }
 
-// Exists reports whether a project exists.
+// Exists reports whether a project exists and has not been deleted.
 func (p *Projects) Exists(ctx context.Context, id uuid.UUID) (bool, error) {
 	var ok bool
-	err := p.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)`, id).Scan(&ok)
+	err := p.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL)`, id).Scan(&ok)
 	return ok, err
 }
 
@@ -201,20 +208,54 @@ func (p *Projects) Create(ctx context.Context, name, description, by string) (*P
 	return &pr, err
 }
 
-// Delete removes a project and its memberships. It is refused while the project owns anything.
-func (p *Projects) Delete(ctx context.Context, id uuid.UUID) error {
-	tag, err := p.db.Exec(ctx, `DELETE FROM projects WHERE id = $1`, id)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-		return ErrProjectInUse
-	}
+// Deleted says what deleting a project switched off.
+type Deleted struct {
+	APIKeys    int64 `json:"api_keys_revoked"`
+	Tokens     int64 `json:"tokens_revoked"`
+	Collectors int64 `json:"collectors"`
+	Pushes     int64 `json:"pushes_aborted"`
+}
+
+// Delete retires a project. Nothing is removed: the project is marked
+// deleted and kept as a record, together with its collectors, configs and
+// history. Its agent API keys and API tokens are revoked, so its collectors
+// are disconnected and cannot come back, pushes still in progress are
+// aborted, and nobody but global administrators can see it any more.
+func (p *Projects) Delete(ctx context.Context, id uuid.UUID, by string) (Deleted, error) {
+	var d Deleted
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
-		return err
+		return d, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE projects SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL`, id, by)
+	if err != nil {
+		return d, err
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrProjectNotFound
+		return d, ErrProjectNotFound
 	}
-	return nil
+	for _, step := range []struct {
+		n   *int64
+		sql string
+	}{
+		{&d.APIKeys, `UPDATE credentials SET revoked_at = now() WHERE project_id = $1 AND revoked_at IS NULL`},
+		{&d.Tokens, `UPDATE api_tokens SET revoked_at = now() WHERE project_id = $1 AND revoked_at IS NULL`},
+		{&d.Pushes, `UPDATE rollouts SET status = 'aborted', finished_at = now(), error = 'the project was deleted'
+		             WHERE project_id = $1 AND status IN ('pending', 'running', 'paused')`},
+		// Groups stop handing out configs; collectors are counted, and stop being asked to change.
+		{nil, `UPDATE agent_groups SET config_version_id = NULL WHERE project_id = $1`},
+		{&d.Collectors, `UPDATE agents SET paused = FALSE WHERE project_id = $1`},
+	} {
+		tag, err := tx.Exec(ctx, step.sql, id)
+		if err != nil {
+			return d, err
+		}
+		if step.n != nil {
+			*step.n = tag.RowsAffected()
+		}
+	}
+	return d, tx.Commit(ctx)
 }
 
 // Members lists a project's members by name.

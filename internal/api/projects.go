@@ -135,7 +135,7 @@ func projectFilter(w http.ResponseWriter, r *http.Request) (*registry.ProjectRef
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	u, _ := auth.UserFrom(r.Context())
 	scope := access.From(r.Context())
-	projects, err := s.Projects.List(r.Context(), scope)
+	projects, err := s.Projects.List(r.Context(), scope, false)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -162,7 +162,9 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
-	projects, err := s.Projects.List(r.Context(), access.From(r.Context()))
+	// ?include_deleted=true also returns deleted projects, for administrators.
+	scope := access.From(r.Context())
+	projects, err := s.Projects.List(r.Context(), scope, scope.Admin && r.URL.Query().Get("include_deleted") == "true")
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -201,21 +203,19 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	err := s.Projects.Delete(r.Context(), id)
-	switch {
-	case errors.Is(err, access.ErrProjectNotFound):
+	u, _ := auth.UserFrom(r.Context())
+	done, err := s.Projects.Delete(r.Context(), id, u.Subject)
+	if errors.Is(err, access.ErrProjectNotFound) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
-	case errors.Is(err, access.ErrProjectInUse):
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	case err != nil:
+	}
+	if err != nil {
 		s.internal(w, r, err)
 		return
 	}
-	u, _ := auth.UserFrom(r.Context())
-	s.audit(r.Context(), u.Subject, u.Provider, "project.delete", "project", id.String(), nil)
-	w.WriteHeader(http.StatusNoContent)
+	s.audit(r.Context(), u.Subject, u.Provider, "project.delete", "project", id.String(), map[string]any{
+		"api_keys_revoked": done.APIKeys, "tokens_revoked": done.Tokens, "collectors": done.Collectors, "pushes_aborted": done.Pushes})
+	writeJSON(w, http.StatusOK, done)
 }
 
 func (s *Server) listProjectMembers(w http.ResponseWriter, r *http.Request) {

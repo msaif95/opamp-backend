@@ -8,11 +8,17 @@ CREATE TYPE rbac_role AS ENUM ('admin', 'operator', 'viewer');
 -- governed by a user's global role, as everything was before projects.
 CREATE TABLE projects (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     created_by  TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Projects are never removed: deleting one marks it here, revokes its API
+    -- keys and tokens and takes away everyone's access. Its records stay.
+    deleted_at  TIMESTAMPTZ,
+    deleted_by  TEXT
 );
+-- A deleted project's name can be used again.
+CREATE UNIQUE INDEX projects_name_key ON projects (name) WHERE deleted_at IS NULL;
 
 -- A person's role in a project. subject is the lower-cased sign-in name
 -- (Okta email, or the local username).

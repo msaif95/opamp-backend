@@ -169,3 +169,6 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   assign and pause. Tested against operator chart 0.129.0 (app 0.162.0) on docker-desktop.
 - Projects are mandatory: `targetProject` rejects a create without `project_id` (400). The one exception is a global
   admin API token. Rows with a NULL project can still exist from before and stay governed by the global role.
+- Projects are soft-deleted (`projects.deleted_at`): `Projects.Delete` revokes the project's API keys and tokens,
+  aborts its running rollouts and clears group configs in one transaction; memberships of deleted projects are
+  ignored in `Resolve`, `Exists` is false, the name becomes reusable. Rows are never removed.

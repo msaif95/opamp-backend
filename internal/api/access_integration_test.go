@@ -405,9 +405,36 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("alice can still abort it", first(h.call(alice, "POST", "/rollouts/"+ro2["id"].(string)+"/abort", nil)), 204)
 
 	// --- Admin-only housekeeping.
-	h.expect("delete a project that owns things", first(h.call(admin, "DELETE", "/projects/"+A, nil)), 409)
 	h.expect("remove alice from A", first(h.call(admin, "DELETE", "/projects/"+A+"/members/alice@example.com", nil)), 204)
 	h.expect("alice loses A at once", first(h.call(alice, "GET", "/agents/"+a1, nil)), 404)
+
+	// --- Deleting a project keeps it as a record, revokes its keys and tokens, and takes away access.
+	keyB, err := agents.IssueAPIKey(ctx, "b-live", func() *uuid.UUID { id := uuid.MustParse(B); return &id }(), "root", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, gone := h.call(admin, "DELETE", "/projects/"+B, nil)
+	h.expect("admin deletes B", code, 200)
+	if gone["api_keys_revoked"].(float64) < 1 || gone["collectors"].(float64) != 1 {
+		t.Errorf("delete result = %v", gone)
+	}
+	probe := httptest.NewRequest("GET", "/v1/opamp", nil)
+	probe.Header.Set("Authorization", "Bearer "+keyB.Secret)
+	if _, err := agents.Authenticate(ctx, probe); err == nil {
+		t.Error("an API key of a deleted project still authenticates")
+	}
+	h.expect("alice no longer sees B's collector", first(h.call(alice, "GET", "/agents/"+b1, nil)), 404)
+	h.expect("nothing can be created in a deleted project", first(h.call(admin, "POST", "/configs", map[string]any{"name": "late", "body": collectorYAML, "project_id": B})), 400)
+	h.expect("deleting it again", first(h.call(admin, "DELETE", "/projects/"+B, nil)), 404)
+	_, active := h.call(admin, "GET", "/projects", nil)
+	_, all := h.call(admin, "GET", "/projects?include_deleted=true", nil)
+	if len(all["projects"].([]any)) != len(active["projects"].([]any))+1 {
+		t.Errorf("deleted project not kept as a record: %d active, %d with deleted", len(active["projects"].([]any)), len(all["projects"].([]any)))
+	}
+	// Its collector and config are still on record for administrators, and its name is free again.
+	h.expect("admin still reads B's collector", first(h.call(admin, "GET", "/agents/"+b1, nil)), 200)
+	h.expect("admin still reads B's config", first(h.call(admin, "GET", "/configs/"+cB, nil)), 200)
+	h.expect("the name can be reused", first(h.call(admin, "POST", "/projects", map[string]string{"name": "B"})), 201)
 }
 
 func first(code int, _ map[string]any) int { return code }
