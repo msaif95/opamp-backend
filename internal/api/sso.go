@@ -160,7 +160,15 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		// ProjectID binds a viewer or operator token to one project; omit to act on unassigned resources.
 		ProjectID *uuid.UUID `json:"project_id"`
 	}
-	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
+	if !decode(w, r, &req) {
+		return
+	}
+	// An admin token is global; any other token acts in one project.
+	if req.Role == auth.RoleAdmin && req.ProjectID == nil {
+		if !s.projectAllowed(w, r, nil, auth.RoleAdmin) {
+			return
+		}
+	} else if !s.targetProject(w, r, req.ProjectID, auth.RoleAdmin) {
 		return
 	}
 	switch {

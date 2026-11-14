@@ -22,7 +22,7 @@ const usage = `opampctl - command-line client for OpAMP Fleet
 Connection (flags or environment):
   --url    console URL, e.g. https://opamp.example.com      (OPAMP_URL)
   --token  API token from the console's Agent credentials   (OPAMP_TOKEN)
-  --project  project to act in, by name; omit for resources outside any project   (OPAMP_PROJECT)
+  --project  project to act in, by name; needed to create or push anything       (OPAMP_PROJECT)
 
 Commands:
   agents [--selector k=v,k=v] [--limit N] [-o json]    list collectors

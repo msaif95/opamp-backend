@@ -180,7 +180,8 @@ func TestProjectAccess(t *testing.T) {
 	}
 	a1, b1, u1 := connect("a1", &A), connect("b1", &B), connect("u1", nil)
 
-	// Configs: one per project and one unassigned.
+	// Configs: one per project, and one outside any project. The API no longer creates those, but data from
+	// before projects were mandatory can exist and must stay invisible to project members.
 	mk := func(name string, project *string) (string, string) {
 		body := map[string]any{"name": name, "body": collectorYAML}
 		if project != nil {
@@ -192,7 +193,16 @@ func TestProjectAccess(t *testing.T) {
 	}
 	cA, vA := mk("cfg-a", &A)
 	cB, vB := mk("cfg-b", &B)
-	cU, _ := mk("cfg-u", nil)
+	legacy, _, err := configs.Create(ctx, nil, "cfg-u", "", collectorYAML, "root", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cU := legacy.ID.String()
+	h.expect("admin creates a config without a project", first(h.call(admin, "POST", "/configs", map[string]any{"name": "x", "body": collectorYAML})), 400)
+	h.expect("admin issues an API key without a project", first(h.call(admin, "POST", "/credentials/api-keys", map[string]any{"name": "x"})), 400)
+	h.expect("admin creates a group without a project", first(h.call(admin, "POST", "/groups", map[string]any{"name": "x", "selector": map[string][]string{"env": {"prod"}}})), 400)
+	h.expect("admin creates an operator token without a project", first(h.call(admin, "POST", "/auth/tokens", map[string]any{"name": "x", "role": "operator"})), 400)
+	h.expect("admin creates a global admin token", first(h.call(admin, "POST", "/auth/tokens", map[string]any{"name": "global", "role": "admin"})), 201)
 
 	// --- What each person sees.
 	for who, tc := range map[string]struct {
@@ -240,10 +250,10 @@ func TestProjectAccess(t *testing.T) {
 	// --- Changes need the operator role in that project.
 	h.expect("alice creates config in A", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML, "project_id": A})), 201)
 	h.expect("alice creates config in B (viewer)", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML, "project_id": B})), 403)
-	h.expect("alice creates config outside a project", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML})), 403)
+	h.expect("alice creates config outside a project", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML})), 400)
 	h.expect("alice edits config in B", first(h.call(alice, "POST", "/configs/"+cB+"/versions", map[string]any{"body": collectorYAML + "# x\n"})), 403)
 	h.expect("alice deletes unassigned config", first(h.call(alice, "DELETE", "/configs/"+cU, nil)), 404)
-	h.expect("bob (global viewer) creates unassigned config", first(h.call(bob, "POST", "/configs", map[string]any{"name": "b", "body": collectorYAML})), 403)
+	h.expect("bob (global viewer) creates unassigned config", first(h.call(bob, "POST", "/configs", map[string]any{"name": "b", "body": collectorYAML})), 400)
 	h.expect("alice stops collector in B (viewer)", first(h.call(alice, "POST", "/agents/"+b1+"/pause", nil)), 403)
 	h.expect("alice restarts unassigned collector", first(h.call(alice, "POST", "/agents/"+u1+"/restart", nil)), 404)
 	h.expect("alice assigns A config to A collector", first(h.call(alice, "PUT", "/agents/"+a1+"/config", map[string]any{"config_version_id": vA})), 204)
@@ -283,7 +293,7 @@ func TestProjectAccess(t *testing.T) {
 		t.Errorf("push to all of A targets %v agents, want 1", ro["total_agents"])
 	}
 	h.expect("alice pushes in B (viewer)", first(h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vB, "project_id": B, "all_agents": true, "selector": map[string]any{}})), 403)
-	h.expect("alice pushes to unassigned agents", first(h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vA, "all_agents": true, "selector": map[string]any{}})), 403)
+	h.expect("alice pushes to unassigned agents", first(h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vA, "all_agents": true, "selector": map[string]any{}})), 400)
 	h.expect("alice pushes B's config into A", first(h.call(alice, "POST", "/rollouts", map[string]any{"config_version_id": vB, "project_id": A, "all_agents": true, "selector": map[string]any{}})), 409)
 	h.expect("bob reads A's push", first(h.call(bob, "GET", "/rollouts/"+ro["id"].(string), nil)), 404)
 	h.expect("bob aborts A's push", first(h.call(bob, "POST", "/rollouts/"+ro["id"].(string)+"/abort", nil)), 404)

@@ -74,9 +74,19 @@ func (s *Server) allowConfig(w http.ResponseWriter, r *http.Request, templateID 
 	return project, s.allow(w, r, project, need)
 }
 
-// targetProject validates the project a new resource is being created in:
-// it must exist and the caller must have the needed role there.
+// targetProject validates the project a new resource is being created in.
+// Everything belongs to a project: one must be given, it must exist and the
+// caller must have the needed role there.
 func (s *Server) targetProject(w http.ResponseWriter, r *http.Request, project *uuid.UUID, need auth.Role) bool {
+	if project == nil {
+		writeError(w, http.StatusBadRequest, "choose a project: everything belongs to a project (an administrator creates them under Admin → Projects)")
+		return false
+	}
+	return s.projectAllowed(w, r, project, need)
+}
+
+// projectAllowed is targetProject without the requirement that a project is given.
+func (s *Server) projectAllowed(w http.ResponseWriter, r *http.Request, project *uuid.UUID, need auth.Role) bool {
 	if project != nil {
 		ok, err := s.Projects.Exists(r.Context(), *project)
 		if err != nil {

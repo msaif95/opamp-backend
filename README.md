@@ -309,6 +309,8 @@ attributes match belongs to it. Groups are used to filter the fleet, to target b
 
 ### Projects and access
 
+- **A project comes first.** Nothing can be created until one exists: API keys, collectors, configs, groups and
+  bulk pushes must each be given a project.
 - A **project** owns collectors, configs, groups, bulk pushes and library items. A collector joins the project of
   the API key it was installed with.
 - People see a project only when added to it, as **viewer** (can look) or **operator** (can change configs, push,

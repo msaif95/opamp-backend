@@ -167,3 +167,5 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   deletes managed ones missing from a remote config), rebuilt from name/namespace/labels/spec so the hash is stable.
   Nothing is sent to a bridge with no assignment. Bridges are excluded from rollouts, group configs, whole-agent
   assign and pause. Tested against operator chart 0.129.0 (app 0.162.0) on docker-desktop.
+- Projects are mandatory: `targetProject` rejects a create without `project_id` (400). The one exception is a global
+  admin API token. Rows with a NULL project can still exist from before and stay governed by the global role.
