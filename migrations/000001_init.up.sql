@@ -46,6 +46,10 @@ CREATE TABLE agents (
     credential_id         UUID,
     -- Flattened from AgentDescription for indexed querying.
     attributes            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Labels people put on the collector in the console ({"owner": "alice"}).
+    -- They also appear in attributes as "label.<key>" (see agents_merge_labels),
+    -- so selectors, groups, filters, search and exports treat them like any attribute.
+    labels                JSONB NOT NULL DEFAULT '{}'::jsonb,
     capabilities          BIGINT NOT NULL DEFAULT 0,
     agent_version         TEXT,
     -- Health (from ComponentHealth).
@@ -74,6 +78,19 @@ CREATE INDEX agents_connected_idx ON agents (connected);
 CREATE INDEX agents_project_idx ON agents (project_id);
 CREATE INDEX agents_desired_config_idx ON agents (desired_config_version_id) WHERE desired_config_version_id IS NOT NULL;
 CREATE INDEX agents_host_name_idx ON agents ((attributes->>'host.name'), instance_uid);
+
+-- Keeps labels visible in attributes under the reserved "label." prefix, on
+-- every write of either column: what a collector reports replaces the
+-- reported attributes only, and a collector cannot report a label itself.
+CREATE FUNCTION agents_merge_labels() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.attributes :=
+        COALESCE((SELECT jsonb_object_agg(key, value) FROM jsonb_each(NEW.attributes) WHERE key NOT LIKE 'label.%'), '{}'::jsonb)
+        || COALESCE((SELECT jsonb_object_agg('label.' || key, value) FROM jsonb_each(NEW.labels)), '{}'::jsonb);
+    RETURN NEW;
+END $$;
+CREATE TRIGGER agents_merge_labels BEFORE INSERT OR UPDATE OF attributes, labels ON agents
+    FOR EACH ROW EXECUTE FUNCTION agents_merge_labels();
 
 -- Config templates / versions ---------------------------------------------
 CREATE TYPE config_origin AS ENUM ('ui', 'git');

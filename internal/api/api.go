@@ -155,6 +155,7 @@ func (s *Server) Router() http.Handler {
 			r.Post("/agents/{uid}/pause", s.agentAction("pause"))
 			r.Post("/agents/{uid}/resume", s.agentAction("resume"))
 			r.Delete("/agents/{uid}", s.agentAction("delete"))
+			r.Put("/agents/{uid}/labels", s.setAgentLabels)
 			r.Post("/agents/bulk", s.bulkAgents)
 			r.Post("/groups", s.createGroup)
 			r.Put("/groups/{id}", s.updateGroup)

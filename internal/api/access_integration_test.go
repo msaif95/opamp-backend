@@ -281,6 +281,27 @@ func TestProjectAccess(t *testing.T) {
 	}
 	h.expect("bulk with an unknown action", first(h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "explode", "instance_uids": []string{a2}})), 400)
 	h.expect("bulk with no collectors", first(h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "pause", "instance_uids": []string{}})), 400)
+	// Labels: operators in the collector's project, one at a time or in bulk; a label then selects like an attribute.
+	h.expect("alice labels a collector in A", first(h.call(alice, "PUT", "/agents/"+a2+"/labels", map[string]any{"labels": map[string]string{"owner": "alice"}})), 204)
+	h.expect("alice labels a collector in B (viewer)", first(h.call(alice, "PUT", "/agents/"+b2+"/labels", map[string]any{"labels": map[string]string{"owner": "alice"}})), 403)
+	h.expect("alice labels an unassigned collector", first(h.call(alice, "PUT", "/agents/"+u1+"/labels", map[string]any{"labels": map[string]string{"owner": "alice"}})), 404)
+	h.expect("a label key with a space", first(h.call(alice, "PUT", "/agents/"+a2+"/labels", map[string]any{"labels": map[string]string{"my key": "x"}})), 400)
+	lcode, lout := h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "label", "instance_uids": []string{a2, b2, u1},
+		"labels": map[string]any{"set": map[string]string{"canary": "true"}}})
+	h.expect("alice bulk labels", lcode, 200)
+	if lout["succeeded"].(float64) != 1 {
+		t.Errorf("bulk label = %v, want only a2 to succeed", lout)
+	}
+	h.expect("bulk label with nothing to change", first(h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "label", "instance_uids": []string{a2}})), 400)
+	_, labelled := h.call(alice, "GET", "/agents?attr=label.canary=true", nil)
+	if got := names(labelled, "agents", "host"); !equal(got, []string{"a2"}) {
+		t.Errorf("fleet filtered by label = %v, want [a2]", got)
+	}
+	_, one := h.call(alice, "GET", "/agents/"+a2, nil)
+	if l, _ := one["labels"].(map[string]any); l["owner"] != "alice" || l["canary"] != "true" {
+		t.Errorf("a2 labels = %v", one["labels"])
+	}
+
 	h.expect("alice removes a connected collector", first(h.call(alice, "DELETE", "/agents/"+a2, nil)), 409)
 	for _, uid := range []string{a2, b2} {
 		if err := reg.Disconnected(ctx, uuid.MustParse(uid)); err != nil {

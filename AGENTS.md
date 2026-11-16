@@ -183,3 +183,9 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   the many queries on `agents` needs a "not deleted" filter. `GET /agents/deleted` (and `/agents/deleted/{id}` with history and last config) lists the records by project
   scope; they are never pruned. A returning agent registers as new. (The retention job's removal of long-offline
   agents is still a hard delete.)
+- Labels (`agents.labels`, `internal/api/labels.go`, `Registry.SetLabels`): name=value tags people put on a collector.
+  The `agents_merge_labels` trigger mirrors them into `attributes` as `label.<key>` on every write of either column
+  and strips that prefix from what a collector reports, so selectors, groups, facets, filters, search, exports and
+  rollouts handle labels with no code of their own, and a collector cannot label itself. `PUT /agents/{uid}/labels`
+  replaces the set; bulk action `label` (`labels: {set, remove}`) patches it. Operator in the agent's project; max 20.
+  Schema changes are still squashed into `000001_init`; apply the delta by hand to the dev and `opamp_test` databases.

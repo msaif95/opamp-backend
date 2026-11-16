@@ -2,6 +2,8 @@ DROP TABLE IF EXISTS deleted_agents;
 DROP TABLE IF EXISTS bridge_collector_configs;
 DROP TABLE IF EXISTS fleet_samples;
 DROP TABLE IF EXISTS secrets;
+DROP TRIGGER IF EXISTS agents_merge_labels ON agents;
+DROP FUNCTION IF EXISTS agents_merge_labels();
 DROP TRIGGER IF EXISTS agents_record_events_update ON agents;
 DROP TRIGGER IF EXISTS agents_record_events_insert ON agents;
 DROP FUNCTION IF EXISTS record_agent_events();

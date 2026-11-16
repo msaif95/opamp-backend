@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -217,6 +218,62 @@ func TestDeleteOnlyOffline(t *testing.T) {
 	}
 	if _, err := r.Delete(ctx, uid, "root"); !errors.Is(err, registry.ErrNotFound) {
 		t.Errorf("deleting twice: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestLabels(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	uid, other := uuid.New(), uuid.New()
+	// A collector cannot give itself a label: the reserved prefix is dropped from what it reports.
+	mustReport(t, r, uid, fullReport("host-1", kv("env", "prod"), kv("label.owner", "mallory")))
+	mustReport(t, r, other, fullReport("host-2", kv("env", "prod")))
+	if a, _ := r.Get(ctx, uid); a.Attributes["label.owner"] != "" || len(a.Labels) != 0 {
+		t.Fatalf("reported label kept: attributes %v, labels %v", a.Attributes, a.Labels)
+	}
+
+	labels, err := r.SetLabels(ctx, uid, map[string]string{"owner": "alice", "canary": "true"}, nil, false)
+	if err != nil || labels["owner"] != "alice" || len(labels) != 2 {
+		t.Fatalf("set = %v, %v", labels, err)
+	}
+	a, _ := r.Get(ctx, uid)
+	if a.Labels["owner"] != "alice" || a.Attributes["label.owner"] != "alice" || a.Attributes["env"] != "prod" {
+		t.Errorf("after set: labels %v, attributes %v", a.Labels, a.Attributes)
+	}
+	// Labels select agents like any attribute.
+	list, total, err := r.List(ctx, registry.ListFilter{Attributes: map[string]string{"label.owner": "alice"}})
+	if err != nil || total != 1 || list[0].InstanceUID != uid {
+		t.Errorf("selecting by label: %d agents, err %v", total, err)
+	}
+	// What the collector reports next replaces its attributes but not the labels.
+	mustReport(t, r, uid, fullReport("host-1", kv("env", "staging"), kv("label.owner", "mallory")))
+	a, _ = r.Get(ctx, uid)
+	if a.Attributes["env"] != "staging" || a.Attributes["label.owner"] != "alice" || a.Attributes["label.canary"] != "true" {
+		t.Errorf("after a new report: attributes %v", a.Attributes)
+	}
+
+	// Adding and removing leaves the rest; replacing sets the whole set.
+	labels, _ = r.SetLabels(ctx, uid, map[string]string{"owner": "bob"}, []string{"canary"}, false)
+	if len(labels) != 1 || labels["owner"] != "bob" {
+		t.Errorf("patch = %v", labels)
+	}
+	if a, _ := r.Get(ctx, uid); a.Attributes["label.canary"] != "" || a.Attributes["label.owner"] != "bob" {
+		t.Errorf("after patch: attributes %v", a.Attributes)
+	}
+	labels, _ = r.SetLabels(ctx, uid, map[string]string{"tier": "gold"}, nil, true)
+	if len(labels) != 1 || labels["tier"] != "gold" {
+		t.Errorf("replace = %v", labels)
+	}
+
+	many := map[string]string{}
+	for i := range registry.MaxLabels {
+		many["k"+strconv.Itoa(i)] = "v"
+	}
+	if _, err := r.SetLabels(ctx, uid, many, nil, false); !errors.Is(err, registry.ErrTooManyLabels) {
+		t.Errorf("21 labels: err = %v, want ErrTooManyLabels", err)
+	}
+	if _, err := r.SetLabels(ctx, uuid.New(), map[string]string{"a": "b"}, nil, false); !errors.Is(err, registry.ErrNotFound) {
+		t.Errorf("unknown agent: err = %v, want ErrNotFound", err)
 	}
 }
 

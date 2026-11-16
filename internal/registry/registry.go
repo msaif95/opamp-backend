@@ -67,10 +67,13 @@ type ConfigState struct {
 type Agent struct {
 	InstanceUID uuid.UUID `json:"instance_uid"`
 	// ProjectID is the project the collector belongs to; nil means unassigned.
-	ProjectID              *uuid.UUID        `json:"project_id"`
-	ConnectorType          string            `json:"connector_type"`
-	AuthMode               string            `json:"auth_mode"`
-	Attributes             map[string]string `json:"attributes"`
+	ProjectID     *uuid.UUID        `json:"project_id"`
+	ConnectorType string            `json:"connector_type"`
+	AuthMode      string            `json:"auth_mode"`
+	Attributes    map[string]string `json:"attributes"`
+	// Labels are put on the collector by people in the console. Each also
+	// appears in Attributes as "label.<key>", which is what selectors match.
+	Labels                 map[string]string `json:"labels"`
 	Capabilities           uint64            `json:"capabilities"`
 	AgentVersion           *string           `json:"agent_version"`
 	Healthy                *bool             `json:"healthy"`
@@ -608,6 +611,47 @@ func (r *Registry) SetProject(ctx context.Context, uid uuid.UUID, project *uuid.
 	return nil
 }
 
+// MaxLabels is how many labels one agent may carry.
+const MaxLabels = 20
+
+// LabelPrefix is put before a label's key where it appears among an agent's attributes.
+const LabelPrefix = "label."
+
+// ErrTooManyLabels is returned when a change would leave an agent with more than MaxLabels labels.
+var ErrTooManyLabels = fmt.Errorf("a collector can carry at most %d labels", MaxLabels)
+
+// SetLabels changes the labels people have put on an agent and returns the
+// result. With replace, set becomes the whole set; otherwise the keys in
+// remove are dropped and those in set added or overwritten. The database
+// mirrors labels into the agent's attributes as "label.<key>".
+func (r *Registry) SetLabels(ctx context.Context, uid uuid.UUID, set map[string]string, remove []string, replace bool) (map[string]string, error) {
+	if set == nil {
+		set = map[string]string{}
+	}
+	if remove == nil {
+		remove = []string{}
+	}
+	add, _ := json.Marshal(set)
+	const next = `CASE WHEN $4 THEN $2::jsonb ELSE (labels - $3::text[]) || $2::jsonb END`
+	var raw []byte
+	err := r.db.QueryRow(ctx, `
+UPDATE agents SET labels = `+next+`
+WHERE instance_uid = $1 AND (SELECT count(*) FROM jsonb_object_keys(`+next+`)) <= $5
+RETURNING labels`, uid, add, remove, replace, MaxLabels).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := r.ProjectOf(ctx, uid); err != nil {
+			return nil, err
+		}
+		return nil, ErrTooManyLabels
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.publish(ctx, "agent.updated", uid)
+	var labels map[string]string
+	return labels, json.Unmarshal(raw, &labels)
+}
+
 // ErrBridge is returned for actions that apply to a single collector when the agent is a Kubernetes OpAMP Bridge.
 var ErrBridge = errors.New("this is a Kubernetes OpAMP Bridge: assign configs to its collectors on its Kubernetes tab")
 
@@ -890,7 +934,7 @@ const agentColumns = `instance_uid, connector_type::text, auth_mode::text, attri
     healthy, health_status, health_last_error, effective_config_hash, remote_config_hash,
     remote_config_status::text, remote_config_error, desired_config_version_id, connected, first_seen, last_seen,
     cv.template_id, ct.name, cv.version, a.paused, a.project_id,
-    COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE)`
+    COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE), a.labels`
 
 const agentFrom = ` FROM agents a
     LEFT JOIN config_versions cv ON cv.id = a.desired_config_version_id
@@ -1204,6 +1248,7 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	var (
 		a        Agent
 		attrs    []byte
+		labels   []byte
 		caps     int64
 		tmplID   *uuid.UUID
 		tmplName *string
@@ -1213,7 +1258,7 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	err := row.Scan(&a.InstanceUID, &a.ConnectorType, &a.AuthMode, &attrs, &caps, &a.AgentVersion,
 		&a.Healthy, &a.HealthStatus, &a.HealthLastError, &a.EffectiveConfigHash, &a.RemoteConfigHash,
 		&a.RemoteConfigStatus, &a.RemoteConfigError, &a.DesiredConfigVersionID, &a.Connected, &a.FirstSeen, &a.LastSeen,
-		&tmplID, &tmplName, &version, &a.Paused, &a.ProjectID, &inSync)
+		&tmplID, &tmplName, &version, &a.Paused, &a.ProjectID, &inSync, &labels)
 	if err != nil {
 		return a, err
 	}
@@ -1222,6 +1267,9 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 			TemplateName: *tmplName, Version: *version, InSync: inSync}
 	}
 	a.Capabilities = uint64(caps)
+	if err := json.Unmarshal(labels, &a.Labels); err != nil {
+		return a, err
+	}
 	return a, json.Unmarshal(attrs, &a.Attributes)
 }
 

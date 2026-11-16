@@ -53,13 +53,28 @@ func (s *Server) bulkAgents(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Action       string      `json:"action"`
 		InstanceUIDs []uuid.UUID `json:"instance_uids"`
+		// Labels is the change to make when the action is "label".
+		Labels labelChange `json:"labels"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
 	do, ok := agentActions[req.Action]
+	if req.Action == "label" {
+		if err := req.Labels.validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if len(req.Labels.Set)+len(req.Labels.Remove) == 0 {
+			writeError(w, http.StatusBadRequest, "labels must set or remove at least one label")
+			return
+		}
+		do, ok = func(s *Server, ctx context.Context, uid uuid.UUID, d map[string]any) (int, string) {
+			return s.labelOne(ctx, uid, req.Labels, false, d)
+		}, true
+	}
 	if !ok {
-		writeError(w, http.StatusBadRequest, "action must be restart, pause, resume or delete")
+		writeError(w, http.StatusBadRequest, "action must be restart, pause, resume, delete or label")
 		return
 	}
 	if len(req.InstanceUIDs) == 0 || len(req.InstanceUIDs) > maxBulkAgents {
