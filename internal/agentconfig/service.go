@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,14 @@ var (
 	ErrNameTaken = errors.New("a config with this name already exists")
 	ErrUnchanged = errors.New("body is identical to the latest version")
 	ErrInUse     = errors.New("config is assigned to agents or referenced by rollouts")
+	// ErrDerived is returned when a derived config is given a whole body instead of overrides.
+	ErrDerived = errors.New("this config is derived from a base config: change its overrides, or the base, rather than the whole text")
+	// ErrNotDerived is returned for derived-config operations on an ordinary config.
+	ErrNotDerived = errors.New("this config is not derived from a base config")
+	// ErrBase covers bases that cannot be used: in another project, or themselves derived.
+	ErrBase = errors.New("the base must be an ordinary config in the same project (a derived config cannot be a base)")
+	// ErrHasDerived is returned when deleting a base that other configs are derived from.
+	ErrHasDerived = errors.New("other configs are derived from this one; delete or re-create them first")
 )
 
 const versionCacheN = 256
@@ -48,11 +57,33 @@ type Template struct {
 	Description   string     `json:"description"`
 	Origin        string     `json:"origin"`
 	LatestVersion int        `json:"latest_version"`
-	AssignedCount int        `json:"assigned_agents"`
+	// Base is set for a derived config: the config it takes its body from.
+	Base *BaseRef `json:"base"`
+	// Derived lists the configs derived from this one. Only populated by Service.Get.
+	Derived       []DerivedRef `json:"derived,omitempty"`
+	AssignedCount int          `json:"assigned_agents"`
 	// AssignedByVersion maps a version number to the agents assigned to it.
 	AssignedByVersion map[int]int `json:"assigned_by_version"`
 	CreatedAt         time.Time   `json:"created_at"`
 	UpdatedAt         time.Time   `json:"updated_at"`
+}
+
+// BaseRef names the base of a derived config.
+type BaseRef struct {
+	ID            uuid.UUID `json:"id"`
+	Name          string    `json:"name"`
+	LatestVersion int       `json:"latest_version"`
+}
+
+// DerivedRef is a config derived from another.
+type DerivedRef struct {
+	ID            uuid.UUID `json:"id"`
+	Name          string    `json:"name"`
+	LatestVersion int       `json:"latest_version"`
+	// BaseVersion is the base version its latest version was built from.
+	BaseVersion int `json:"base_version"`
+	// UpToDate is whether rebuilding it from the base's latest version would change nothing.
+	UpToDate bool `json:"up_to_date"`
 }
 
 // Version is one immutable revision of a template.
@@ -69,6 +100,10 @@ type Version struct {
 	// BuilderSpec is the pipeline as built in the config builder, if this
 	// version was made there. Only populated when the body is.
 	BuilderSpec json.RawMessage `json:"builder_spec,omitempty"`
+	// BaseVersion is the base version a derived config's version was built
+	// from; Overrides what was laid over it (only populated when the body is).
+	BaseVersion *int   `json:"base_version"`
+	Overrides   string `json:"overrides,omitempty"`
 	// AssignedCount is only populated by Service.Get.
 	AssignedCount int       `json:"assigned_agents,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -129,8 +164,11 @@ func (s *Service) AddVersion(ctx context.Context, templateID uuid.UUID, body, de
 	defer tx.Rollback(ctx)
 
 	// Lock the template row so concurrent saves get distinct version numbers.
-	var origin string
-	err = tx.QueryRow(ctx, `SELECT origin::text FROM config_templates WHERE id = $1 FOR UPDATE`, templateID).Scan(&origin)
+	var (
+		origin string
+		base   *uuid.UUID
+	)
+	err = tx.QueryRow(ctx, `SELECT origin::text, base_template_id FROM config_templates WHERE id = $1 FOR UPDATE`, templateID).Scan(&origin, &base)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -139,6 +177,9 @@ func (s *Service) AddVersion(ctx context.Context, templateID uuid.UUID, body, de
 	}
 	if origin == OriginGit {
 		return nil, ErrReadOnly
+	}
+	if base != nil {
+		return nil, ErrDerived
 	}
 
 	var (
@@ -182,17 +223,25 @@ SELECT t.id, t.name, COALESCE(t.description, ''), t.origin::text,
        COALESCE((SELECT jsonb_object_agg(version, n) FROM (
            SELECT v.version, count(*) AS n FROM agents a JOIN config_versions v ON v.id = a.desired_config_version_id
            WHERE v.template_id = t.id GROUP BY v.version) c), '{}'::jsonb),
-       t.created_at, t.updated_at, t.project_id
-FROM config_templates t`
+       t.created_at, t.updated_at, t.project_id,
+       t.base_template_id, b.name, COALESCE((SELECT max(version) FROM config_versions v WHERE v.template_id = b.id), 0)
+FROM config_templates t LEFT JOIN config_templates b ON b.id = t.base_template_id`
 
 func scanTemplate(row pgx.CollectableRow) (Template, error) {
 	var (
-		t        Template
-		assigned []byte
+		t          Template
+		assigned   []byte
+		baseID     *uuid.UUID
+		baseName   *string
+		baseLatest int
 	)
-	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &assigned, &t.CreatedAt, &t.UpdatedAt, &t.ProjectID)
+	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.Origin, &t.LatestVersion, &assigned, &t.CreatedAt, &t.UpdatedAt, &t.ProjectID,
+		&baseID, &baseName, &baseLatest)
 	if err != nil {
 		return t, err
+	}
+	if baseID != nil {
+		t.Base = &BaseRef{ID: *baseID, Name: *baseName, LatestVersion: baseLatest}
 	}
 	if err := json.Unmarshal(assigned, &t.AssignedByVersion); err != nil {
 		return t, err
@@ -246,19 +295,24 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Template, []Version, 
 		return nil, nil, err
 	}
 	versions, err := pgx.CollectRows(rows, scanVersion)
+	if err != nil {
+		return nil, nil, err
+	}
 	for i := range versions {
 		versions[i].AssignedCount = t.AssignedByVersion[versions[i].Version]
 	}
+	t.Derived, err = s.derived(ctx, s.db, id)
 	return &t, versions, err
 }
 
 func versionSelect(withBody bool) string {
-	body, spec := "''", "NULL::jsonb"
+	body, spec, overrides := "''", "NULL::jsonb", "''"
 	if withBody {
-		body, spec = "body", "builder_spec"
+		body, spec, overrides = "body", "builder_spec", "COALESCE(overrides, '')"
 	}
 	return `SELECT id, template_id, version, ` + body + `, body_hash, author, COALESCE(description, ''),
-       origin::text, git_commit_sha, created_at, ` + spec + ` FROM config_versions`
+       origin::text, git_commit_sha, created_at, ` + spec + `,
+       (SELECT bv.version FROM config_versions bv WHERE bv.id = config_versions.base_version_id) AS base_version, ` + overrides + ` FROM config_versions`
 }
 
 // nullableJSON stores an absent spec as SQL NULL rather than the JSON value null.
@@ -273,7 +327,7 @@ func scanVersion(row pgx.CollectableRow) (Version, error) {
 	var v Version
 	var spec []byte
 	err := row.Scan(&v.ID, &v.TemplateID, &v.Version, &v.Body, &v.BodyHash, &v.Author, &v.Description,
-		&v.Origin, &v.GitCommitSHA, &v.CreatedAt, &spec)
+		&v.Origin, &v.GitCommitSHA, &v.CreatedAt, &spec, &v.BaseVersion, &v.Overrides)
 	v.BuilderSpec = spec
 	return v, err
 }
@@ -328,6 +382,9 @@ DELETE FROM config_templates t WHERE t.id = $1 AND NOT EXISTS (
     SELECT 1 FROM agents a JOIN config_versions v ON v.id = a.desired_config_version_id WHERE v.template_id = t.id)`, id)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		if strings.Contains(pgErr.ConstraintName, "base_") {
+			return ErrHasDerived
+		}
 		return ErrInUse
 	}
 	if err != nil {

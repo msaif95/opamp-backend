@@ -84,12 +84,11 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		Builder *pipeline.Spec `json:"builder"`
 		// ProjectID is the project that will own the config; omit for unassigned.
 		ProjectID *uuid.UUID `json:"project_id"`
+		// BaseID makes this a derived config: its body is that config's, with Overrides laid over it.
+		BaseID    *uuid.UUID `json:"base_id"`
+		Overrides string     `json:"overrides"`
 	}
 	if !decode(w, r, &req) || !s.targetProject(w, r, req.ProjectID, auth.RoleOperator) {
-		return
-	}
-	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
-	if !ok {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
@@ -98,13 +97,36 @@ func (s *Server) createConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := auth.UserFrom(r.Context())
-	t, v, err := s.Configs.Create(r.Context(), req.ProjectID, req.Name, req.Description, req.Body, u.Subject, spec)
+	var (
+		t       *agentconfig.Template
+		v       *agentconfig.Version
+		err     error
+		details = map[string]any{}
+	)
+	if req.BaseID != nil {
+		if req.Body != "" || req.Builder != nil {
+			writeError(w, http.StatusBadRequest, "a derived config takes overrides, not a body or a builder pipeline")
+			return
+		}
+		// The base must be visible to the caller; the service checks it is in the same project.
+		if _, ok := s.allowConfig(w, r, *req.BaseID, auth.RoleViewer); !ok {
+			return
+		}
+		t, v, err = s.Configs.CreateDerived(r.Context(), req.ProjectID, req.Name, req.Description, *req.BaseID, req.Overrides, u.Subject)
+		details["base_id"] = req.BaseID
+	} else {
+		spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
+		if !ok {
+			return
+		}
+		t, v, err = s.Configs.Create(r.Context(), req.ProjectID, req.Name, req.Description, req.Body, u.Subject, spec)
+	}
 	if err != nil {
 		s.configError(w, r, err)
 		return
 	}
-	s.audit(r.Context(), u.Subject, u.Provider, "config.create", "config", t.ID.String(),
-		map[string]any{"name": t.Name, "version_id": v.ID})
+	details["name"], details["version_id"] = t.Name, v.ID
+	s.audit(r.Context(), u.Subject, u.Provider, "config.create", "config", t.ID.String(), details)
 	writeJSON(w, http.StatusCreated, map[string]any{"config": t, "version": v})
 }
 
@@ -117,6 +139,9 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 		Body        string         `json:"body"`
 		Description string         `json:"description"`
 		Builder     *pipeline.Spec `json:"builder"`
+		// Overrides is for a derived config: its new overrides. With neither
+		// this nor a body, a derived config is rebuilt from its base's latest version.
+		Overrides *string `json:"overrides"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -124,18 +149,30 @@ func (s *Server) addConfigVersion(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.allowConfig(w, r, id, auth.RoleOperator); !ok {
 		return
 	}
-	spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
-	if !ok {
-		return
-	}
 	u, _ := auth.UserFrom(r.Context())
-	v, err := s.Configs.AddVersion(r.Context(), id, req.Body, req.Description, u.Subject, spec)
+	var (
+		v       *agentconfig.Version
+		err     error
+		details = map[string]any{}
+	)
+	if req.Overrides != nil || (req.Body == "" && req.Builder == nil) {
+		v, err = s.Configs.AddDerivedVersion(r.Context(), id, req.Overrides, req.Description, u.Subject)
+		if v != nil {
+			details["base_version"], details["rebuilt_from_base"] = v.BaseVersion, req.Overrides == nil
+		}
+	} else {
+		spec, ok := s.renderBuilder(w, r, req.Builder, &req.Body)
+		if !ok {
+			return
+		}
+		v, err = s.Configs.AddVersion(r.Context(), id, req.Body, req.Description, u.Subject, spec)
+	}
 	if err != nil {
 		s.configError(w, r, err)
 		return
 	}
-	s.audit(r.Context(), u.Subject, u.Provider, "config.version.create", "config", id.String(),
-		map[string]any{"version": v.Version, "version_id": v.ID})
+	details["version"], details["version_id"] = v.Version, v.ID
+	s.audit(r.Context(), u.Subject, u.Provider, "config.version.create", "config", id.String(), details)
 	writeJSON(w, http.StatusCreated, v)
 }
 
@@ -212,7 +249,9 @@ func (s *Server) configError(w http.ResponseWriter, r *http.Request, err error) 
 	case errors.Is(err, agentconfig.ErrNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, agentconfig.ErrReadOnly), errors.Is(err, agentconfig.ErrNameTaken),
-		errors.Is(err, agentconfig.ErrUnchanged), errors.Is(err, agentconfig.ErrInUse):
+		errors.Is(err, agentconfig.ErrUnchanged), errors.Is(err, agentconfig.ErrInUse),
+		errors.Is(err, agentconfig.ErrDerived), errors.Is(err, agentconfig.ErrNotDerived),
+		errors.Is(err, agentconfig.ErrBase), errors.Is(err, agentconfig.ErrHasDerived):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
 		s.internal(w, r, err)
@@ -380,4 +419,51 @@ func (s *Server) allowLibraryItem(w http.ResponseWriter, r *http.Request, id uui
 		return false
 	}
 	return s.allow(w, r, project, auth.RoleOperator)
+}
+
+// mergeConfig shows what a config derived from a base with the given
+// overrides would be, with any issues, without saving anything.
+func (s *Server) mergeConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BaseID    uuid.UUID `json:"base_id"`
+		Overrides string    `json:"overrides"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if _, ok := s.allowConfig(w, r, req.BaseID, auth.RoleViewer); !ok {
+		return
+	}
+	body, baseVersion, issues, err := s.Configs.PreviewDerived(r.Context(), req.BaseID, req.Overrides)
+	if err != nil {
+		s.configError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"body": body, "base_version": baseVersion, "issues": nonNil(issues)})
+}
+
+// updateDerivedConfigs brings every config derived from this base up to
+// date with its latest version, making a new version of each that changes.
+func (s *Server) updateDerivedConfigs(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	// Derived configs are in the base's project, so its operators may change them all.
+	if _, ok := s.allowConfig(w, r, id, auth.RoleOperator); !ok {
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	results, err := s.Configs.UpdateDerived(r.Context(), id, u.Subject)
+	for _, res := range results {
+		if res.Version > 0 {
+			s.audit(r.Context(), u.Subject, u.Provider, "config.version.create", "config", res.ID.String(),
+				map[string]any{"version": res.Version, "rebuilt_from_base": true, "base_id": id})
+		}
+	}
+	if err != nil {
+		s.configError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": nonNil(results)})
 }

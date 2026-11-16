@@ -215,3 +215,11 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `next_run_at` in the transaction that stores the report, so replicas never double up. Reports are deployment-wide
   (the audit log has no project column). Pruned after `REPORT_RETENTION_DAYS` (400). New audit actions need a look
   at `Categorize`.
+- Config inheritance (`internal/agentconfig/inherit.go`, `merge.go`): a derived config has `base_template_id` and
+  each of its versions stores `base_version_id`, `overrides` and the full merged `body`, so pushes, hashes, diffs,
+  preview and reports need no knowledge of inheritance. `Merge` works on YAML nodes (keeps the base's order and
+  comments): mappings merge, values and lists are replaced, null removes a key. A derived config never follows its
+  base by itself: `AddDerivedVersion(overrides=nil)` / `POST /configs/{id}/versions {}` rebuilds one, and
+  `POST /configs/{id}/derived/update` rebuilds all of a base's, each making a new version only if its body changes
+  ("up to date" is decided by rebuilding and comparing hashes, not by version numbers). One level only, same
+  project, a base with derived configs cannot be deleted, and a derived config refuses a whole `body`.

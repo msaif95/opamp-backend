@@ -103,9 +103,14 @@ CREATE TABLE config_templates (
     description TEXT,
     origin      config_origin NOT NULL DEFAULT 'ui',
     git_path    TEXT,
+    -- A derived config: its versions are this base config's body with the
+    -- version's overrides laid over it. A base cannot be deleted while
+    -- configs are derived from it, and a base is never itself derived.
+    base_template_id UUID REFERENCES config_templates(id),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX config_templates_base_idx ON config_templates (base_template_id) WHERE base_template_id IS NOT NULL;
 
 -- Names only need to be unique within a project.
 CREATE UNIQUE INDEX config_templates_project_name_key
@@ -123,6 +128,11 @@ CREATE TABLE config_versions (
     git_commit_sha TEXT,
     -- The pipeline as built in the config builder; NULL for versions written as YAML.
     builder_spec   JSONB,
+    -- For a version of a derived config: the base version it was built from
+    -- and the overrides laid over it. body is always the full result, so
+    -- nothing downstream needs to know about inheritance.
+    base_version_id UUID REFERENCES config_versions(id),
+    overrides      TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (template_id, version)
 );

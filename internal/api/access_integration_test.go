@@ -257,6 +257,34 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("alice creates config in A", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML, "project_id": A})), 201)
 	h.expect("alice creates config in B (viewer)", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML, "project_id": B})), 403)
 	h.expect("alice creates config outside a project", first(h.call(alice, "POST", "/configs", map[string]any{"name": "mine", "body": collectorYAML})), 400)
+	// Derived configs: the base must be visible and in the same project; only overrides are sent.
+	h.expect("alice previews overrides on A's config", first(h.call(alice, "POST", "/configs/merge", map[string]any{"base_id": cA, "overrides": "exporters:\n  debug:\n    verbosity: detailed\n"})), 200)
+	h.expect("carol previews overrides on A's config", first(h.call(carol, "POST", "/configs/merge", map[string]any{"base_id": cA})), 404)
+	dcode, derived := h.call(alice, "POST", "/configs", map[string]any{"name": "cfg-a-prod", "project_id": A, "base_id": cA, "overrides": "exporters:\n  debug:\n    verbosity: detailed\n"})
+	h.expect("alice derives a config from A's", dcode, 201)
+	dID := derived["config"].(map[string]any)["id"].(string)
+	if body := derived["version"].(map[string]any)["body"].(string); !strings.Contains(body, "verbosity: detailed") || derived["config"].(map[string]any)["base"].(map[string]any)["id"] != cA {
+		t.Errorf("derived config = %v", derived)
+	}
+	h.expect("deriving in A from B's config", first(h.call(alice, "POST", "/configs", map[string]any{"name": "x", "project_id": A, "base_id": cB})), 409)
+	h.expect("deriving from a config alice cannot see", first(h.call(alice, "POST", "/configs", map[string]any{"name": "x", "project_id": A, "base_id": cU})), 404)
+	h.expect("a derived config given a whole body", first(h.call(alice, "POST", "/configs/"+dID+"/versions", map[string]any{"body": collectorYAML + "# x\n"})), 409)
+	h.expect("a derived config given new overrides", first(h.call(alice, "POST", "/configs/"+dID+"/versions", map[string]any{"overrides": "exporters:\n  debug:\n    verbosity: basic\n"})), 201)
+	h.expect("rebuilding it with nothing new in the base", first(h.call(alice, "POST", "/configs/"+dID+"/versions", map[string]any{})), 409)
+	h.expect("deleting a base that has derived configs", first(h.call(alice, "DELETE", "/configs/"+cA, nil)), 409)
+	h.expect("viewer updates B's derived configs", first(h.call(alice, "POST", "/configs/"+cB+"/derived/update", nil)), 403)
+	h.expect("admin changes the base", first(h.call(admin, "POST", "/configs/"+cA+"/versions", map[string]any{"body": collectorYAML + "# base moved on\n"})), 201)
+	_, baseNow := h.call(alice, "GET", "/configs/"+cA, nil)
+	if d := baseNow["config"].(map[string]any)["derived"].([]any); len(d) != 1 || d[0].(map[string]any)["up_to_date"] != false {
+		t.Errorf("derived list on the base = %v", d)
+	}
+	ucode, updated := h.call(alice, "POST", "/configs/"+cA+"/derived/update", nil)
+	h.expect("alice updates A's derived configs", ucode, 200)
+	if res := updated["results"].([]any); len(res) != 1 || res[0].(map[string]any)["version"].(float64) != 3 {
+		t.Errorf("update derived = %v", updated)
+	}
+	h.expect("alice deletes the derived config", first(h.call(alice, "DELETE", "/configs/"+dID, nil)), 204)
+
 	h.expect("alice edits config in B", first(h.call(alice, "POST", "/configs/"+cB+"/versions", map[string]any{"body": collectorYAML + "# x\n"})), 403)
 	h.expect("alice deletes unassigned config", first(h.call(alice, "DELETE", "/configs/"+cU, nil)), 404)
 	h.expect("bob (global viewer) creates unassigned config", first(h.call(bob, "POST", "/configs", map[string]any{"name": "b", "body": collectorYAML})), 400)
