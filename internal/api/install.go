@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/registry"
 )
 
 // DefaultCollectorVersion is offered when the caller does not pick one.
@@ -46,6 +47,9 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 		ExpiresDays int               `json:"expires_days"`
 		// ProjectID is the project the installed collectors will join; omit for unassigned.
 		ProjectID *uuid.UUID `json:"project_id"`
+		// Transport is "websocket" (the default) or "http" for plain HTTP
+		// polling, for networks whose proxies do not pass WebSockets.
+		Transport string `json:"transport"`
 	}{Version: DefaultCollectorVersion}
 	if !decode(w, r, &req) {
 		return
@@ -66,6 +70,9 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	case req.ExpiresDays < 0:
 		writeError(w, http.StatusBadRequest, "expires_days must be 0 or more")
+		return
+	case req.Transport != "" && req.Transport != registry.TransportWebSocket && req.Transport != registry.TransportHTTP:
+		writeError(w, http.StatusBadRequest, "transport must be websocket or http")
 		return
 	}
 	// Labels end up in a shell script and a YAML file; keep them to a safe alphabet.
@@ -99,11 +106,27 @@ func (s *Server) installCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), u.Subject, u.Provider, "agent.install_command", "credential", key.ID.String(),
-		map[string]any{"platform": req.Platform, "version": req.Version, "labels": req.Labels, "key_name": key.Name})
+		map[string]any{"platform": req.Platform, "version": req.Version, "labels": req.Labels, "key_name": key.Name, "transport": req.Transport})
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"script":     installScript(s.Install.EndpointURL, string(ca), key.Secret, req.Platform, req.Version, req.Labels),
+		"script":     installScript(endpointFor(s.Install.EndpointURL, req.Transport), string(ca), key.Secret, req.Platform, req.Version, req.Labels),
 		"api_key_id": key.ID,
 	})
+}
+
+// endpointFor returns the agent endpoint for a transport. The listener
+// serves both on the same address and path; the URL's scheme is what makes
+// a collector's OpAMP client open a WebSocket (ws, wss) or poll (http, https).
+func endpointFor(endpoint, transport string) string {
+	if transport != registry.TransportHTTP {
+		return endpoint
+	}
+	if rest, ok := strings.CutPrefix(endpoint, "wss://"); ok {
+		return "https://" + rest
+	}
+	if rest, ok := strings.CutPrefix(endpoint, "ws://"); ok {
+		return "http://" + rest
+	}
+	return endpoint
 }
 
 func installScript(endpoint, caPEM, apiKey, platform, version string, labels map[string]string) string {
@@ -124,7 +147,7 @@ func installScript(endpoint, caPEM, apiKey, platform, version string, labels map
 	}
 	tls, writeCA := "", ""
 	switch {
-	case strings.HasPrefix(endpoint, "ws://"):
+	case strings.HasPrefix(endpoint, "ws://"), strings.HasPrefix(endpoint, "http://"):
 		tls = "  tls:\n    insecure: true\n"
 	case caPEM != "":
 		tls = "  tls:\n    ca_file: __DIR__/ca.crt\n"

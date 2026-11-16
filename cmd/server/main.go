@@ -236,6 +236,7 @@ func run() error {
 		}
 	}
 	conns := connection.NewManager(agentAuth, handler, reg, log)
+	conns.PendingRestart = reg.TakePendingRestart
 	conns.Extra = map[string]http.Handler{throughput.IntakePath: tput, ownlogs.IntakePath: collectorLogs, owntraces.IntakePath: collectorTraces}
 
 	var tlsCfg *tls.Config

@@ -132,7 +132,11 @@ func (h *Handler) Handle(ctx context.Context, id registry.Identity, msg *protobu
 	case h.OwnMetrics != nil && msg.Capabilities&uint64(protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics) != 0:
 		resp.ConnectionSettings = h.OwnMetrics(uid)
 	}
-	if needFullState {
+	// An agent that comes back after being unknown or offline and does not
+	// describe itself is asked to: what is stored may no longer be true. On a
+	// WebSocket the caller sees this as a sequence gap; a polling agent has
+	// no connection to track, so it is decided here.
+	if needFullState || (state.Returned && msg.AgentDescription == nil) {
 		resp.Flags = uint64(protobufs.ServerToAgentFlags_ServerToAgentFlags_ReportFullState)
 	}
 	return uid, resp

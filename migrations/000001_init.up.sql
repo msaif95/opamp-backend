@@ -42,6 +42,10 @@ CREATE TABLE agents (
     -- The project of the API key the collector connects with; NULL means unassigned.
     project_id            UUID REFERENCES projects(id),
     connector_type        connector_type NOT NULL DEFAULT 'supervisor',
+    -- How the collector talks OpAMP: over a WebSocket it keeps open, or by
+    -- plain HTTP polling (for networks that block WebSockets). A polling
+    -- collector gets configs and commands with the answer to its next poll.
+    transport             TEXT NOT NULL DEFAULT 'websocket' CHECK (transport IN ('websocket', 'http')),
     auth_mode             auth_mode NOT NULL,
     credential_id         UUID,
     -- Flattened from AgentDescription for indexed querying.

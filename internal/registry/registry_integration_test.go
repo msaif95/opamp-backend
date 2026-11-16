@@ -277,6 +277,75 @@ func TestLabels(t *testing.T) {
 	}
 }
 
+func TestTransportAndPollingRestart(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	ws, poll := uuid.New(), uuid.New()
+	polling := registry.Identity{AuthMode: "api_key", Transport: registry.TransportHTTP}
+	mustReport(t, r, ws, fullReport("ws-host"))
+	st, err := r.Report(ctx, poll, polling, fullReport("poll-host"))
+	if err != nil || !st.Returned {
+		t.Fatalf("first poll: %+v, %v", st, err)
+	}
+	if a, _ := r.Get(ctx, ws); a.Transport != registry.TransportWebSocket {
+		t.Errorf("websocket agent stored as %q", a.Transport)
+	}
+	if a, _ := r.Get(ctx, poll); a.Transport != registry.TransportHTTP || !a.Connected {
+		t.Errorf("polling agent = %q, connected %v", a.Transport, a.Connected)
+	}
+
+	// Heartbeats by poll take the cheap path and keep the transport; a known agent is not "returned".
+	heartbeat := &protobufs.AgentToServer{Capabilities: acceptsRemoteConfig, SequenceNum: 2}
+	if _, err := db.Exec(ctx, `UPDATE agents SET last_seen = now() - interval '1 hour' WHERE instance_uid = $1`, poll); err != nil {
+		t.Fatal(err)
+	}
+	before := lastSeen(t, db, poll)
+	if st, err := r.Report(ctx, poll, polling, heartbeat); err != nil || st.Returned {
+		t.Fatalf("poll heartbeat: %+v, %v", st, err)
+	}
+	if !lastSeen(t, db, poll).Equal(before) {
+		t.Error("a poll heartbeat wrote to Postgres at once")
+	}
+	// The same agent switching to a WebSocket (the proxy was fixed) is noticed even on a heartbeat.
+	mustReport(t, r, poll, heartbeat)
+	if a, _ := r.Get(ctx, poll); a.Transport != registry.TransportWebSocket {
+		t.Errorf("transport after switching = %q", a.Transport)
+	}
+	if _, err := r.Report(ctx, poll, polling, heartbeat); err != nil {
+		t.Fatal(err)
+	}
+
+	// A heartbeat from an agent that had been marked offline brings it back and says so, so it can be asked for its full state.
+	if _, err := db.Exec(ctx, `UPDATE agents SET connected = FALSE WHERE instance_uid = $1`, poll); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := r.Report(ctx, poll, polling, heartbeat); err != nil || !st.Returned {
+		t.Errorf("returning agent: %+v, %v", st, err)
+	}
+
+	// A restart for a polling agent waits for its next poll and is handed over once.
+	if sent, err := r.RequestRestart(ctx, poll); err != nil || !sent {
+		t.Fatalf("request restart: %v, %v", sent, err)
+	}
+	if r.TakePendingRestart(ctx, ws) {
+		t.Error("another agent took the restart")
+	}
+	if !r.TakePendingRestart(ctx, poll) || r.TakePendingRestart(ctx, poll) {
+		t.Error("the waiting restart was not handed over exactly once")
+	}
+	// A WebSocket agent's restart goes to its replica instead and leaves nothing waiting.
+	if sent, err := r.RequestRestart(ctx, ws); err != nil || !sent || r.TakePendingRestart(ctx, ws) {
+		t.Errorf("websocket restart: sent %v, err %v", sent, err)
+	}
+	// An agent that stopped polling and was swept is not connected: nothing is queued for it.
+	if err := r.Disconnected(ctx, poll); err != nil {
+		t.Fatal(err)
+	}
+	if sent, _ := r.RequestRestart(ctx, poll); sent || r.TakePendingRestart(ctx, poll) {
+		t.Error("a restart was queued for an agent that is not connected")
+	}
+}
+
 func TestSweepSparesAgentsWithLiveRoute(t *testing.T) {
 	db, rdb := testdb.Open(t)
 	r := registry.New(db, rdb, "replica-a", time.Minute)

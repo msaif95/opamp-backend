@@ -75,6 +75,9 @@ type Manager struct {
 	disconnectErr *logthrottle.Throttle
 	// Extra handlers served on the agent listener next to the OpAMP endpoint. Set before Start.
 	Extra map[string]http.Handler
+	// PendingRestart, if set, reports (and clears) a restart waiting for an
+	// agent that uses HTTP polling. Set before Start.
+	PendingRestart func(ctx context.Context, uid uuid.UUID) bool
 
 	messages     metric.Int64Counter
 	handleTime   metric.Float64Histogram
@@ -196,8 +199,13 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 
 	// Plain HTTP polling "closes" after every message, so only WebSocket
 	// connections are tracked and trigger a disconnect on close. Polling
-	// agents are aged out by the registry's offline sweep.
+	// agents are aged out by the registry's offline sweep, and are sent what
+	// is waiting for them with the answer to each poll (see answerPoll).
 	persistent := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	id.Transport = registry.TransportHTTP
+	if persistent {
+		id.Transport = registry.TransportWebSocket
+	}
 
 	return types.ConnectionResponse{Accept: true, ConnectionCallbacks: types.ConnectionCallbacks{
 		OnConnected: func(_ context.Context, conn types.Connection) {
@@ -222,7 +230,10 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 			needFull := persistent && m.sequenceGap(conn, msg)
 			uid, resp := m.handler.Handle(ctx, id, msg, needFull)
 			trace.SpanFromContext(ctx).SetAttributes(attribute.String("opamp.instance_uid", uid.String()))
-			attrs := metric.WithAttributes(attribute.String("kind", kind))
+			if !persistent && uid != uuid.Nil {
+				m.answerPoll(ctx, uid, msg, resp)
+			}
+			attrs := metric.WithAttributes(attribute.String("kind", kind), attribute.String("transport", id.Transport))
 			m.messages.Add(ctx, 1, attrs)
 			m.handleTime.Record(ctx, time.Since(start).Seconds(), attrs)
 			if persistent && uid != uuid.Nil {
@@ -259,6 +270,28 @@ func (m *Manager) onConnecting(r *http.Request) types.ConnectionResponse {
 			}
 		},
 	}}
+}
+
+// answerPoll finishes the answer to an HTTP poll with what a WebSocket
+// agent would have been sent, or would have signalled, out of band.
+func (m *Manager) answerPoll(ctx context.Context, uid uuid.UUID, msg *protobufs.AgentToServer, resp *protobufs.ServerToAgent) {
+	// A polling agent has no connection whose closing shows it has gone; it says so in its last message.
+	if msg.AgentDisconnect != nil {
+		if err := m.reg.Disconnected(ctx, uid); err != nil {
+			m.disconnectErr.Do(func(suppressed int64) {
+				m.log.Error("mark agent disconnected", "instance_uid", uid, "err", err, "similar_errors_suppressed", suppressed)
+			})
+		}
+		return
+	}
+	if resp.ErrorResponse != nil || m.PendingRestart == nil || !m.PendingRestart(ctx, uid) {
+		return
+	}
+	// An agent acts on a command and ignores the rest of the message, so a
+	// config due in the same answer is left for the next poll, where it is
+	// offered again because the agent has not acknowledged it.
+	resp.Command = &protobufs.ServerToAgentCommand{Type: protobufs.CommandType_CommandType_Restart}
+	resp.RemoteConfig, resp.ConnectionSettings = nil, nil
 }
 
 // Push sends the agent its pending server-initiated message (currently its

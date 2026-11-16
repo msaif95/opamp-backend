@@ -223,3 +223,11 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `POST /configs/{id}/derived/update` rebuilds all of a base's, each making a new version only if its body changes
   ("up to date" is decided by rebuilding and comparing hashes, not by version numbers). One level only, same
   project, a base with derived configs cannot be deleted, and a derived config refuses a whole `body`.
+- HTTP polling transport: the OpAMP listener serves plain HTTP on the same path as WebSocket (opamp-go does both);
+  `agents.transport` (`websocket` | `http`) records which, from `Identity.Transport` set in `onConnecting`. A polling
+  agent has no tracked connection: configs ride on the answer to its next poll (already how `pendingConfig` works), a
+  restart waits in Redis (`opamp:pending-restart:<uid>`, 5 min TTL, `Registry.TakePendingRestart`) and goes out alone
+  on the next poll, `AgentDisconnect` in a poll marks it offline, otherwise the offline sweep does. A returning agent
+  that sends a bare heartbeat is asked for its full state (`ConfigState.Returned`). Keep the poll interval well under
+  `AGENT_OFFLINE_AFTER` (90s). `agentsim -url http://...` simulates polling agents (`-poll`); install scripts take
+  `transport: http`, which only swaps the endpoint scheme to http(s).

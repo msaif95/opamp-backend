@@ -67,3 +67,41 @@ func TestSecretsAreResolvedOnlyOnTheWayOut(t *testing.T) {
 		t.Fatalf("config sent despite an unresolved secret: %s", got.Config.ConfigMap[""].Body)
 	}
 }
+
+type fixedState struct{ st registry.ConfigState }
+
+func (f fixedState) Report(context.Context, uuid.UUID, registry.Identity, *protobufs.AgentToServer) (registry.ConfigState, error) {
+	return f.st, nil
+}
+func (f fixedState) ConfigState(context.Context, uuid.UUID) (registry.ConfigState, error) {
+	return f.st, nil
+}
+func (f fixedState) BridgeState(context.Context, uuid.UUID) (map[string]string, []byte, map[string]registry.BridgeAssignment, error) {
+	return nil, nil, nil, nil
+}
+
+// An agent that comes back without describing itself (a polling agent after
+// an outage, for instance) is asked for its full state; one that describes
+// itself, or was never away, is not.
+func TestReturningAgentIsAskedForFullState(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	uid := uuid.New()
+	full := uint64(protobufs.ServerToAgentFlags_ServerToAgentFlags_ReportFullState)
+	for name, tc := range map[string]struct {
+		returned, describes bool
+		want                uint64
+	}{
+		"came back with a bare heartbeat": {true, false, full},
+		"came back describing itself":     {true, true, 0},
+		"was never away":                  {false, false, 0},
+	} {
+		h := NewHandler(fixedState{registry.ConfigState{Returned: tc.returned}}, oneVersion{}, log)
+		msg := &protobufs.AgentToServer{InstanceUid: uid[:]}
+		if tc.describes {
+			msg.AgentDescription = &protobufs.AgentDescription{}
+		}
+		if _, resp := h.Handle(context.Background(), registry.Identity{}, msg, false); resp.Flags != tc.want {
+			t.Errorf("%s: flags = %d, want %d", name, resp.Flags, tc.want)
+		}
+	}
+}

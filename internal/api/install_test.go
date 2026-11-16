@@ -112,3 +112,21 @@ func TestInstallScriptIsPlatformSpecific(t *testing.T) {
 		}
 	}
 }
+
+func TestEndpointForTransport(t *testing.T) {
+	for _, tc := range [][3]string{
+		{"wss://opamp.example.com/v1/opamp", "http", "https://opamp.example.com/v1/opamp"},
+		{"ws://localhost:4320/v1/opamp", "http", "http://localhost:4320/v1/opamp"},
+		{"wss://opamp.example.com/v1/opamp", "websocket", "wss://opamp.example.com/v1/opamp"},
+		{"wss://opamp.example.com/v1/opamp", "", "wss://opamp.example.com/v1/opamp"},
+		{"https://opamp.example.com/v1/opamp", "http", "https://opamp.example.com/v1/opamp"},
+	} {
+		if got := endpointFor(tc[0], tc[1]); got != tc[2] {
+			t.Errorf("endpointFor(%q, %q) = %q, want %q", tc[0], tc[1], got, tc[2])
+		}
+	}
+	// A plaintext polling endpoint needs the same "insecure" setting as a plaintext WebSocket one.
+	if script := installScript("http://localhost:4320/v1/opamp", "", "k", "linux_amd64", "0.164.0", nil); !strings.Contains(script, "endpoint: http://localhost:4320/v1/opamp") || !strings.Contains(script, "insecure: true") {
+		t.Error("polling install script lacks the http endpoint or the insecure setting")
+	}
+}

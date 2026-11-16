@@ -41,6 +41,14 @@ var (
 	ErrRemoteConfigUnsupported = errors.New("agent does not accept remote config")
 )
 
+// OpAMP transports.
+const (
+	TransportWebSocket = "websocket"
+	// TransportHTTP is plain HTTP polling: the agent asks, the server
+	// answers, and nothing can be sent to the agent in between.
+	TransportHTTP = "http"
+)
+
 // DesiredConfig describes the config version assigned to an agent.
 type DesiredConfig struct {
 	VersionID    uuid.UUID `json:"version_id"`
@@ -61,16 +69,21 @@ type ConfigState struct {
 	Paused bool
 	// Bridge is true for a Kubernetes OpAMP Bridge, whose config is built per collector (see internal/k8sbridge).
 	Bridge bool
+	// Returned is true when this message brought back an agent that was
+	// unknown or marked offline, so what is stored about it may be stale.
+	Returned bool
 }
 
 // Agent is the API/storage representation of one collector instance.
 type Agent struct {
 	InstanceUID uuid.UUID `json:"instance_uid"`
 	// ProjectID is the project the collector belongs to; nil means unassigned.
-	ProjectID     *uuid.UUID        `json:"project_id"`
-	ConnectorType string            `json:"connector_type"`
-	AuthMode      string            `json:"auth_mode"`
-	Attributes    map[string]string `json:"attributes"`
+	ProjectID     *uuid.UUID `json:"project_id"`
+	ConnectorType string     `json:"connector_type"`
+	// Transport is websocket or http (polling); see the Transport constants.
+	Transport  string            `json:"transport"`
+	AuthMode   string            `json:"auth_mode"`
+	Attributes map[string]string `json:"attributes"`
 	// Labels are put on the collector by people in the console. Each also
 	// appears in Attributes as "label.<key>", which is what selectors match.
 	Labels                 map[string]string `json:"labels"`
@@ -105,6 +118,9 @@ type Event struct {
 type Identity struct {
 	AuthMode     string // mtls | api_key
 	CredentialID *uuid.UUID
+	// Transport is how the message arrived: TransportWebSocket or
+	// TransportHTTP. Empty is taken as WebSocket.
+	Transport string
 	// Set for mTLS: SHA-256 of the client certificate and its expiry.
 	CertFingerprint []byte
 	CertNotAfter    time.Time
@@ -203,17 +219,21 @@ func IsHeartbeat(msg *protobufs.AgentToServer) bool {
 // agent's liveness is recorded in Redis immediately and its last_seen is
 // written in batches. ok is false when the stored row cannot be trusted
 // (unknown agent, marked offline, or changed capabilities) and the caller
-// must fall back to the full upsert.
-func (r *Registry) heartbeat(ctx context.Context, uid uuid.UUID, msg *protobufs.AgentToServer) (st ConfigState, ok bool, err error) {
+// must fall back to the full upsert. So must a change of transport, which is stored.
+func (r *Registry) heartbeat(ctx context.Context, uid uuid.UUID, id Identity, msg *protobufs.AgentToServer) (st ConfigState, ok bool, err error) {
 	var (
 		caps      int64
 		connected bool
+		transport string
 	)
 	err = r.db.QueryRow(ctx, `
-SELECT capabilities, desired_config_version_id, remote_config_hash, connected, paused, connector_type = 'k8s_bridge'
+SELECT capabilities, desired_config_version_id, remote_config_hash, connected, paused, connector_type = 'k8s_bridge', transport
 FROM agents WHERE instance_uid = $1`,
-		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected, &st.Paused, &st.Bridge)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!connected || uint64(caps) != msg.Capabilities)) {
+		uid).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &connected, &st.Paused, &st.Bridge, &transport)
+	if id.Transport == "" {
+		id.Transport = TransportWebSocket
+	}
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!connected || uint64(caps) != msg.Capabilities || transport != id.Transport)) {
 		return st, false, nil
 	}
 	if err != nil {
@@ -279,14 +299,14 @@ INSERT INTO agents (
     healthy, health_status, health_last_error, health,
     effective_config_hash, effective_config,
     remote_config_hash, remote_config_status, remote_config_error,
-    connected, sequence_num, last_seen, project_id, connector_type, effective_files)
+    connected, sequence_num, last_seen, project_id, connector_type, effective_files, transport)
 VALUES (
     $1, $2::auth_mode, $3, COALESCE($4::jsonb, '{}'::jsonb), $5, $6,
     $7, $8, $9, $10::jsonb,
     $11, $12,
     $13, COALESCE($14::remote_config_status, 'unset'), $15,
     TRUE, $16, now(), (SELECT project_id FROM credentials WHERE id = $3),
-    COALESCE($17::connector_type, 'supervisor'), $18::jsonb)
+    COALESCE($17::connector_type, 'supervisor'), $18::jsonb, COALESCE(NULLIF($19, ''), 'websocket'))
 ON CONFLICT (instance_uid) DO UPDATE SET
     auth_mode             = EXCLUDED.auth_mode,
     credential_id         = EXCLUDED.credential_id,
@@ -310,6 +330,7 @@ ON CONFLICT (instance_uid) DO UPDATE SET
     remote_config_error   = CASE WHEN $14::remote_config_status IS NULL THEN agents.remote_config_error ELSE $15 END,
     connector_type        = COALESCE($17::connector_type, agents.connector_type),
     effective_files       = COALESCE($18::jsonb, agents.effective_files),
+    transport             = EXCLUDED.transport,
     connected             = TRUE,
     sequence_num          = EXCLUDED.sequence_num,
     last_seen             = now()
@@ -325,7 +346,7 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 	// database outage.
 	r.setRoute(ctx, uid)
 	if IsHeartbeat(msg) {
-		if st, ok, err := r.heartbeat(ctx, uid, msg); ok || err != nil {
+		if st, ok, err := r.heartbeat(ctx, uid, id, msg); ok || err != nil {
 			return st, err
 		}
 	}
@@ -381,11 +402,12 @@ func (r *Registry) Report(ctx context.Context, uid uuid.UUID, id Identity, msg *
 		healthy, healthStatus, healthErr, health,
 		effHash, effBody,
 		remoteHash, remoteStatus, remoteError,
-		int64(msg.SequenceNum), connector, effFiles).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &wasConnected, &st.Bridge)
+		int64(msg.SequenceNum), connector, effFiles, id.Transport).Scan(&caps, &st.DesiredConfigVersionID, &st.RemoteConfigHash, &st.Paused, &wasConnected, &st.Bridge)
 	if err != nil {
 		return st, fmt.Errorf("upsert agent %s: %w", uid, err)
 	}
 	st.Capabilities = uint64(caps)
+	st.Returned = !wasConnected
 
 	// Plain heartbeats only refresh last_seen; publishing them would make
 	// every UI refetch constantly at fleet scale.
@@ -794,16 +816,39 @@ FROM deleted_agents a WHERE `+cond+` ORDER BY a.deleted_at DESC, a.id DESC LIMIT
 	})
 }
 
-const restartPrefix = "restart:"
+const (
+	restartPrefix = "restart:"
+	// A restart for a polling agent waits here for its next poll. It is
+	// dropped if the agent does not poll within the TTL, so a restart is
+	// never delivered long after it was asked for.
+	pendingRestartPrefix = "opamp:pending-restart:"
+	pendingRestartTTL    = 5 * time.Minute
+)
 
-// RequestRestart asks the replica holding the agent's connection to send it
-// a restart command. It reports false when the agent has no live connection.
+// RequestRestart asks for the agent to be sent a restart command: at once,
+// by the replica holding its WebSocket, or with the answer to its next poll
+// if it uses HTTP polling. It reports false when the agent is not connected.
 func (r *Registry) RequestRestart(ctx context.Context, uid uuid.UUID) (bool, error) {
 	replica, err := r.Route(ctx, uid)
 	if err != nil || replica == "" {
 		return false, err
 	}
+	var transport string
+	if err := r.db.QueryRow(ctx, `SELECT transport FROM agents WHERE instance_uid = $1`, uid).Scan(&transport); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if transport == TransportHTTP {
+		return true, r.rdb.Set(ctx, pendingRestartPrefix+uid.String(), 1, pendingRestartTTL).Err()
+	}
 	return true, r.rdb.Publish(ctx, pushChanPrefix+replica, restartPrefix+uid.String()).Err()
+}
+
+// TakePendingRestart reports whether a restart is waiting for a polling
+// agent, and clears it: the caller must deliver it. Redis being unreachable
+// counts as nothing waiting; the request then expires undelivered.
+func (r *Registry) TakePendingRestart(ctx context.Context, uid uuid.UUID) bool {
+	v, err := r.rdb.GetDel(ctx, pendingRestartPrefix+uid.String()).Result()
+	return err == nil && v != ""
 }
 
 // SubscribePush calls fn, concurrently, for every push request addressed to
@@ -934,7 +979,7 @@ const agentColumns = `instance_uid, connector_type::text, auth_mode::text, attri
     healthy, health_status, health_last_error, effective_config_hash, remote_config_hash,
     remote_config_status::text, remote_config_error, desired_config_version_id, connected, first_seen, last_seen,
     cv.template_id, ct.name, cv.version, a.paused, a.project_id,
-    COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE), a.labels`
+    COALESCE(cv.body_hash = a.remote_config_hash AND a.remote_config_status = 'applied', FALSE), a.labels, a.transport`
 
 const agentFrom = ` FROM agents a
     LEFT JOIN config_versions cv ON cv.id = a.desired_config_version_id
@@ -1258,7 +1303,7 @@ func scanAgent(row pgx.CollectableRow) (Agent, error) {
 	err := row.Scan(&a.InstanceUID, &a.ConnectorType, &a.AuthMode, &attrs, &caps, &a.AgentVersion,
 		&a.Healthy, &a.HealthStatus, &a.HealthLastError, &a.EffectiveConfigHash, &a.RemoteConfigHash,
 		&a.RemoteConfigStatus, &a.RemoteConfigError, &a.DesiredConfigVersionID, &a.Connected, &a.FirstSeen, &a.LastSeen,
-		&tmplID, &tmplName, &version, &a.Paused, &a.ProjectID, &inSync, &labels)
+		&tmplID, &tmplName, &version, &a.Paused, &a.ProjectID, &inSync, &labels, &a.Transport)
 	if err != nil {
 		return a, err
 	}

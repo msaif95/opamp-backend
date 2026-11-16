@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/open-telemetry/opamp-go/client"
 	"github.com/open-telemetry/opamp-go/client/types"
 	"github.com/open-telemetry/opamp-go/protobufs"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
@@ -306,4 +308,142 @@ func TestRevokedCredentialDisconnectsLiveAgent(t *testing.T) {
 		t.Fatalf("revoked credential: closed %d connections, err %v", n, err)
 	}
 	eventually(t, "disconnect recorded", func() bool { _, d := reg.snapshot(); return len(d) >= 1 && d[0] == uid })
+}
+
+// pollOnce sends one AgentToServer over plain HTTP, as a polling agent does, and returns the answer.
+func pollOnce(t *testing.T, wsURL string, msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+	t.Helper()
+	body, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest("POST", "http"+strings.TrimPrefix(wsURL, "ws"), bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Authorization", "Bearer good")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		t.Fatalf("poll: HTTP %d: %s", res.StatusCode, raw)
+	}
+	var out protobufs.ServerToAgent
+	if err := proto.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return &out
+}
+
+// An agent on HTTP polling is served on the same endpoint: it is told apart
+// from a WebSocket agent, is never counted as a live connection, and gets
+// its config, a waiting restart and its goodbye through its polls.
+func TestHTTPPolling(t *testing.T) {
+	m, reg, url := startManager(t)
+	uid := uuid.New()
+	restartWaiting := false
+	m.PendingRestart = func(_ context.Context, got uuid.UUID) bool {
+		waiting := restartWaiting && got == uid
+		restartWaiting = false
+		return waiting
+	}
+	caps := uint64(protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus | protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig)
+	describe := &protobufs.AgentToServer{InstanceUid: uid[:], Capabilities: caps, AgentDescription: &protobufs.AgentDescription{}}
+
+	first := pollOnce(t, url, describe)
+	if first.RemoteConfig != nil || first.Command != nil || first.ErrorResponse != nil {
+		t.Fatalf("first answer = %v", first)
+	}
+	reports, _ := reg.snapshot()
+	if len(reports) != 1 || reports[0].id.Transport != registry.TransportHTTP || reports[0].id.AuthMode != "api_key" {
+		t.Fatalf("first report = %+v", reports)
+	}
+	if n := m.ConnectionCount(); n != 0 {
+		t.Errorf("a polling agent counted as %d live connections", n)
+	}
+
+	// A config assigned between polls arrives with the next poll, and is not repeated once acknowledged.
+	hash := []byte("hash-1")
+	reg.assign("receivers: {}\n", hash)
+	m.Push(context.Background(), uid) // nothing to push to: no connection
+	heartbeat := &protobufs.AgentToServer{InstanceUid: uid[:], Capabilities: caps, SequenceNum: 1}
+	second := pollOnce(t, url, heartbeat)
+	if second.RemoteConfig == nil || string(second.RemoteConfig.ConfigHash) != "hash-1" {
+		t.Fatalf("config not delivered on the next poll: %v", second)
+	}
+	applied := &protobufs.AgentToServer{InstanceUid: uid[:], Capabilities: caps, SequenceNum: 2,
+		RemoteConfigStatus: &protobufs.RemoteConfigStatus{LastRemoteConfigHash: hash, Status: protobufs.RemoteConfigStatuses_RemoteConfigStatuses_APPLIED}}
+	if third := pollOnce(t, url, applied); third.RemoteConfig != nil {
+		t.Errorf("config offered again after it was applied: %v", third)
+	}
+
+	// A waiting restart goes out alone; the config due with it follows on the poll after.
+	reg.assign("receivers: {otlp: {}}\n", []byte("hash-2"))
+	restartWaiting = true
+	withRestart := pollOnce(t, url, heartbeat)
+	if withRestart.Command == nil || withRestart.Command.Type != protobufs.CommandType_CommandType_Restart || withRestart.RemoteConfig != nil {
+		t.Fatalf("restart answer = %v", withRestart)
+	}
+	after := pollOnce(t, url, heartbeat)
+	if after.Command != nil || after.RemoteConfig == nil || string(after.RemoteConfig.ConfigHash) != "hash-2" {
+		t.Fatalf("answer after the restart = %v", after)
+	}
+
+	// Nothing marks a polling agent as gone until it says so (or stops polling and is swept).
+	if _, gone := reg.snapshot(); len(gone) != 0 {
+		t.Fatalf("polling agent marked disconnected between polls: %v", gone)
+	}
+	pollOnce(t, url, &protobufs.AgentToServer{InstanceUid: uid[:], Capabilities: caps, SequenceNum: 5, AgentDisconnect: &protobufs.AgentDisconnect{}})
+	if _, gone := reg.snapshot(); len(gone) != 1 || gone[0] != uid {
+		t.Errorf("goodbye not recorded: %v", gone)
+	}
+}
+
+// The stock OpAMP client library in polling mode works against the listener end to end.
+func TestHTTPPollingClientLibrary(t *testing.T) {
+	_, reg, url := startManager(t)
+	hash := []byte("hash-1")
+	reg.assign("receivers: {}\n", hash)
+	got := make(chan *protobufs.AgentRemoteConfig, 1)
+	c := client.NewHTTP(nil)
+	c.SetPollingInterval(20 * time.Millisecond)
+	caps := protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus | protobufs.AgentCapabilities_AgentCapabilities_AcceptsRemoteConfig
+	if err := c.SetAgentDescription(&protobufs.AgentDescription{IdentifyingAttributes: []*protobufs.KeyValue{{
+		Key: "service.name", Value: &protobufs.AnyValue{Value: &protobufs.AnyValue_StringValue{StringValue: "otelcol"}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetCapabilities(&caps); err != nil {
+		t.Fatal(err)
+	}
+	uid := uuid.New()
+	err := c.Start(context.Background(), types.StartSettings{
+		OpAMPServerURL: "http" + strings.TrimPrefix(url, "ws"),
+		Header:         http.Header{"Authorization": {"Bearer good"}},
+		InstanceUid:    types.InstanceUid(uid),
+		Callbacks: types.Callbacks{OnMessage: func(_ context.Context, msg *types.MessageData) {
+			if msg.RemoteConfig != nil {
+				select {
+				case got <- msg.RemoteConfig:
+				default:
+				}
+			}
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(context.Background())
+	select {
+	case cfg := <-got:
+		if string(cfg.ConfigHash) != "hash-1" {
+			t.Errorf("config hash = %q", cfg.ConfigHash)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the polling client never received its config")
+	}
+	reports, _ := reg.snapshot()
+	if reports[0].uid != uid || reports[0].id.Transport != registry.TransportHTTP || reports[0].attrs["service.name"] != "otelcol" {
+		t.Errorf("first report = %+v", reports[0])
+	}
 }

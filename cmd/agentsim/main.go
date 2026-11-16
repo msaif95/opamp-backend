@@ -40,7 +40,8 @@ service:
 `
 
 func main() {
-	url := flag.String("url", "ws://localhost:4320/v1/opamp", "OpAMP server URL")
+	url := flag.String("url", "ws://localhost:4320/v1/opamp", "OpAMP server URL; an http:// or https:// URL makes the agents use HTTP polling instead of a WebSocket")
+	poll := flag.Duration("poll", 10*time.Second, "polling interval for HTTP polling agents")
 	token := flag.String("token", os.Getenv("OPAMP_API_KEY"), "agent API key (or set OPAMP_API_KEY)")
 	n := flag.Int("n", 1, "number of simulated agents")
 	heartbeat := flag.Duration("heartbeat", 30*time.Second, "heartbeat interval")
@@ -131,7 +132,13 @@ func main() {
 		// Derived from the index so that re-running the simulator reconnects
 		// the same agents instead of creating new ones.
 		uid := uuid.NewSHA1(uuid.NameSpaceDNS, fmt.Appendf(nil, "agent%s-%d", *name, i))
-		c := client.NewWebSocket(nil)
+		// The URL's scheme picks the transport, as it does for a real Supervisor.
+		var c client.OpAMPClient = client.NewWebSocket(nil)
+		if strings.HasPrefix(*url, "http") {
+			polling := client.NewHTTP(nil)
+			polling.SetPollingInterval(*poll)
+			c = polling
+		}
 		region := regions[i%len(regions)]
 		must(c.SetAgentDescription(&protobufs.AgentDescription{
 			IdentifyingAttributes: []*protobufs.KeyValue{
