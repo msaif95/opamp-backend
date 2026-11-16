@@ -1,0 +1,100 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "checkout" } },
+          { "key": "deployment.environment", "value": { "stringValue": "prod" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "5b8efff798038103d269b633813fc60c",
+              "spanId": "eee19b7ec3c1b174",
+              "name": "POST /checkout",
+              "kind": 2,
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/checkout" } },
+                { "key": "http.status_code", "value": { "intValue": "200" } },
+                { "key": "user.email", "value": { "stringValue": "ana@example.com" } }
+              ]
+            },
+            {
+              "traceId": "5b8efff798038103d269b633813fc60c",
+              "spanId": "aaa19b7ec3c1b175",
+              "parentSpanId": "eee19b7ec3c1b174",
+              "name": "charge card",
+              "kind": 3,
+              "attributes": [{ "key": "payment.provider", "value": { "stringValue": "acme-pay" } }]
+            },
+            {
+              "traceId": "9d2c1e4a7b3f5d6e8a0b1c2d3e4f5a6b",
+              "spanId": "bbb19b7ec3c1b176",
+              "name": "POST /checkout",
+              "kind": 2,
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/checkout" } },
+                { "key": "http.status_code", "value": { "intValue": "402" } },
+                { "key": "user.email", "value": { "stringValue": "li@example.com" } }
+              ]
+            },
+            {
+              "traceId": "77aa66bb55cc44dd33ee22ff11009988",
+              "spanId": "ccc19b7ec3c1b177",
+              "name": "GET /healthz",
+              "kind": 2,
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/healthz" } },
+                { "key": "http.status_code", "value": { "intValue": "200" } }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "search" } },
+          { "key": "deployment.environment", "value": { "stringValue": "staging" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "spans": [
+            {
+              "traceId": "1f0e9d8c7b6a5f4e3d2c1b0a99887766",
+              "spanId": "ddd19b7ec3c1b178",
+              "name": "GET /search",
+              "kind": 2,
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/search" } },
+                { "key": "http.status_code", "value": { "intValue": "200" } }
+              ]
+            },
+            {
+              "traceId": "1f0e9d8c7b6a5f4e3d2c1b0a99887766",
+              "spanId": "fff19b7ec3c1b179",
+              "parentSpanId": "ddd19b7ec3c1b178",
+              "name": "query index",
+              "kind": 3,
+              "attributes": [{ "key": "db.system", "value": { "stringValue": "opensearch" } }]
+            },
+            {
+              "traceId": "c4b3a2918070605040302010ffeeddcc",
+              "spanId": "11119b7ec3c1b17a",
+              "name": "GET /search",
+              "kind": 2,
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/search" } },
+                { "key": "http.status_code", "value": { "intValue": "503" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

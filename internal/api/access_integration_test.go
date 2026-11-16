@@ -340,6 +340,28 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("bob reads a2's record", first(h.call(bob, "GET", "/agents/deleted/"+recA, nil)), 404)
 	h.expect("a record that does not exist", first(h.call(admin, "GET", "/agents/deleted/999999", nil)), 404)
 
+	// --- Preview works on what the caller sends, so anyone signed in may use it; nothing is stored.
+	pcode, pv := h.call(carol, "POST", "/configs/preview", map[string]any{"body": collectorYAML})
+	h.expect("carol previews a config", pcode, 200)
+	if pv["signal"] != "logs" || pv["in"].(float64) != 8 || pv["out"].(float64) != 8 || pv["exact"] != true {
+		t.Errorf("preview = %v", pv)
+	}
+	h.expect("preview of a signal the config lacks", first(h.call(carol, "POST", "/configs/preview", map[string]any{"body": collectorYAML, "signal": "traces"})), 400)
+	h.expect("preview of a builder pipeline with errors", first(h.call(alice, "POST", "/configs/preview", map[string]any{"builder": map[string]any{"sources": []any{}}})), 422)
+	bcode, bv := h.call(alice, "POST", "/configs/preview", map[string]any{"builder": map[string]any{
+		"sources":      []any{map[string]any{"type": "otlp"}},
+		"processors":   []any{map[string]any{"type": "drop_low_severity_logs", "params": map[string]any{"min_severity": "ERROR"}}},
+		"destinations": []any{map[string]any{"type": "debug"}},
+	}})
+	h.expect("alice previews a builder pipeline", bcode, 200)
+	if bv["out"].(float64) != 3 {
+		t.Errorf("builder preview keeps %v records, want 3 (two errors and one with no severity)", bv["out"])
+	}
+	_, smp := h.call(carol, "GET", "/configs/preview/samples", nil)
+	if s, _ := smp["traces"].(string); !strings.Contains(s, "resourceSpans") {
+		t.Errorf("samples = %.80v", smp)
+	}
+
 	// --- Groups and pushes stay inside their project, even with a selector that matches everywhere.
 	code, grp := h.call(alice, "POST", "/groups", map[string]any{"name": "prod", "project_id": A, "selector": map[string][]string{"env": {"prod"}}})
 	h.expect("alice creates group in A", code, 201)

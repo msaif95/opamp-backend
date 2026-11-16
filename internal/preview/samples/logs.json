@@ -1,0 +1,112 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "checkout" } },
+          { "key": "deployment.environment", "value": { "stringValue": "prod" } },
+          { "key": "host.name", "value": { "stringValue": "checkout-7d9f" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1767225600000000000",
+              "severityNumber": 5,
+              "severityText": "DEBUG",
+              "body": { "stringValue": "cart loaded from cache" },
+              "attributes": [
+                { "key": "cart.items", "value": { "intValue": "3" } },
+                { "key": "user.email", "value": { "stringValue": "ana@example.com" } }
+              ],
+              "traceId": "5b8efff798038103d269b633813fc60c"
+            },
+            {
+              "timeUnixNano": "1767225601000000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "body": { "stringValue": "order placed" },
+              "attributes": [
+                { "key": "order.id", "value": { "stringValue": "A-10293" } },
+                { "key": "user.email", "value": { "stringValue": "ana@example.com" } },
+                { "key": "http.route", "value": { "stringValue": "/checkout" } }
+              ],
+              "traceId": "5b8efff798038103d269b633813fc60c"
+            },
+            {
+              "timeUnixNano": "1767225602000000000",
+              "severityNumber": 13,
+              "severityText": "WARN",
+              "body": { "stringValue": "payment provider slow: 2.4s" },
+              "attributes": [
+                { "key": "payment.provider", "value": { "stringValue": "acme-pay" } },
+                { "key": "http.route", "value": { "stringValue": "/checkout" } }
+              ],
+              "traceId": "9d2c1e4a7b3f5d6e8a0b1c2d3e4f5a6b"
+            },
+            {
+              "timeUnixNano": "1767225603000000000",
+              "severityNumber": 17,
+              "severityText": "ERROR",
+              "body": { "stringValue": "payment declined" },
+              "attributes": [
+                { "key": "order.id", "value": { "stringValue": "A-10294" } },
+                { "key": "user.email", "value": { "stringValue": "li@example.com" } },
+                { "key": "http.status_code", "value": { "intValue": "402" } }
+              ],
+              "traceId": "9d2c1e4a7b3f5d6e8a0b1c2d3e4f5a6b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "search" } },
+          { "key": "deployment.environment", "value": { "stringValue": "staging" } },
+          { "key": "host.name", "value": { "stringValue": "search-2b41" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1767225604000000000",
+              "severityNumber": 1,
+              "severityText": "TRACE",
+              "body": { "stringValue": "query parsed" },
+              "attributes": [{ "key": "query.terms", "value": { "intValue": "2" } }],
+              "traceId": "1f0e9d8c7b6a5f4e3d2c1b0a99887766"
+            },
+            {
+              "timeUnixNano": "1767225605000000000",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "body": { "stringValue": "search served in 38ms" },
+              "attributes": [
+                { "key": "http.route", "value": { "stringValue": "/search" } },
+                { "key": "result.count", "value": { "intValue": "17" } }
+              ],
+              "traceId": "1f0e9d8c7b6a5f4e3d2c1b0a99887766"
+            },
+            {
+              "timeUnixNano": "1767225606000000000",
+              "severityNumber": 17,
+              "severityText": "ERROR",
+              "body": { "stringValue": "index shard unavailable" },
+              "attributes": [{ "key": "shard", "value": { "stringValue": "products-3" } }],
+              "traceId": "c4b3a2918070605040302010ffeeddcc"
+            },
+            {
+              "timeUnixNano": "1767225607000000000",
+              "body": { "stringValue": "plain line with no severity" },
+              "attributes": [{ "key": "log.file.name", "value": { "stringValue": "search.log" } }]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

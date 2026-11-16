@@ -199,3 +199,10 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   Per-token limits: `api_tokens.rate_limit_per_minute` / `write_limit_per_minute` (NULL = deployment default,
   0 = no limit), set at creation or with `PUT /auth/tokens/{id}/limits` (admin), read on every request by
   `Tokens.Authenticate` into `User.TokenLimits`. Agent API keys (collectors, OpAMP listener) are not rate limited.
+- Effect preview (`internal/preview`, `POST /configs/preview`, `GET /configs/preview/samples`; any signed-in user,
+  nothing stored, secrets never resolved): a built-in model of processors applied to sample telemetry (embedded
+  OTLP JSON in `samples/`, or the caller's own), not a real collector. Modelled: `resource` / `attributes`
+  insert-update-upsert-delete, `filter` with a small OTTL subset (`ottl.go`: field-vs-literal comparisons joined by
+  and/or), `probabilistic_sampler` (approximate), `batch` / `memory_limiter` (no effect). Anything else is reported
+  as `not_previewed` and passes data through; never guess. `TestEveryBuilderProcessorIsModelled` fails when a
+  processor is added to the builder catalog without a model here.

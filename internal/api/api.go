@@ -146,6 +146,8 @@ func (s *Server) Router() http.Handler {
 			r.Method(http.MethodGet, "/events", s.Events)
 			r.Get("/configs", s.listConfigs)
 			r.Post("/configs/validate", s.validateConfig)
+			r.Post("/configs/preview", s.previewConfig)
+			r.Get("/configs/preview/samples", s.previewSamples)
 			r.Get("/configs/builder/catalog", s.builderCatalog)
 			r.Post("/configs/builder/render", s.builderRender)
 			r.Get("/configs/builder/library", s.listLibrary)

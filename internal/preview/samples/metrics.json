@@ -1,0 +1,90 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "checkout" } },
+          { "key": "deployment.environment", "value": { "stringValue": "prod" } },
+          { "key": "host.name", "value": { "stringValue": "checkout-7d9f" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "http.server.request.count",
+              "unit": "1",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "asInt": "1284",
+                    "attributes": [
+                      { "key": "http.route", "value": { "stringValue": "/checkout" } },
+                      { "key": "http.status_code", "value": { "intValue": "200" } }
+                    ]
+                  },
+                  {
+                    "asInt": "37",
+                    "attributes": [
+                      { "key": "http.route", "value": { "stringValue": "/checkout" } },
+                      { "key": "http.status_code", "value": { "intValue": "402" } }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "process.memory.usage",
+              "unit": "By",
+              "gauge": {
+                "dataPoints": [{ "asDouble": 268435456, "attributes": [{ "key": "pod.uid", "value": { "stringValue": "7f3c-11aa" } }] }]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "search" } },
+          { "key": "deployment.environment", "value": { "stringValue": "staging" } },
+          { "key": "host.name", "value": { "stringValue": "search-2b41" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "http.server.request.count",
+              "unit": "1",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "asInt": "9120",
+                    "attributes": [
+                      { "key": "http.route", "value": { "stringValue": "/search" } },
+                      { "key": "http.status_code", "value": { "intValue": "200" } }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "search.query.duration",
+              "unit": "ms",
+              "histogram": {
+                "aggregationTemporality": 2,
+                "dataPoints": [{ "count": "9120", "sum": 346560, "attributes": [{ "key": "index", "value": { "stringValue": "products" } }] }]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
