@@ -34,16 +34,24 @@ func (s *Server) withScope(next http.Handler) http.Handler {
 // caller may not even view is reported as not found, so project contents
 // cannot be probed by ID.
 func (s *Server) allow(w http.ResponseWriter, r *http.Request, project *uuid.UUID, need auth.Role) bool {
-	scope := access.From(r.Context())
+	if status, msg := permit(r.Context(), project, need); status != 0 {
+		writeError(w, status, msg)
+		return false
+	}
+	return true
+}
+
+// permit is allow without the response: it returns 0, or the status and message of the refusal.
+func permit(ctx context.Context, project *uuid.UUID, need auth.Role) (int, string) {
+	scope := access.From(ctx)
 	switch {
 	case scope.Can(project, need):
-		return true
+		return 0, ""
 	case scope.Can(project, auth.RoleViewer):
-		writeError(w, http.StatusForbidden, "your role in this project does not allow this")
+		return http.StatusForbidden, "your role in this project does not allow this"
 	default:
-		writeError(w, http.StatusNotFound, "not found")
+		return http.StatusNotFound, "not found"
 	}
-	return false
 }
 
 // allowAgent loads the agent's project and checks the caller's role there.

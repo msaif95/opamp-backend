@@ -11,6 +11,8 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   `POST /api/v1/credentials/api-keys` (admin) or from the UI's Agent credentials page.
 - Migrations in `migrations/` are applied on startup (golang-migrate). The schema is a single `000001_init` pair
   (squashed before the first production deployment); from now on add new numbered files, never edit applied ones.
+  After squashing a later file into it, a database that already ran that file needs its marker put back:
+  `UPDATE schema_migrations SET version = 1` (the dev and `opamp_test` databases).
 - Layout: `internal/connection` (listener, auth on connect, live conn tracking), `internal/protocol` (message
   handling, OpAMP-only), `internal/registry` (Postgres agent state + Redis `opamp:route:<uid>` routing table and
   `opamp:agent-events` pub/sub), `internal/agentconfig` (config templates, immutable versions, YAML/pipeline validation;
@@ -172,3 +174,12 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Projects are soft-deleted (`projects.deleted_at`): `Projects.Delete` revokes the project's API keys and tokens,
   aborts its running rollouts and clears group configs in one transaction; memberships of deleted projects are
   ignored in `Resolve`, `Exists` is false, the name becomes reusable. Rows are never removed.
+- Agent actions (`internal/api/bulk.go`): restart, pause, resume and delete are `restartOne`/`pauseOne`/`deleteOne`,
+  returning a status and message; `agentAction` serves them for one agent and `POST /agents/bulk`
+  (`{action, instance_uids}`, max 500) for many, answering 200 with a result per agent. Add a new action to
+  `agentActions` so both get it. `DELETE /agents/{uid}` (operator) only removes offline agents (`Registry.Delete`,
+  409 while connected or holding a Redis route). It is a soft delete by archiving: the row moves from `agents` to
+  `deleted_agents` with its `agent_events` copied into `events`, in one statement, so none of
+  the many queries on `agents` needs a "not deleted" filter. `GET /agents/deleted` (and `/agents/deleted/{id}` with history and last config) lists the records by project
+  scope; they are never pruned. A returning agent registers as new. (The retention job's removal of long-offline
+  agents is still a hard delete.)

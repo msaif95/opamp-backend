@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS deleted_agents;
 DROP TABLE IF EXISTS bridge_collector_configs;
 DROP TABLE IF EXISTS fleet_samples;
 DROP TABLE IF EXISTS secrets;

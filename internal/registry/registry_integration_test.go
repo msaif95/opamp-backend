@@ -163,6 +163,63 @@ func TestDisconnectedOnlyByOwningReplica(t *testing.T) {
 	}
 }
 
+func TestDeleteOnlyOffline(t *testing.T) {
+	db, rdb := testdb.Open(t)
+	r := registry.New(db, rdb, "replica-a", time.Minute)
+	uid := uuid.New()
+	mustReport(t, r, uid, fullReport("host-1"))
+	if _, err := r.Delete(ctx, uid, "root"); !errors.Is(err, registry.ErrConnected) {
+		t.Fatalf("deleting a connected agent: err = %v, want ErrConnected", err)
+	}
+	// Marked offline in Postgres but still holding a route: a connection exists, so it stays.
+	if _, err := db.Exec(ctx, `UPDATE agents SET connected = FALSE WHERE instance_uid = $1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Delete(ctx, uid, "root"); !errors.Is(err, registry.ErrConnected) {
+		t.Fatalf("deleting an agent with a live route: err = %v, want ErrConnected", err)
+	}
+	mustReport(t, r, uid, fullReport("host-1"))
+	if err := r.Disconnected(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	host, err := r.Delete(ctx, uid, "root")
+	if err != nil || host != "host-1" {
+		t.Fatalf("delete = %q, %v", host, err)
+	}
+	if _, err := r.Get(ctx, uid); !errors.Is(err, registry.ErrNotFound) {
+		t.Errorf("deleted agent still readable: %v", err)
+	}
+	var events int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM agent_events WHERE instance_uid = $1`, uid).Scan(&events); err != nil || events != 0 {
+		t.Errorf("live history left behind: %d events, err %v", events, err)
+	}
+	// The record stays, with the history it had.
+	kept, err := r.ListDeleted(ctx, nil, 10)
+	if err != nil || len(kept) != 1 {
+		t.Fatalf("records kept = %v, %v; want 1", kept, err)
+	}
+	if k := kept[0]; k.InstanceUID != uid || k.HostName != "host-1" || k.DeletedBy != "root" || k.Events < 3 || k.Attributes["host.name"] != "host-1" {
+		t.Errorf("kept record = %+v", k)
+	}
+	// It is out of the fleet, and coming back registers it as new while the record remains.
+	if _, total, _ := r.List(ctx, registry.ListFilter{}); total != 0 {
+		t.Errorf("fleet still lists %d agents", total)
+	}
+	mustReport(t, r, uid, fullReport("host-1"))
+	if kept, _ := r.ListDeleted(ctx, nil, 10); len(kept) != 1 {
+		t.Errorf("records after re-registering = %d, want 1", len(kept))
+	}
+	if err := r.Disconnected(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Delete(ctx, uid, "root"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Delete(ctx, uid, "root"); !errors.Is(err, registry.ErrNotFound) {
+		t.Errorf("deleting twice: err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSweepSparesAgentsWithLiveRoute(t *testing.T) {
 	db, rdb := testdb.Open(t)
 	r := registry.New(db, rdb, "replica-a", time.Minute)

@@ -118,6 +118,8 @@ func (s *Server) Router() http.Handler {
 			r.Get("/rollouts/{id}", s.getRollout)
 			r.Get("/agents/{uid}", s.getAgent)
 			r.Get("/agents/export", s.exportAgents)
+			r.Get("/agents/deleted", s.deletedAgents)
+			r.Get("/agents/deleted/{id}", s.deletedAgent)
 			r.Get("/agents/breakdown", s.agentBreakdown)
 			r.Get("/summary/history", s.summaryHistory)
 			r.Get("/rollouts/{id}/batches", s.rolloutBatches)
@@ -149,9 +151,11 @@ func (s *Server) Router() http.Handler {
 			r.Post("/configs/{id}/versions", s.addConfigVersion)
 			r.Delete("/configs/{id}", s.deleteConfig)
 			r.Put("/agents/{uid}/config", s.assignConfig)
-			r.Post("/agents/{uid}/restart", s.restartAgent)
-			r.Post("/agents/{uid}/pause", s.pauseAgent(true))
-			r.Post("/agents/{uid}/resume", s.pauseAgent(false))
+			r.Post("/agents/{uid}/restart", s.agentAction("restart"))
+			r.Post("/agents/{uid}/pause", s.agentAction("pause"))
+			r.Post("/agents/{uid}/resume", s.agentAction("resume"))
+			r.Delete("/agents/{uid}", s.agentAction("delete"))
+			r.Post("/agents/bulk", s.bulkAgents)
 			r.Post("/groups", s.createGroup)
 			r.Put("/groups/{id}", s.updateGroup)
 			r.Put("/groups/{id}/config", s.setGroupConfig)
@@ -425,71 +429,6 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 		*registry.Agent
 		Throughput *throughput.Sample `json:"throughput"`
 	}{a, sample})
-}
-
-// restartAgent asks the collector's Supervisor to restart the collector process.
-func (s *Server) restartAgent(w http.ResponseWriter, r *http.Request) {
-	uid, ok := pathUUID(w, r, "uid")
-	if !ok {
-		return
-	}
-	a, err := s.Registry.Get(r.Context(), uid)
-	if errors.Is(err, registry.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "agent not found")
-		return
-	}
-	if err != nil {
-		s.internal(w, r, err)
-		return
-	}
-	if !s.allow(w, r, a.ProjectID, auth.RoleOperator) {
-		return
-	}
-	if a.Capabilities&capAcceptsRestart == 0 {
-		writeError(w, http.StatusConflict, "this collector does not accept restart commands (set accepts_restart_command: true in its Supervisor config)")
-		return
-	}
-	sent, err := s.Registry.RequestRestart(r.Context(), uid)
-	if err != nil {
-		s.internal(w, r, err)
-		return
-	}
-	if !sent {
-		writeError(w, http.StatusConflict, "the collector is not connected")
-		return
-	}
-	u, _ := auth.UserFrom(r.Context())
-	s.audit(r.Context(), u.Subject, u.Provider, "agent.restart", "agent", uid.String(), nil)
-	w.WriteHeader(http.StatusAccepted)
-}
-
-// pauseAgent stops (or resumes) collection on a collector without stopping the process.
-func (s *Server) pauseAgent(paused bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid, ok := pathUUID(w, r, "uid")
-		if !ok {
-			return
-		}
-		if _, ok := s.allowAgent(w, r, uid, auth.RoleOperator); !ok {
-			return
-		}
-		err := s.Registry.SetPaused(r.Context(), uid, paused)
-		switch {
-		case errors.Is(err, registry.ErrNotFound):
-			writeError(w, http.StatusNotFound, "agent not found")
-			return
-		case errors.Is(err, registry.ErrNoConfig), errors.Is(err, registry.ErrRemoteConfigUnsupported), errors.Is(err, registry.ErrBridge):
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		case err != nil:
-			s.internal(w, r, err)
-			return
-		}
-		action := map[bool]string{true: "agent.pause", false: "agent.resume"}[paused]
-		u, _ := auth.UserFrom(r.Context())
-		s.audit(r.Context(), u.Subject, u.Provider, action, "agent", uid.String(), nil)
-		w.WriteHeader(http.StatusNoContent)
-	}
 }
 
 // capAcceptsRestart is the OpAMP AcceptsRestartCommand capability bit.

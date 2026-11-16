@@ -640,6 +640,116 @@ UPDATE agents SET paused = $2 WHERE instance_uid = $1 AND capabilities & $3 <> 0
 	return r.RequestPush(ctx, uid)
 }
 
+// ErrConnected is returned when removing an agent that is still connected.
+var ErrConnected = errors.New("the collector is connected: it would register again at once. Stop it or revoke its credential first")
+
+// DeletedAgent is the record kept of a collector removed from the fleet.
+type DeletedAgent struct {
+	ID            int64             `json:"id"`
+	InstanceUID   uuid.UUID         `json:"instance_uid"`
+	ProjectID     *uuid.UUID        `json:"project_id"`
+	HostName      string            `json:"host_name"`
+	ConnectorType string            `json:"connector_type"`
+	AuthMode      string            `json:"auth_mode"`
+	Attributes    map[string]string `json:"attributes"`
+	AgentVersion  *string           `json:"agent_version"`
+	FirstSeen     time.Time         `json:"first_seen"`
+	LastSeen      time.Time         `json:"last_seen"`
+	// Events is how many history entries were kept with the record.
+	Events    int       `json:"events"`
+	DeletedAt time.Time `json:"deleted_at"`
+	DeletedBy string    `json:"deleted_by"`
+}
+
+// Delete removes an offline agent from the fleet and returns its host name.
+// It is a soft delete: the agent leaves the agents table, so nothing can
+// target or count it, and what it was is kept with its history in
+// deleted_agents. An agent that later connects again registers as new.
+func (r *Registry) Delete(ctx context.Context, uid uuid.UUID, by string) (host string, err error) {
+	// A live route means a connection exists even if Postgres has not caught up. Redis is best-effort.
+	if replica, _ := r.Route(ctx, uid); replica != "" {
+		return "", ErrConnected
+	}
+	// One statement: every part sees the same snapshot, so the history is
+	// copied before the delete cascades to it.
+	err = r.db.QueryRow(ctx, `
+WITH gone AS (DELETE FROM agents WHERE instance_uid = $1 AND NOT connected RETURNING *)
+INSERT INTO deleted_agents (instance_uid, project_id, host_name, connector_type, auth_mode, attributes, agent_version,
+                            effective_config, first_seen, last_seen, deleted_by, events)
+SELECT g.instance_uid, g.project_id, COALESCE(g.attributes->>'host.name', ''), g.connector_type::text, g.auth_mode::text,
+       g.attributes, g.agent_version, g.effective_config, g.first_seen, g.last_seen, $2,
+       COALESCE((SELECT jsonb_agg(jsonb_build_object('at', e.occurred_at, 'kind', e.kind, 'detail', e.detail) ORDER BY e.id)
+                 FROM agent_events e WHERE e.instance_uid = g.instance_uid), '[]'::jsonb)
+FROM gone g RETURNING host_name`, uid, by).Scan(&host)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err := r.ProjectOf(ctx, uid); err != nil {
+			return "", err
+		}
+		return "", ErrConnected
+	}
+	if err != nil {
+		return "", err
+	}
+	r.publish(ctx, "agent.deleted", uid)
+	return host, nil
+}
+
+// DeletedAgentDetail is a removed agent's record with everything kept of it.
+type DeletedAgentDetail struct {
+	DeletedAgent
+	EffectiveConfig *string `json:"effective_config"`
+	// History is the agent's history at the time it was removed, oldest first:
+	// objects with "at", "kind" and "detail" (see HistoryEvent for the kinds).
+	History json.RawMessage `json:"history"`
+}
+
+// GetDeleted returns one removed agent's record by record ID.
+func (r *Registry) GetDeleted(ctx context.Context, id int64) (*DeletedAgentDetail, error) {
+	var (
+		d              DeletedAgentDetail
+		attrs, history []byte
+	)
+	err := r.db.QueryRow(ctx, `
+SELECT id, instance_uid, project_id, host_name, connector_type, auth_mode, attributes, agent_version,
+       first_seen, last_seen, jsonb_array_length(events), deleted_at, deleted_by, effective_config, events
+FROM deleted_agents WHERE id = $1`, id).Scan(&d.ID, &d.InstanceUID, &d.ProjectID, &d.HostName, &d.ConnectorType, &d.AuthMode, &attrs,
+		&d.AgentVersion, &d.FirstSeen, &d.LastSeen, &d.Events, &d.DeletedAt, &d.DeletedBy, &d.EffectiveConfig, &history)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.History = history
+	return &d, json.Unmarshal(attrs, &d.Attributes)
+}
+
+// ListDeleted returns the records of removed agents the scope may view, newest first.
+func (r *Registry) ListDeleted(ctx context.Context, scope Scope, limit int) ([]DeletedAgent, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	cond, args := scopeWhere(scope, nil, []any{limit})
+	rows, err := r.db.Query(ctx, `
+SELECT a.id, a.instance_uid, a.project_id, a.host_name, a.connector_type, a.auth_mode, a.attributes, a.agent_version,
+       a.first_seen, a.last_seen, jsonb_array_length(a.events), a.deleted_at, a.deleted_by
+FROM deleted_agents a WHERE `+cond+` ORDER BY a.deleted_at DESC, a.id DESC LIMIT $1`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeletedAgent, error) {
+		var (
+			d     DeletedAgent
+			attrs []byte
+		)
+		if err := row.Scan(&d.ID, &d.InstanceUID, &d.ProjectID, &d.HostName, &d.ConnectorType, &d.AuthMode, &attrs, &d.AgentVersion,
+			&d.FirstSeen, &d.LastSeen, &d.Events, &d.DeletedAt, &d.DeletedBy); err != nil {
+			return d, err
+		}
+		return d, json.Unmarshal(attrs, &d.Attributes)
+	})
+}
+
 const restartPrefix = "restart:"
 
 // RequestRestart asks the replica holding the agent's connection to send it

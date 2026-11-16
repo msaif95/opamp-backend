@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +260,61 @@ func TestProjectAccess(t *testing.T) {
 	h.expect("alice assigns A config to A collector", first(h.call(alice, "PUT", "/agents/"+a1+"/config", map[string]any{"config_version_id": vA})), 204)
 	h.expect("alice assigns B config to A collector", first(h.call(alice, "PUT", "/agents/"+a1+"/config", map[string]any{"config_version_id": vB})), 409)
 	h.expect("alice assigns A config to B collector", first(h.call(alice, "PUT", "/agents/"+b1+"/config", map[string]any{"config_version_id": vA})), 403)
+
+	// --- Bulk actions judge every collector as the single endpoints do, and one refusal does not stop the rest.
+	a2, b2 := connect("a2", &A), connect("b2", &B)
+	bulk := func(token, action string, uids ...string) (map[string]int, float64) {
+		code, out := h.call(token, "POST", "/agents/bulk", map[string]any{"action": action, "instance_uids": uids})
+		h.expect("bulk "+action, code, 200)
+		got := map[string]int{}
+		for _, r := range out["results"].([]any) {
+			m := r.(map[string]any)
+			got[m["instance_uid"].(string)] = int(m["status"].(float64))
+		}
+		return got, out["succeeded"].(float64)
+	}
+	if got, _ := bulk(alice, "pause", a2, b2, u1); got[a2] != 409 || got[b2] != 403 || got[u1] != 404 {
+		t.Errorf("alice bulk pause (no config, viewer, invisible) = %v", got)
+	}
+	if got, _ := bulk(alice, "restart", a2, b2, u1); got[a2] != 409 || got[b2] != 403 || got[u1] != 404 {
+		t.Errorf("alice bulk restart = %v", got)
+	}
+	h.expect("bulk with an unknown action", first(h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "explode", "instance_uids": []string{a2}})), 400)
+	h.expect("bulk with no collectors", first(h.call(alice, "POST", "/agents/bulk", map[string]any{"action": "pause", "instance_uids": []string{}})), 400)
+	h.expect("alice removes a connected collector", first(h.call(alice, "DELETE", "/agents/"+a2, nil)), 409)
+	for _, uid := range []string{a2, b2} {
+		if err := reg.Disconnected(ctx, uuid.MustParse(uid)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, ok := bulk(alice, "delete", a2, b2, u1, a2); got[a2] != 204 || got[b2] != 403 || got[u1] != 404 || ok != 1 || len(got) != 3 {
+		t.Errorf("alice bulk delete = %v, %v succeeded", got, ok)
+	}
+	h.expect("the removed collector is gone", first(h.call(admin, "GET", "/agents/"+a2, nil)), 404)
+	h.expect("carol removes a collector she cannot see", first(h.call(carol, "DELETE", "/agents/"+b2, nil)), 404)
+	h.expect("admin removes B's offline collector", first(h.call(admin, "DELETE", "/agents/"+b2, nil)), 204)
+	// Removing keeps a record, visible by project like everything else.
+	for who, tc := range map[string]struct {
+		token string
+		want  []string
+	}{"admin": {admin, []string{"b2", "a2"}}, "alice": {alice, []string{"b2", "a2"}}, "bob": {bob, nil}, "carol": {carol, nil}} {
+		_, out := h.call(tc.token, "GET", "/agents/deleted", nil)
+		if got := names(out, "agents", "host_name"); !equal(got, tc.want) {
+			t.Errorf("%s sees removed collectors %v, want %v", who, got, tc.want)
+		}
+	}
+	_, removed := h.call(admin, "GET", "/agents/deleted", nil)
+	if m := removed["agents"].([]any)[1].(map[string]any); m["deleted_by"] != "alice@example.com" && m["deleted_by"] != "Alice@Example.com" {
+		t.Errorf("a2 removed by %v, want alice", m["deleted_by"])
+	}
+	recA := strconv.Itoa(int(removed["agents"].([]any)[1].(map[string]any)["id"].(float64)))
+	code, rec := h.call(alice, "GET", "/agents/deleted/"+recA, nil)
+	h.expect("alice reads a2's record", code, 200)
+	if hist, _ := rec["history"].([]any); rec["host_name"] != "a2" || len(hist) < 2 || hist[0].(map[string]any)["kind"] != "first_seen" {
+		t.Errorf("a2's record = %v", rec)
+	}
+	h.expect("bob reads a2's record", first(h.call(bob, "GET", "/agents/deleted/"+recA, nil)), 404)
+	h.expect("a record that does not exist", first(h.call(admin, "GET", "/agents/deleted/999999", nil)), 404)
 
 	// --- Groups and pushes stay inside their project, even with a selector that matches everywhere.
 	code, grp := h.call(alice, "POST", "/groups", map[string]any{"name": "prod", "project_id": A, "selector": map[string][]string{"env": {"prod"}}})

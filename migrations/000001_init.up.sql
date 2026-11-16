@@ -295,6 +295,32 @@ CREATE TABLE agent_events (
 CREATE INDEX agent_events_agent_idx ON agent_events (instance_uid, id DESC);
 CREATE INDEX agent_events_time_idx ON agent_events (occurred_at);
 
+-- Removed agents ---------------------------------------------------------
+-- Collectors removed from the fleet. Removing one takes its row out of
+-- `agents` (so nothing that targets, counts or pushes to agents can reach
+-- it) and keeps what it was here, with its history, as a record for audit.
+-- The same instance UID can appear more than once: a collector that
+-- connects again registers as new and may be removed again.
+CREATE TABLE deleted_agents (
+    id               BIGSERIAL PRIMARY KEY,
+    instance_uid     UUID NOT NULL,
+    project_id       UUID REFERENCES projects(id),
+    host_name        TEXT NOT NULL DEFAULT '',
+    connector_type   TEXT NOT NULL,
+    auth_mode        TEXT NOT NULL,
+    attributes       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    agent_version    TEXT,
+    effective_config TEXT,
+    first_seen       TIMESTAMPTZ NOT NULL,
+    last_seen        TIMESTAMPTZ NOT NULL,
+    -- The agent's history (agent_events) at the time it was removed, oldest first.
+    events           JSONB NOT NULL DEFAULT '[]'::jsonb,
+    deleted_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_by       TEXT NOT NULL
+);
+CREATE INDEX deleted_agents_time_idx ON deleted_agents (deleted_at DESC);
+CREATE INDEX deleted_agents_uid_idx ON deleted_agents (instance_uid);
+
 CREATE FUNCTION record_agent_events() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     cfg JSONB;
