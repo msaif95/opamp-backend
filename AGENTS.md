@@ -77,7 +77,7 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   from the System page. Each replica caches the values and refreshes on a Redis notification or every 5 s.
   Components take a `func() bool` gate rather than reading config. A switch can only turn on something the
   deployment configured (`Definition.Available`); agent TLS is `Locked`; the last working sign-in method cannot be
-  switched off. Add a new protection by adding a key, a `Definition` in `cmd/server/main.go` and UI copy in
+  switched off. Add a new protection by adding a key (also to `order` in `Store.List`, or the System page will not show it), a `Definition` in `cmd/server/main.go` and UI copy in
   `opamp-ui/src/features/system/System.tsx`.
 - Group configs ("fleets"): `PUT /api/v1/groups/{id}/config` starts a rollout to the group and records the version
   on the group. `rollout.Service.ReconcileGroups` (every engine tick) then gives it to matching agents that have no
@@ -189,3 +189,13 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   rollouts handle labels with no code of their own, and a collector cannot label itself. `PUT /agents/{uid}/labels`
   replaces the set; bulk action `label` (`labels: {set, remove}`) patches it. Operator in the agent's project; max 20.
   Schema changes are still squashed into `000001_init`; apply the delta by hand to the dev and `opamp_test` databases.
+- API rate limiting (`internal/ratelimit`, switch `api_rate_limit`): middleware after `Sessions.Require` on every
+  signed-in route, keyed by `provider:subject` (so a person's sessions share one budget and each API token has its
+  own). Two budgets per minute in Redis (`opamp:ratelimit:<budget>:<caller>:<minute>`, sliding estimate from the
+  current and previous minute): `API_RATE_LIMIT_PER_MINUTE` (1200) for everything and
+  `API_RATE_LIMIT_WRITES_PER_MINUTE` (120) for non-GET; 0 disables one. Refusals are 429 with `Retry-After` and
+  `RateLimit-*` headers and are not audited. Fails open when Redis is down. Sign-in routes are not covered (local
+  login has `LoginLimiter`). The decision is the pure `decide`; keep logic there.
+  Per-token limits: `api_tokens.rate_limit_per_minute` / `write_limit_per_minute` (NULL = deployment default,
+  0 = no limit), set at creation or with `PUT /auth/tokens/{id}/limits` (admin), read on every request by
+  `Tokens.Authenticate` into `User.TokenLimits`. Agent API keys (collectors, OpAMP listener) are not rate limited.

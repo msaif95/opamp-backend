@@ -36,7 +36,9 @@ type User struct {
 	Role     Role   `json:"role"`
 	// TokenProject is set for an API token bound to one project.
 	TokenProject *uuid.UUID `json:"-"`
-	sessionID    string
+	// TokenLimits are an API token's own rate limits, where it has any.
+	TokenLimits TokenLimits `json:"-"`
+	sessionID   string
 }
 
 type claims struct {

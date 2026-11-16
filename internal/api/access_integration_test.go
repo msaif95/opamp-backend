@@ -23,6 +23,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
+	"github.com/msaif95/opamp-backend/internal/ratelimit"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/secrets"
@@ -128,6 +129,8 @@ func TestProjectAccess(t *testing.T) {
 		DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollout.NewService(db, reg, log),
 		Agents: agents, Sessions: sessions, Groups: targeting.NewGroups(db), Events: http.NotFoundHandler(), Log: log,
 		Tokens: tokens, Projects: projects, Secrets: secretStore, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
+		// No deployment-wide budget: only tokens given their own are limited.
+		Limits:     ratelimit.New(rdb, 0, 0, log),
 		Throughput: func(context.Context, uuid.UUID) (*throughputSample, error) { return nil, nil },
 		History:    func(context.Context, uuid.UUID) ([]throughputPoint, error) { return nil, nil },
 		AllMetrics: func(context.Context, uuid.UUID) ([]throughput.Series, []throughput.MetricSample, error) {
@@ -387,6 +390,23 @@ func TestProjectAccess(t *testing.T) {
 		t.Errorf("project token sees %v, want [a1]", got)
 	}
 	h.expect("project token changes B", first(h.call(tok["secret"].(string), "POST", "/configs/"+cB+"/versions", map[string]any{"body": collectorYAML + "# y\n"})), 404)
+	// A token's own rate limits are set by administrators and apply to that token only.
+	limitsOf := "/auth/tokens/" + tok["id"].(string) + "/limits"
+	h.expect("non-admin sets a token's limits", first(h.call(alice, "PUT", limitsOf, map[string]any{"write_limit_per_minute": 1})), 403)
+	h.expect("a negative limit", first(h.call(admin, "PUT", limitsOf, map[string]any{"write_limit_per_minute": -1})), 400)
+	h.expect("limits of an unknown token", first(h.call(admin, "PUT", "/auth/tokens/"+uuid.NewString()+"/limits", map[string]any{})), 404)
+	lcode, limited := h.call(admin, "PUT", limitsOf, map[string]any{"write_limit_per_minute": 1})
+	h.expect("admin sets a token's limits", lcode, 200)
+	if limited["write_limit_per_minute"].(float64) != 1 || limited["rate_limit_per_minute"] != nil {
+		t.Errorf("limits after change = %v", limited)
+	}
+	validate := map[string]any{"body": collectorYAML}
+	h.expect("the token's first change", first(h.call(tok["secret"].(string), "POST", "/configs/validate", validate)), 200)
+	h.expect("the token's second change in a minute", first(h.call(tok["secret"].(string), "POST", "/configs/validate", validate)), 429)
+	h.expect("the token still reads", first(h.call(tok["secret"].(string), "GET", "/agents", nil)), 200)
+	h.expect("someone else is not affected", first(h.call(alice, "POST", "/configs/validate", validate)), 200)
+	h.expect("admin clears the token's limits", first(h.call(admin, "PUT", limitsOf, map[string]any{})), 200)
+	h.expect("the token changes things again", first(h.call(tok["secret"].(string), "POST", "/configs/validate", validate)), 200)
 	h.expect("admin token cannot be project-bound", first(h.call(admin, "POST", "/auth/tokens", map[string]any{"name": "x", "role": "admin", "project_id": A})), 400)
 
 	// --- The Users page: people who signed in, and people added ahead of their first sign-in.

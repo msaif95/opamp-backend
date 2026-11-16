@@ -30,6 +30,8 @@ const (
 	FleetHealthAlerts = "fleet_health_alerts"
 	// SecondApprover requires someone other than the person who started a bulk push to resume or approve it.
 	SecondApprover = "second_approver"
+	// APIRateLimit throttles console API requests per user and per API token.
+	APIRateLimit = "api_rate_limit"
 )
 
 const (
@@ -163,7 +165,7 @@ func (s *Store) Func(key string) func() bool {
 
 // List returns every protection's state in a stable order.
 func (s *Store) List() []State {
-	order := []string{SSO, LocalLogin, AgentTLS, StoreEncryption, AgentMTLS, AlertDelivery, Telemetry, Rebalancing, FleetHealthAlerts, SecondApprover}
+	order := []string{SSO, LocalLogin, AgentTLS, StoreEncryption, AgentMTLS, AlertDelivery, Telemetry, Rebalancing, FleetHealthAlerts, SecondApprover, APIRateLimit}
 	out := make([]State, 0, len(order))
 	s.mu.RLock()
 	defer s.mu.RUnlock()

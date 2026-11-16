@@ -107,6 +107,9 @@ type Config struct {
 	AlertUnhealthyPct float64
 	// TrustProxyHeaders takes client addresses from X-Forwarded-For.
 	TrustProxyHeaders bool
+	// Console API budgets per user or API token, per minute; 0 disables one.
+	// Writes is the budget for requests that change something.
+	APIRateLimit, APIRateLimitWrites int
 
 	MigrationsDir string
 	LogLevel      string
@@ -196,6 +199,12 @@ func Load() (*Config, error) {
 		def := map[string]string{"AUDIT_RETENTION_DAYS": "0", "ROLLOUT_RETENTION_DAYS": "180", "AGENT_RETENTION_DAYS": "30", "AGENT_EVENT_RETENTION_DAYS": "90"}[name]
 		if *dst, err = strconv.Atoi(env(name, def)); err != nil || *dst < 0 {
 			return nil, fmt.Errorf("%s must be a number of days, 0 or more", name)
+		}
+	}
+	for name, dst := range map[string]*int{"API_RATE_LIMIT_PER_MINUTE": &c.APIRateLimit, "API_RATE_LIMIT_WRITES_PER_MINUTE": &c.APIRateLimitWrites} {
+		def := map[string]string{"API_RATE_LIMIT_PER_MINUTE": "1200", "API_RATE_LIMIT_WRITES_PER_MINUTE": "120"}[name]
+		if *dst, err = strconv.Atoi(env(name, def)); err != nil || *dst < 0 {
+			return nil, fmt.Errorf("%s must be a number of requests per minute, 0 (no limit) or more", name)
 		}
 	}
 	if len(c.JWTSigningKey) < 32 {

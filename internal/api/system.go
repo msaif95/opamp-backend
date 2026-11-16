@@ -21,6 +21,9 @@ type SystemStatus struct {
 	AlertOfflinePct          float64 `json:"alert_offline_pct"`
 	AlertUnhealthyPct        float64 `json:"alert_unhealthy_pct"`
 	AgentOfflineAfterSeconds int     `json:"agent_offline_after_seconds"`
+	// Console API budgets per user or token per minute; 0 means that budget is not enforced.
+	APIRateLimit       int `json:"api_rate_limit_per_minute"`
+	APIRateLimitWrites int `json:"api_rate_limit_writes_per_minute"`
 }
 
 // system reports configuration status, the live backend replicas and recent alerts.

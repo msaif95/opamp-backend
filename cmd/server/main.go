@@ -38,6 +38,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
 	"github.com/msaif95/opamp-backend/internal/protocol"
+	"github.com/msaif95/opamp-backend/internal/ratelimit"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/retention"
 	"github.com/msaif95/opamp-backend/internal/rollout"
@@ -249,13 +250,15 @@ func run() error {
 		settings.LocalLogin: {Available: cfg.LocalAdminPassword != "", Default: true},
 		// Switching TLS at runtime would drop every agent and, when off, send
 		// their credentials in plaintext; it stays a deployment decision.
-		settings.StoreEncryption:   {Available: cfg.PostgresEncrypted() && cfg.RedisTLS, Default: true, Locked: true},
-		settings.AgentTLS:          {Available: tlsCfg != nil || cfg.AgentTLSUpstream, Default: true, Locked: true},
-		settings.AgentMTLS:         {Available: cfg.MTLSEnabled(), Default: true},
-		settings.AlertDelivery:     {Available: cfg.AlertWebhookURL != "", Default: true},
-		settings.Telemetry:         {Available: telemetry.Enabled(), Default: true},
-		settings.Rebalancing:       {Available: true, Default: cfg.RebalanceEnabled},
-		settings.SecondApprover:    {Available: true, Default: false},
+		settings.StoreEncryption: {Available: cfg.PostgresEncrypted() && cfg.RedisTLS, Default: true, Locked: true},
+		settings.AgentTLS:        {Available: tlsCfg != nil || cfg.AgentTLSUpstream, Default: true, Locked: true},
+		settings.AgentMTLS:       {Available: cfg.MTLSEnabled(), Default: true},
+		settings.AlertDelivery:   {Available: cfg.AlertWebhookURL != "", Default: true},
+		settings.Telemetry:       {Available: telemetry.Enabled(), Default: true},
+		settings.Rebalancing:     {Available: true, Default: cfg.RebalanceEnabled},
+		settings.SecondApprover:  {Available: true, Default: false},
+		// Always available: even with no deployment-wide budget, a token can be given its own from the console.
+		settings.APIRateLimit:      {Available: true, Default: true},
 		settings.FleetHealthAlerts: {Available: cfg.AlertOfflinePct > 0 || cfg.AlertUnhealthyPct > 0, Default: true},
 	}, log)
 	if err != nil {
@@ -450,12 +453,15 @@ func run() error {
 		log.Info("single sign-on enabled", "issuer", cfg.OktaIssuer)
 	}
 
+	limits := ratelimit.New(rdb, cfg.APIRateLimit, cfg.APIRateLimitWrites, log)
+	limits.Enabled = switches.Func(settings.APIRateLimit)
+
 	apiSrv := &http.Server{
 		Addr: cfg.APIListenAddr,
 		Handler: otelhttp.NewHandler((&api.Server{
 			DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
-			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders,
+			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders, Limits: limits,
 			Alerts: alertStore, Settings: switches,
 			Throughput: tput.Latest, History: tput.History,
 			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
@@ -463,6 +469,7 @@ func run() error {
 				SSOIssuer: cfg.OktaIssuer, Version: version, DevMode: cfg.DevMode,
 				AlertOfflinePct: cfg.AlertOfflinePct, AlertUnhealthyPct: cfg.AlertUnhealthyPct,
 				AgentOfflineAfterSeconds: int(cfg.AgentOfflineAfter.Seconds()),
+				APIRateLimit:             cfg.APIRateLimit, APIRateLimitWrites: cfg.APIRateLimitWrites,
 			},
 			Logs: collectorLogs.Recent, Traces: collectorTraces.Recent, AllMetrics: tput.All, Sessions: sessions, Tokens: apiTokens, Secrets: secretStore, Projects: projects,
 			// Postgres only. A Redis outage degrades pushes and live updates but

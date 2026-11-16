@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/testdb"
 )
@@ -18,11 +20,11 @@ func TestAPITokens(t *testing.T) {
 	ctx := context.Background()
 	tokens := auth.NewTokens(db)
 
-	tok, err := tokens.Create(ctx, "ci", auth.RoleOperator, nil, "alice", nil)
+	tok, err := tokens.Create(ctx, "ci", auth.RoleOperator, nil, "alice", nil, auth.TokenLimits{})
 	if err != nil || !strings.HasPrefix(tok.Secret, auth.TokenPrefix) {
 		t.Fatalf("create: %v %+v", err, tok)
 	}
-	if _, err := tokens.Create(ctx, "ci", auth.RoleViewer, nil, "alice", nil); !errors.Is(err, auth.ErrTokenNameTaken) {
+	if _, err := tokens.Create(ctx, "ci", auth.RoleViewer, nil, "alice", nil, auth.TokenLimits{}); !errors.Is(err, auth.ErrTokenNameTaken) {
 		t.Fatalf("duplicate name: %v", err)
 	}
 	u, err := tokens.Authenticate(ctx, tok.Secret)
@@ -47,9 +49,36 @@ func TestAPITokens(t *testing.T) {
 		t.Fatal("middleware did not apply the token's role")
 	}
 
+	// Rate limits: none of its own at first, then whatever the console sets, from the next request on.
+	if u.TokenLimits.Requests != nil || u.TokenLimits.Writes != nil {
+		t.Errorf("new token has its own limits: %+v", u.TokenLimits)
+	}
+	three, none := 3, 0
+	changed, err := tokens.SetLimits(ctx, tok.ID, auth.TokenLimits{Requests: &three, Writes: &none})
+	if err != nil || *changed.Requests != 3 || *changed.Writes != 0 {
+		t.Fatalf("set limits: %v %+v", err, changed)
+	}
+	if u, _ := tokens.Authenticate(ctx, tok.Secret); u.TokenLimits.Requests == nil || *u.TokenLimits.Requests != 3 || *u.TokenLimits.Writes != 0 {
+		t.Errorf("limits after change: %+v", u.TokenLimits)
+	}
+	if back, _ := tokens.SetLimits(ctx, tok.ID, auth.TokenLimits{}); back.Requests != nil || back.Writes != nil {
+		t.Errorf("limits not cleared: %+v", back.TokenLimits)
+	}
+	if _, err := tokens.SetLimits(ctx, uuid.New(), auth.TokenLimits{}); !errors.Is(err, auth.ErrTokenNotFound) {
+		t.Errorf("unknown token: %v", err)
+	}
+	limited, err := tokens.Create(ctx, "limited", auth.RoleViewer, nil, "alice", nil, auth.TokenLimits{Writes: &three})
+	if err != nil || limited.Writes == nil || *limited.Writes != 3 || limited.Requests != nil {
+		t.Fatalf("create with limits: %v %+v", err, limited)
+	}
+	over := auth.MaxTokenLimit + 1
+	if (auth.TokenLimits{Requests: &over}).Validate() == nil || (auth.TokenLimits{Writes: &three}).Validate() != nil {
+		t.Error("limit validation is wrong")
+	}
+
 	// Expired and revoked tokens stop working at once.
 	past := time.Now().Add(-time.Hour)
-	old, _ := tokens.Create(ctx, "old", auth.RoleAdmin, nil, "alice", &past)
+	old, _ := tokens.Create(ctx, "old", auth.RoleAdmin, nil, "alice", &past, auth.TokenLimits{})
 	if _, err := tokens.Authenticate(ctx, old.Secret); err == nil {
 		t.Fatal("expired token accepted")
 	}
@@ -63,7 +92,7 @@ func TestAPITokens(t *testing.T) {
 		t.Fatalf("second revoke: %v", err)
 	}
 	list, _ := tokens.List(ctx)
-	if len(list) != 2 || list[0].Secret != "" {
+	if len(list) != 3 || list[0].Secret != "" {
 		t.Fatalf("list = %+v", list)
 	}
 }

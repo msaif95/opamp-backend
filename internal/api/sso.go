@@ -159,8 +159,14 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		ExpiresDays int       `json:"expires_days"`
 		// ProjectID binds a viewer or operator token to one project; omit to act on unassigned resources.
 		ProjectID *uuid.UUID `json:"project_id"`
+		// The token's own rate limits; omit one to use the deployment's default.
+		auth.TokenLimits
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	if err := req.TokenLimits.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// An admin token is global; any other token acts in one project.
@@ -191,7 +197,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		expires = &t
 	}
 	u, _ := auth.UserFrom(r.Context())
-	tok, err := s.Tokens.Create(r.Context(), req.Name, req.Role, req.ProjectID, u.Subject, expires)
+	tok, err := s.Tokens.Create(r.Context(), req.Name, req.Role, req.ProjectID, u.Subject, expires, req.TokenLimits)
 	if errors.Is(err, auth.ErrTokenNameTaken) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -203,6 +209,36 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	s.audit(r.Context(), u.Subject, u.Provider, "api_token.create", "api_token", tok.ID.String(),
 		map[string]any{"name": tok.Name, "role": tok.Role, "project_id": tok.ProjectID})
 	writeJSON(w, http.StatusCreated, tok)
+}
+
+// setTokenLimits changes a token's own rate limits: PUT {"rate_limit_per_minute": 300, "write_limit_per_minute": null}.
+// A number is that token's budget per minute, 0 is no limit, null goes back to the deployment's default.
+func (s *Server) setTokenLimits(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var limits auth.TokenLimits
+	if !decode(w, r, &limits) {
+		return
+	}
+	if err := limits.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tok, err := s.Tokens.SetLimits(r.Context(), id, limits)
+	if errors.Is(err, auth.ErrTokenNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "api_token.limits", "api_token", id.String(),
+		map[string]any{"name": tok.Name, "rate_limit_per_minute": limits.Requests, "write_limit_per_minute": limits.Writes})
+	writeJSON(w, http.StatusOK, tok)
 }
 
 func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {

@@ -25,6 +25,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
+	"github.com/msaif95/opamp-backend/internal/ratelimit"
 	"github.com/msaif95/opamp-backend/internal/registry"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/secrets"
@@ -67,6 +68,8 @@ type Server struct {
 	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
+	// Limits throttles signed-in callers; nil means no throttling.
+	Limits *ratelimit.Limiter
 	// TrustProxyHeaders makes the client address come from X-Forwarded-For.
 	// Enable only when the API is reachable solely through a trusted proxy.
 	TrustProxyHeaders bool
@@ -97,6 +100,16 @@ func (s *Server) Router() http.Handler {
 		}
 	})
 
+	// Each person and each API token has its own budget, shared by all their sessions and by every replica.
+	// An API token can carry its own budgets, set from the console.
+	throttle := s.Limits.Middleware(func(r *http.Request) ratelimit.Caller {
+		u, ok := auth.UserFrom(r.Context())
+		if !ok {
+			return ratelimit.Caller{}
+		}
+		return ratelimit.Caller{Key: u.Provider + ":" + strings.ToLower(u.Subject), Requests: u.TokenLimits.Requests, Writes: u.TokenLimits.Writes}
+	})
+
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/login", s.login)
 		r.Get("/auth/config", s.authConfig)
@@ -105,7 +118,7 @@ func (s *Server) Router() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			// Any signed-in user; handlers filter and check by project.
-			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
+			r.Use(s.Sessions.Require(auth.RoleNone), throttle, s.withScope)
 			r.Get("/auth/me", s.me)
 			r.Post("/auth/logout", s.logout)
 			r.Get("/projects", s.listProjects)
@@ -142,7 +155,7 @@ func (s *Server) Router() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			// Changes: each handler checks the operator role in the resource's project.
-			r.Use(s.Sessions.Require(auth.RoleNone), s.withScope)
+			r.Use(s.Sessions.Require(auth.RoleNone), throttle, s.withScope)
 			r.Put("/agents/{uid}/collectors/config", s.setBridgeCollectorConfig)
 			r.Post("/configs", s.createConfig)
 			r.Post("/configs/builder/library", s.saveLibraryItem)
@@ -178,7 +191,7 @@ func (s *Server) Router() http.Handler {
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.Sessions.Require(auth.RoleAdmin), s.withScope)
+			r.Use(s.Sessions.Require(auth.RoleAdmin), throttle, s.withScope)
 			r.Get("/secrets", s.listSecrets)
 			r.Put("/secrets", s.setSecret)
 			r.Delete("/secrets/{id}", s.deleteSecret)
@@ -198,6 +211,7 @@ func (s *Server) Router() http.Handler {
 			r.Get("/auth/tokens", s.listTokens)
 			r.Post("/auth/tokens", s.createToken)
 			r.Delete("/auth/tokens/{id}", s.revokeToken)
+			r.Put("/auth/tokens/{id}/limits", s.setTokenLimits)
 			r.Put("/system/settings/{key}", s.updateSetting)
 			r.Get("/credentials/api-keys", s.listAPIKeys)
 			r.Post("/credentials/api-keys", s.issueAPIKey)

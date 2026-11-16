@@ -269,7 +269,12 @@ CREATE TABLE api_tokens (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at   TIMESTAMPTZ,
     revoked_at   TIMESTAMPTZ,
-    last_used_at TIMESTAMPTZ
+    last_used_at TIMESTAMPTZ,
+    -- This token's own API budgets per minute, set from the console: all
+    -- requests, and requests that change something. NULL uses the
+    -- deployment's default; 0 means no limit.
+    rate_limit_per_minute  INTEGER CHECK (rate_limit_per_minute >= 0),
+    write_limit_per_minute INTEGER CHECK (write_limit_per_minute >= 0)
 );
 
 -- Runtime settings --------------------------------------------------------
