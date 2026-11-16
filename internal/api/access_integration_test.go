@@ -517,6 +517,21 @@ func TestProjectAccess(t *testing.T) {
 		t.Errorf("timeline = %v", tl)
 	}
 
+	// --- Console settings are each person's own: one cannot read or change another's.
+	h.expect("alice saves her fleet views", first(h.call(alice, "PUT", "/auth/me/settings/fleet_views", map[string]any{"value": []any{map[string]any{"id": "1", "name": "prod", "query": "attr=env%3Dprod"}}})), 204)
+	_, mine := h.call(alice, "GET", "/auth/me/settings/fleet_views", nil)
+	if v, _ := mine["value"].([]any); len(v) != 1 || v[0].(map[string]any)["name"] != "prod" {
+		t.Errorf("alice's views = %v", mine)
+	}
+	_, theirs := h.call(bob, "GET", "/auth/me/settings/fleet_views", nil)
+	if theirs["value"] != nil {
+		t.Errorf("bob sees someone else's views: %v", theirs)
+	}
+	h.expect("a setting that does not exist", first(h.call(alice, "GET", "/auth/me/settings/anything", nil)), 404)
+	h.expect("a setting that is not a list", first(h.call(alice, "PUT", "/auth/me/settings/overview_cards", map[string]any{"value": "x"})), 400)
+	h.expect("more than can be saved", first(h.call(alice, "PUT", "/auth/me/settings/overview_cards", map[string]any{"value": make([]int, 51)})), 400)
+	h.expect("replacing with nothing", first(h.call(alice, "PUT", "/auth/me/settings/fleet_views", map[string]any{"value": []any{}})), 204)
+
 	// --- Compliance reports: administrators only, since they hold the audit trail and every project's fleet.
 	h.expect("non-admin lists reports", first(h.call(alice, "GET", "/reports", nil)), 403)
 	h.expect("non-admin makes a report", first(h.call(alice, "POST", "/reports", map[string]any{"days": 7})), 403)

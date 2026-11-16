@@ -124,6 +124,8 @@ func (s *Server) Router() http.Handler {
 			r.Use(s.Sessions.Require(auth.RoleNone), throttle, s.withScope)
 			r.Get("/auth/me", s.me)
 			r.Post("/auth/logout", s.logout)
+			r.Get("/auth/me/settings/{key}", s.getUserSetting)
+			r.Put("/auth/me/settings/{key}", s.putUserSetting)
 			r.Get("/projects", s.listProjects)
 			r.Get("/summary", s.summary)
 			r.Get("/agents", s.listAgents)

@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS user_settings;
 DROP TABLE IF EXISTS compliance_reports;
 DROP TABLE IF EXISTS report_schedules;
 DROP TABLE IF EXISTS deleted_agents;

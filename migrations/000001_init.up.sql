@@ -555,3 +555,15 @@ CREATE TABLE compliance_reports (
     body         JSONB NOT NULL
 );
 CREATE INDEX compliance_reports_time_idx ON compliance_reports (generated_at DESC);
+
+-- Per-user console settings ---------------------------------------------------
+-- What one person has set up for themselves in the console: saved fleet
+-- views and the cards on their overview. owner is "<sign-in method>:<subject>".
+-- The value's shape belongs to the console; the backend only bounds it.
+CREATE TABLE user_settings (
+    owner      TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner, key)
+);

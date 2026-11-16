@@ -231,3 +231,6 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   that sends a bare heartbeat is asked for its full state (`ConfigState.Returned`). Keep the poll interval well under
   `AGENT_OFFLINE_AFTER` (90s). `agentsim -url http://...` simulates polling agents (`-poll`); install scripts take
   `transport: http`, which only swaps the endpoint scheme to http(s).
+- Per-user console settings (`internal/api/usersettings.go`, table `user_settings`, `GET|PUT /auth/me/settings/{key}`):
+  a JSON list per person per key (`fleet_views`, `overview_cards`), owner `provider:subject`, always the caller's own.
+  The backend only bounds size (32 KiB, 50 items) and the key set; the shape belongs to the console. Not audited.
