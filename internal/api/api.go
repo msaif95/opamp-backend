@@ -69,6 +69,9 @@ type Server struct {
 	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
+	// CLIDir holds the opampctl binaries offered for download (opampctl_<os>_<arch>[.exe]); it may be missing.
+	CLIDir string
+	cli    cliBuilds
 	// Reports makes and stores compliance reports.
 	Reports *compliance.Service
 	// Limits throttles signed-in callers; nil means no throttling.
@@ -125,6 +128,9 @@ func (s *Server) Router() http.Handler {
 			r.Get("/auth/me", s.me)
 			r.Post("/auth/logout", s.logout)
 			r.Get("/auth/me/settings/{key}", s.getUserSetting)
+			r.Get("/openapi.json", s.openAPI)
+			r.Get("/downloads/opampctl", s.cliInfo)
+			r.Get("/downloads/opampctl/{platform}", s.cliDownload)
 			r.Put("/auth/me/settings/{key}", s.putUserSetting)
 			r.Get("/projects", s.listProjects)
 			r.Get("/summary", s.summary)

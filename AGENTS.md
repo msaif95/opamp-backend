@@ -234,3 +234,10 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - Per-user console settings (`internal/api/usersettings.go`, table `user_settings`, `GET|PUT /auth/me/settings/{key}`):
   a JSON list per person per key (`fleet_views`, `overview_cards`), owner `provider:subject`, always the caller's own.
   The backend only bounds size (32 KiB, 50 items) and the key set; the shape belongs to the console. Not audited.
+- API reference: `internal/api/openapi.go` holds `routeDocs`, one entry per endpoint (summary, who may call it, query
+  parameters, example body); `GET /openapi.json` builds an OpenAPI 3 document from it. `TestAPIReferenceMatchesTheRouter`
+  fails when a route is added, removed or renamed without its entry, so add the entry with the route. Response bodies
+  are deliberately not described field by field.
+- opampctl downloads: `GET /downloads/opampctl` (version, usage text, builds) and `/downloads/opampctl/{platform}` serve
+  binaries named `opampctl_<os>_<arch>[.exe]` from `OPAMPCTL_DIR` (`bin/dist` in dev via `make cli-dist`, `/opampctl`
+  in the image, which builds them). The usage text lives in `internal/opampctldoc` and is shared with the tool.

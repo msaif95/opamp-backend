@@ -1,4 +1,4 @@
-.PHONY: deps-up deps-down run run-sso build test test-integration lint
+.PHONY: deps-up deps-down run run-sso build cli-dist test test-integration lint
 
 # Dev-only defaults; never use these values outside a local machine.
 export JWT_SIGNING_KEY ?= dev-only-signing-key-do-not-use-in-prod
@@ -30,6 +30,16 @@ run-sso:
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/opamp-backend ./cmd/server
 	go build -ldflags "$(LDFLAGS)" -o bin/opampctl ./cmd/opampctl
+
+# opampctl for every platform the console offers to download, in bin/dist
+# (where the dev server looks; the image build does the same into /opampctl).
+CLI_PLATFORMS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64
+cli-dist:
+	@for p in $(CLI_PLATFORMS); do \
+		os=$${p%_*}; arch=$${p#*_}; ext=; [ $$os = windows ] && ext=.exe; \
+		echo "opampctl $$p"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "-s -w $(LDFLAGS)" -o bin/dist/opampctl_$$p$$ext ./cmd/opampctl || exit 1; \
+	done
 
 test:
 	go test -race ./...

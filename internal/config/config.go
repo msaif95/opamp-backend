@@ -114,7 +114,9 @@ type Config struct {
 	APIRateLimit, APIRateLimitWrites int
 
 	MigrationsDir string
-	LogLevel      string
+	// CLIDir holds the opampctl binaries the console offers for download.
+	CLIDir   string
+	LogLevel string
 }
 
 // Load reads configuration from environment variables, applying dev-friendly defaults.
@@ -153,6 +155,7 @@ func Load() (*Config, error) {
 		DevMode:                env("DEV_MODE", "false") == "true",
 		AgentTLSUpstream:       env("AGENT_TLS_TERMINATED_UPSTREAM", "false") == "true",
 		MigrationsDir:          env("MIGRATIONS_DIR", "migrations"),
+		CLIDir:                 env("OPAMPCTL_DIR", "bin/dist"),
 		LogLevel:               env("LOG_LEVEL", "info"),
 	}
 

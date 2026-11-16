@@ -467,7 +467,7 @@ func run() error {
 		Handler: otelhttp.NewHandler((&api.Server{
 			DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
-			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders, Limits: limits, Reports: reports,
+			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders, Limits: limits, Reports: reports, CLIDir: cfg.CLIDir,
 			Alerts: alertStore, Settings: switches,
 			Throughput: tput.Latest, History: tput.History,
 			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},
