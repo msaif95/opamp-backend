@@ -20,6 +20,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/compliance"
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
@@ -129,6 +130,7 @@ func TestProjectAccess(t *testing.T) {
 		DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollout.NewService(db, reg, log),
 		Agents: agents, Sessions: sessions, Groups: targeting.NewGroups(db), Events: http.NotFoundHandler(), Log: log,
 		Tokens: tokens, Projects: projects, Secrets: secretStore, Settings: switches, Logins: auth.NewLoginLimiter(rdb),
+		Reports: compliance.NewService(db),
 		// No deployment-wide budget: only tokens given their own are limited.
 		Limits:     ratelimit.New(rdb, 0, 0, log),
 		Throughput: func(context.Context, uuid.UUID) (*throughputSample, error) { return nil, nil },
@@ -486,6 +488,55 @@ func TestProjectAccess(t *testing.T) {
 	if b := tl["batches"].([]any); len(b) != 1 || b[0].(map[string]any)["agents"].(float64) != 1 {
 		t.Errorf("timeline = %v", tl)
 	}
+
+	// --- Compliance reports: administrators only, since they hold the audit trail and every project's fleet.
+	h.expect("non-admin lists reports", first(h.call(alice, "GET", "/reports", nil)), 403)
+	h.expect("non-admin makes a report", first(h.call(alice, "POST", "/reports", map[string]any{"days": 7})), 403)
+	h.expect("a report over no days", first(h.call(admin, "POST", "/reports", map[string]any{"days": 0})), 400)
+	rcode, rep := h.call(admin, "POST", "/reports", map[string]any{"name": "Audit prep", "days": 7})
+	h.expect("admin makes a report", rcode, 201)
+	repID := rep["id"].(string)
+	if sm := rep["summary"].(map[string]any); sm["collectors"].(float64) != 3 || sm["audit_intact"] != true || sm["changes"].(float64) < 5 || rep["collectors"] != nil {
+		t.Errorf("report = %v", rep)
+	}
+	h.expect("non-admin downloads a report", first(h.call(alice, "GET", "/reports/"+repID+"/download?format=html", nil)), 403)
+	if page := h.raw(admin, "/reports/"+repID+"/download?format=html"); !strings.Contains(page, "Audit prep") || !strings.Contains(page, "Audit log intact") || !strings.Contains(page, "project.create") {
+		t.Errorf("report HTML:\n%.400s", page)
+	}
+	if csv := h.raw(admin, "/reports/"+repID+"/download?format=collectors"); !strings.HasPrefix(csv, "instance_uid,host,project") || strings.Count(csv, "\n") != 4 {
+		t.Errorf("collectors CSV:\n%s", csv)
+	}
+	if csv := h.raw(admin, "/reports/"+repID+"/download?format=changes"); !strings.Contains(csv, "config.create") {
+		t.Errorf("changes CSV:\n%.300s", csv)
+	}
+	h.expect("a format that does not exist", first(h.call(admin, "GET", "/reports/"+repID+"/download?format=pdf", nil)), 400)
+	_, full := h.call(admin, "GET", "/reports/"+repID, nil)
+	if len(full["collectors"].([]any)) != 3 || full["audit"].(map[string]any)["head_hash"] == "" {
+		t.Errorf("full report = %.300v", full)
+	}
+	h.expect("non-admin makes a schedule", first(h.call(alice, "POST", "/reports/schedules", map[string]any{"name": "w", "frequency": "weekly"})), 403)
+	h.expect("a schedule with an unknown frequency", first(h.call(admin, "POST", "/reports/schedules", map[string]any{"name": "w", "frequency": "hourly"})), 400)
+	scode, sch := h.call(admin, "POST", "/reports/schedules", map[string]any{"name": "Monthly review", "frequency": "monthly"})
+	h.expect("admin makes a schedule", scode, 201)
+	schID := sch["id"].(string)
+	h.expect("the same name again", first(h.call(admin, "POST", "/reports/schedules", map[string]any{"name": "Monthly review", "frequency": "daily"})), 409)
+	ncode, ran := h.call(admin, "POST", "/reports/schedules/"+schID+"/run", nil)
+	h.expect("admin runs a schedule now", ncode, 201)
+	if !strings.HasPrefix(ran["name"].(string), "Monthly review, ") || ran["schedule_id"] != schID {
+		t.Errorf("run now = %v", ran)
+	}
+	pcode, paused := h.call(admin, "PUT", "/reports/schedules/"+schID, map[string]any{"enabled": false})
+	h.expect("admin pauses a schedule", pcode, 200)
+	if paused["enabled"] != false {
+		t.Errorf("paused = %v", paused)
+	}
+	h.expect("admin deletes a schedule", first(h.call(admin, "DELETE", "/reports/schedules/"+schID, nil)), 204)
+	_, reports := h.call(admin, "GET", "/reports", nil)
+	if len(reports["reports"].([]any)) != 2 {
+		t.Errorf("%d reports listed, want 2 (a schedule's reports outlive it)", len(reports["reports"].([]any)))
+	}
+	h.expect("admin deletes a report", first(h.call(admin, "DELETE", "/reports/"+repID, nil)), 204)
+	h.expect("the deleted report", first(h.call(admin, "GET", "/reports/"+repID, nil)), 404)
 
 	// --- Secrets: admins only, and the value never comes back out.
 	h.expect("admin sets a secret", first(h.call(admin, "PUT", "/secrets", map[string]any{"name": "vendor_key", "value": "s3cr3t-value", "project_id": A})), 204)

@@ -107,6 +107,8 @@ type Config struct {
 	AlertUnhealthyPct float64
 	// TrustProxyHeaders takes client addresses from X-Forwarded-For.
 	TrustProxyHeaders bool
+	// ReportRetentionDays is how long compliance reports are kept; 0 keeps them forever.
+	ReportRetentionDays int
 	// Console API budgets per user or API token, per minute; 0 disables one.
 	// Writes is the budget for requests that change something.
 	APIRateLimit, APIRateLimitWrites int
@@ -200,6 +202,9 @@ func Load() (*Config, error) {
 		if *dst, err = strconv.Atoi(env(name, def)); err != nil || *dst < 0 {
 			return nil, fmt.Errorf("%s must be a number of days, 0 or more", name)
 		}
+	}
+	if c.ReportRetentionDays, err = strconv.Atoi(env("REPORT_RETENTION_DAYS", "400")); err != nil || c.ReportRetentionDays < 0 {
+		return nil, fmt.Errorf("REPORT_RETENTION_DAYS must be a number of days, 0 or more")
 	}
 	for name, dst := range map[string]*int{"API_RATE_LIMIT_PER_MINUTE": &c.APIRateLimit, "API_RATE_LIMIT_WRITES_PER_MINUTE": &c.APIRateLimitWrites} {
 		def := map[string]string{"API_RATE_LIMIT_PER_MINUTE": "1200", "API_RATE_LIMIT_WRITES_PER_MINUTE": "120"}[name]

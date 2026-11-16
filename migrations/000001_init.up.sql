@@ -510,3 +510,34 @@ CREATE TABLE bridge_collector_configs (
     set_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (instance_uid, collector_key)
 );
+
+-- Compliance reports ---------------------------------------------------------
+-- A schedule produces a report for each whole day, week or month (UTC).
+-- next_run_at is moved in the transaction that stores the report, under a row
+-- lock, so several replicas never produce the same report twice.
+CREATE TABLE report_schedules (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL UNIQUE,
+    frequency   TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_run_at TIMESTAMPTZ,
+    next_run_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX report_schedules_due_idx ON report_schedules (next_run_at) WHERE enabled;
+
+-- A generated report, kept as it was made: the fleet's state at that moment,
+-- the audit events of its period, and the audit log's integrity check.
+CREATE TABLE compliance_reports (
+    id           UUID PRIMARY KEY,
+    name         TEXT NOT NULL,
+    schedule_id  UUID REFERENCES report_schedules(id) ON DELETE SET NULL,
+    period_from  TIMESTAMPTZ NOT NULL,
+    period_to    TIMESTAMPTZ NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    generated_by TEXT NOT NULL,
+    summary      JSONB NOT NULL,
+    body         JSONB NOT NULL
+);
+CREATE INDEX compliance_reports_time_idx ON compliance_reports (generated_at DESC);

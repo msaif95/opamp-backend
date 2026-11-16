@@ -206,3 +206,12 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
   and/or), `probabilistic_sampler` (approximate), `batch` / `memory_limiter` (no effect). Anything else is reported
   as `not_previewed` and passes data through; never guess. `TestEveryBuilderProcessorIsModelled` fails when a
   processor is added to the builder catalog without a model here.
+- Compliance reports (`internal/compliance`, tables `compliance_reports`, `report_schedules`, admin endpoints under
+  `/api/v1/reports`): a report is the fleet's state at generation time, the period's audit events (categorised by
+  `Categorize`; sign-ins are counted but are not "changes"), and the audit chain check with the head event's hash.
+  Built in one read-only repeatable-read transaction and stored whole (`summary` + `body` JSONB); downloads are HTML
+  (`html/template`, printable), JSON and two CSVs. Schedules are daily / weekly / monthly in UTC covering the whole
+  period just ended (`NextRun`, `Period` are pure and tested); `RunDue` locks the schedule row and moves
+  `next_run_at` in the transaction that stores the report, so replicas never double up. Reports are deployment-wide
+  (the audit log has no project column). Pruned after `REPORT_RETENTION_DAYS` (400). New audit actions need a look
+  at `Categorize`.

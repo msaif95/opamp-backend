@@ -30,6 +30,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/api"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/compliance"
 	"github.com/msaif95/opamp-backend/internal/config"
 	"github.com/msaif95/opamp-backend/internal/connection"
 	"github.com/msaif95/opamp-backend/internal/events"
@@ -453,6 +454,10 @@ func run() error {
 		log.Info("single sign-on enabled", "issuer", cfg.OktaIssuer)
 	}
 
+	reports := compliance.NewService(db)
+	reports.Notify, reports.PublicURL = alerts.Notify, cfg.PublicURL
+	go reports.Run(ctx, log, cfg.ReportRetentionDays)
+
 	limits := ratelimit.New(rdb, cfg.APIRateLimit, cfg.APIRateLimitWrites, log)
 	limits.Enabled = switches.Func(settings.APIRateLimit)
 
@@ -461,7 +466,7 @@ func run() error {
 		Handler: otelhttp.NewHandler((&api.Server{
 			DB: db, Registry: reg, Configs: configs, Library: pipeline.NewLibrary(db), Rollouts: rollouts, Agents: agentAuth,
 			OIDC: sso, Groups: targeting.NewGroups(db), Events: hub, Log: log,
-			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders, Limits: limits,
+			Logins: auth.NewLoginLimiter(rdb), TrustProxyHeaders: cfg.TrustProxyHeaders, Limits: limits, Reports: reports,
 			Alerts: alertStore, Settings: switches,
 			Throughput: tput.Latest, History: tput.History,
 			Install: api.InstallConfig{EndpointURL: cfg.AgentEndpointURL, CAFile: cfg.AgentCAFile},

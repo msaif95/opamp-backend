@@ -22,6 +22,7 @@ import (
 	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/alert"
 	"github.com/msaif95/opamp-backend/internal/auth"
+	"github.com/msaif95/opamp-backend/internal/compliance"
 	"github.com/msaif95/opamp-backend/internal/ownlogs"
 	"github.com/msaif95/opamp-backend/internal/owntraces"
 	"github.com/msaif95/opamp-backend/internal/pipeline"
@@ -68,6 +69,8 @@ type Server struct {
 	Alerts   *alert.Store
 	// Logins rate-limits failed local logins.
 	Logins *auth.LoginLimiter
+	// Reports makes and stores compliance reports.
+	Reports *compliance.Service
 	// Limits throttles signed-in callers; nil means no throttling.
 	Limits *ratelimit.Limiter
 	// TrustProxyHeaders makes the client address come from X-Forwarded-For.
@@ -209,6 +212,16 @@ func (s *Server) Router() http.Handler {
 			r.Get("/audit", s.listAudit)
 			r.Get("/audit/verify", s.verifyAudit)
 			r.Get("/audit/export", s.exportAudit)
+			r.Get("/reports", s.listReports)
+			r.Post("/reports", s.createReport)
+			r.Get("/reports/schedules", s.listReportSchedules)
+			r.Post("/reports/schedules", s.createReportSchedule)
+			r.Put("/reports/schedules/{id}", s.updateReportSchedule)
+			r.Delete("/reports/schedules/{id}", s.deleteReportSchedule)
+			r.Post("/reports/schedules/{id}/run", s.runReportSchedule)
+			r.Get("/reports/{id}", s.getReport)
+			r.Get("/reports/{id}/download", s.downloadReport)
+			r.Delete("/reports/{id}", s.deleteReport)
 			r.Get("/system", s.system)
 			r.Get("/auth/tokens", s.listTokens)
 			r.Post("/auth/tokens", s.createToken)
