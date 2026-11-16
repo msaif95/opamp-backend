@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -21,7 +22,7 @@ func TestSetupEnabled(t *testing.T) {
 	// Shutdown flushes whatever was collected, so it shows whether the switch gates the export.
 	for _, on := range []bool{false, true} {
 		requests.Store(0)
-		shutdown, err := Setup(context.Background(), "replica-test", func() bool { return on })
+		shutdown, _, err := Setup(context.Background(), "replica-test", false, func() bool { return on })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,8 +41,36 @@ func TestSetupEnabled(t *testing.T) {
 
 func TestSetupDisabled(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	shutdown, err := Setup(context.Background(), "replica-test", func() bool { return true })
-	if err != nil || shutdown(context.Background()) != nil {
-		t.Fatalf("disabled setup failed: %v", err)
+	shutdown, metrics, err := Setup(context.Background(), "replica-test", false, func() bool { return true })
+	if err != nil || shutdown(context.Background()) != nil || metrics != nil {
+		t.Fatalf("disabled setup failed: %v (metrics handler %v)", err, metrics != nil)
+	}
+}
+
+// With scraping on, the backend's instruments are served in the Prometheus
+// format without any OTLP endpoint, and the runtime switch closes the page.
+func TestPrometheusScrape(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	on := true
+	shutdown, metrics, err := Setup(context.Background(), "replica-test", true, func() bool { return on })
+	if err != nil || metrics == nil {
+		t.Fatalf("setup: %v, handler %v", err, metrics != nil)
+	}
+	defer shutdown(context.Background())
+	counter, _ := otel.Meter("test").Int64Counter("opamp.test.events")
+	counter.Add(context.Background(), 3)
+
+	scrape := func() (int, string) {
+		rec := httptest.NewRecorder()
+		metrics.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Code, rec.Body.String()
+	}
+	code, body := scrape()
+	if code != 200 || !strings.Contains(body, "opamp_test_events_total") || !strings.Contains(body, "go_goroutines") || !strings.Contains(body, `service_name="opamp-backend"`) {
+		t.Errorf("scrape: HTTP %d\n%.600s", code, body)
+	}
+	on = false
+	if code, _ := scrape(); code != 503 {
+		t.Errorf("scrape while switched off: HTTP %d", code)
 	}
 }

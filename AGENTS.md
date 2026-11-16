@@ -241,3 +241,7 @@ OpAMP control plane (Go, `opamp-go`) for OTel Collector fleet management. Design
 - opampctl downloads: `GET /downloads/opampctl` (version, usage text, builds) and `/downloads/opampctl/{platform}` serve
   binaries named `opampctl_<os>_<arch>[.exe]` from `OPAMPCTL_DIR` (`bin/dist` in dev via `make cli-dist`, `/opampctl`
   in the image, which builds them). The usage text lives in `internal/opampctldoc` and is shared with the tool.
+- Prometheus scraping: `METRICS_LISTEN_ADDR` (off by default) serves the same OTel instruments at `/metrics` on a
+  port of its own, without sign-in, next to or instead of OTLP push (`telemetry.Setup`); the Monitoring export switch
+  closes it (503). `opamp-backend wait-for-db [timeout]` waits for Postgres and exits; the chart's init container
+  runs it (the image is distroless, so there is no shell or pg_isready to use instead).

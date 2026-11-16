@@ -45,6 +45,10 @@ type Config struct {
 
 	OpAMPListenAddr string
 	APIListenAddr   string
+	// MetricsListenAddr, if set, serves the backend's own metrics for
+	// Prometheus at /metrics on a port of its own, without sign-in. Keep
+	// that port inside the cluster.
+	MetricsListenAddr string
 
 	// TLS for the OpAMP listener. CertFile/KeyFile are the server identity
 	// (issued by cert-manager). ClientCAFile is the CA bundle used to verify
@@ -126,6 +130,7 @@ func Load() (*Config, error) {
 		ReplicaID:              env("OPAMP_REPLICA_ID", host),
 		OpAMPListenAddr:        env("OPAMP_LISTEN_ADDR", ":4320"),
 		APIListenAddr:          env("API_LISTEN_ADDR", ":8080"),
+		MetricsListenAddr:      env("METRICS_LISTEN_ADDR", ""),
 		TLSCertFile:            env("TLS_CERT_FILE", ""),
 		TLSKeyFile:             env("TLS_KEY_FILE", ""),
 		TLSClientCAFile:        env("TLS_CLIENT_CA_FILE", ""),

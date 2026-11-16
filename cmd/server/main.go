@@ -70,7 +70,46 @@ func main() {
 	}
 }
 
+// waitForDatabase blocks until Postgres accepts connections, or the timeout
+// passes. It is what the chart's init container runs ("opamp-backend
+// wait-for-db"), so a pod starts its server only once the database is
+// there instead of crash-looping while it comes up.
+func waitForDatabase(dsn string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		attemptCtx, done := context.WithTimeout(ctx, 5*time.Second)
+		db, err := store.Open(attemptCtx, dsn, 1)
+		done()
+		if err == nil {
+			db.Close()
+			slog.Info("database is ready", "attempts", attempt)
+			return nil
+		}
+		slog.Info("waiting for the database", "attempt", attempt, "err", err.Error())
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the database was not ready within %s: %w", timeout, err)
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "wait-for-db" {
+		timeout := 5 * time.Minute
+		if len(os.Args) > 2 {
+			var err error
+			if timeout, err = time.ParseDuration(os.Args[2]); err != nil {
+				return fmt.Errorf("usage: opamp-backend wait-for-db [timeout, e.g. 5m]: %w", err)
+			}
+		}
+		dsn := os.Getenv("POSTGRES_DSN")
+		if dsn == "" {
+			return errors.New("POSTGRES_DSN is not set")
+		}
+		return waitForDatabase(dsn, timeout)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -91,7 +130,7 @@ func run() error {
 
 	// Telemetry starts before the database is open, so its switch is bound late.
 	var protections atomic.Pointer[settings.Store]
-	stopTelemetry, err := telemetry.Setup(ctx, cfg.ReplicaID, func() bool {
+	stopTelemetry, metricsHandler, err := telemetry.Setup(ctx, cfg.ReplicaID, cfg.MetricsListenAddr != "", func() bool {
 		st := protections.Load()
 		return st == nil || st.Enabled(settings.Telemetry)
 	})
@@ -103,7 +142,18 @@ func run() error {
 		defer cancel()
 		_ = stopTelemetry(flushCtx)
 	}()
-	log.Info("self-telemetry", "otlp_export", telemetry.Enabled())
+	log.Info("self-telemetry", "otlp_export", telemetry.Enabled(), "prometheus_scrape", cfg.MetricsListenAddr)
+	if metricsHandler != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metricsHandler)
+		metricsSrv := &http.Server{Addr: cfg.MetricsListenAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics listener stopped", "err", err)
+			}
+		}()
+		defer metricsSrv.Close()
+	}
 
 	if err := store.Migrate(cfg.PostgresDSN, cfg.MigrationsDir); err != nil {
 		return err
@@ -256,7 +306,7 @@ func run() error {
 		settings.AgentTLS:        {Available: tlsCfg != nil || cfg.AgentTLSUpstream, Default: true, Locked: true},
 		settings.AgentMTLS:       {Available: cfg.MTLSEnabled(), Default: true},
 		settings.AlertDelivery:   {Available: cfg.AlertWebhookURL != "", Default: true},
-		settings.Telemetry:       {Available: telemetry.Enabled(), Default: true},
+		settings.Telemetry:       {Available: telemetry.Enabled() || cfg.MetricsListenAddr != "", Default: true},
 		settings.Rebalancing:     {Available: true, Default: cfg.RebalanceEnabled},
 		settings.SecondApprover:  {Available: true, Default: false},
 		// Always available: even with no deployment-wide budget, a token can be given its own from the console.
