@@ -320,7 +320,8 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 			s.internal(w, r, err)
 			return
 		}
-		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
+		if !scopeOf(r.Context()).CanGroup(id, grp.ProjectID, auth.RoleViewer) {
+			writeError(w, http.StatusNotFound, "not found")
 			return
 		}
 		if project != nil && !sameProject(project.ID, grp.ProjectID) {
@@ -406,7 +407,8 @@ func (s *Server) agentFilter(w http.ResponseWriter, r *http.Request) (f registry
 			s.internal(w, r, err)
 			return f, false, false
 		}
-		if !s.allow(w, r, grp.ProjectID, auth.RoleViewer) {
+		if !scopeOf(r.Context()).CanGroup(id, grp.ProjectID, auth.RoleViewer) {
+			writeError(w, http.StatusNotFound, "not found")
 			return f, false, false
 		}
 		// A group only ever matches its own project's agents. Combined with a

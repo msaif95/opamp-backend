@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/msaif95/opamp-backend/internal/agentconfig"
 	"github.com/msaif95/opamp-backend/internal/auth"
 	"github.com/msaif95/opamp-backend/internal/rollout"
 	"github.com/msaif95/opamp-backend/internal/targeting"
@@ -153,8 +154,13 @@ func (s *Server) setGroupConfig(w http.ResponseWriter, r *http.Request) {
 		s.configError(w, r, err)
 		return
 	}
-	configProject, ok := s.allowConfig(w, r, v.TemplateID, auth.RoleViewer)
-	if !ok {
+	configProject, err := s.Configs.ProjectOf(r.Context(), v.TemplateID)
+	if errors.Is(err, agentconfig.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "config not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
 		return
 	}
 	if !sameProject(grp.ProjectID, configProject) && !scopeOf(r.Context()).Admin {
