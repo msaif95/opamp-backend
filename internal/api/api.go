@@ -190,6 +190,9 @@ func (s *Server) Router() http.Handler {
 			r.Put("/groups/{id}/config", s.setGroupConfig)
 			r.Delete("/groups/{id}/config", s.clearGroupConfig)
 			r.Delete("/groups/{id}", s.deleteGroup)
+			r.Get("/groups/{id}/members", s.listGroupMembers)
+			r.Put("/groups/{id}/members", s.setGroupMember)
+			r.Delete("/groups/{id}/members/{subject}", s.removeGroupMember)
 			r.Post("/rollouts", s.createRollout)
 			r.Post("/rollouts/{id}/rollback", s.rolloutAction("rollback", func(s *Server, r *http.Request, id uuid.UUID) error {
 				return s.Rollouts.Rollback(r.Context(), id)

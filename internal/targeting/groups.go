@@ -58,6 +58,7 @@ type Groups struct{ db *pgxpool.Pool }
 // Scope limits rows to the projects a caller may view (see access.Scope).
 type Scope interface {
 	Where(projectColumn string, firstParam int) (string, []any)
+	WhereGroup(projectColumn, groupIDColumn string, firstParam int) (string, []any)
 }
 
 // NewGroups creates a Groups store.
@@ -65,7 +66,7 @@ func NewGroups(db *pgxpool.Pool) *Groups { return &Groups{db: db} }
 
 // List returns all groups by name with their current member counts.
 func (g *Groups) List(ctx context.Context, scope Scope) ([]Group, error) {
-	scopeWhere, scopeArgs := scope.Where("g.project_id", 1)
+	scopeWhere, scopeArgs := scope.WhereGroup("g.project_id", "g.id", 1)
 	rows, err := g.db.Query(ctx, `
 SELECT `+groupColumns+` FROM agent_groups g`+groupJoins+` WHERE `+scopeWhere+` ORDER BY g.name`, scopeArgs...)
 	if err != nil {

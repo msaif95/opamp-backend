@@ -116,6 +116,9 @@ var routeDocs = []routeDoc{
 	{"DELETE", "/groups/{id}", tagGroups, "Delete a group", operator, nil, ""},
 	{"PUT", "/groups/{id}/config", tagGroups, "Set the group's config: starts a push to its members and gives it to new members", operator, nil, `{"config_version_id": "<version id>", "batch_size": 50, "max_failure_pct": 10}`},
 	{"DELETE", "/groups/{id}/config", tagGroups, "Stop giving the group's config to new members", operator, nil, ""},
+	{"GET", "/groups/{id}/members", tagGroups, "List the group's direct members", operator, nil, ""},
+	{"PUT", "/groups/{id}/members", tagGroups, "Add someone to a group or change their role (requires project operator)", operator, nil, `{"subject": "ana@example.com", "role": "operator"}`},
+	{"DELETE", "/groups/{id}/members/{subject}", tagGroups, "Remove someone from a group", operator, nil, ""},
 
 	{"GET", "/rollouts", tagPushes, "List bulk pushes", viewer, nil, ""},
 	{"POST", "/rollouts", tagPushes, "Start a bulk push to a group, a selector or every collector in a project", operator, nil, `{"config_version_id": "<version id>", "project_id": "<project id>", "group_id": null, "selector": {"env": ["prod"]}, "all_agents": false, "batch_size": 50, "canary_steps_pct": null, "max_failure_pct": 10, "auto_rollback": false, "manual_approval": false}`},

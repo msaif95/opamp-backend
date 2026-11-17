@@ -161,10 +161,17 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		}
 		list = append(list, membership{p.ID, p.Name, role})
 	}
+	groups, err := s.Projects.GroupMemberships(r.Context(), u.Subject)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if groups == nil {
+		groups = []access.GroupMembership{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subject": u.Subject, "provider": u.Provider, "role": u.Role, "admin": scope.Admin, "projects": list,
-		// The console signs the user out itself after this long without input; its
-		// background refreshes would otherwise keep the session alive for ever.
+		"groups":               groups,
 		"session_idle_seconds": int(s.Sessions.IdleTimeout.Seconds()),
 	})
 }

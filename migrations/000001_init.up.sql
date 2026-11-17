@@ -165,6 +165,18 @@ CREATE TABLE agent_groups (
 CREATE UNIQUE INDEX agent_groups_project_name_key
     ON agent_groups (COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
 
+-- Per-group RBAC: a user may hold a role on a specific group without
+-- needing a project-wide role. Additive: supplements project roles.
+CREATE TABLE group_members (
+    group_id UUID NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+    subject  TEXT NOT NULL,
+    role     rbac_role NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, subject)
+);
+CREATE INDEX idx_group_members_subject ON group_members(subject);
+
 -- Rollouts -----------------------------------------------------------------
 CREATE TYPE rollout_status AS ENUM ('pending', 'running', 'paused', 'completed', 'failed', 'rolled_back', 'aborted');
 CREATE TYPE rollout_agent_status AS ENUM ('pending', 'offered', 'applying', 'applied', 'failed', 'skipped', 'rolled_back');

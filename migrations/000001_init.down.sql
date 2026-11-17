@@ -21,6 +21,7 @@ ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_credential_fk;
 DROP TABLE IF EXISTS credentials;
 DROP TABLE IF EXISTS rollout_agents;
 DROP TABLE IF EXISTS rollouts;
+DROP TABLE IF EXISTS group_members;
 DROP TABLE IF EXISTS agent_groups;
 ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_desired_config_fk;
 DROP TABLE IF EXISTS config_versions;

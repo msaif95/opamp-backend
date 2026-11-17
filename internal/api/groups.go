@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/msaif95/opamp-backend/internal/auth"
@@ -212,7 +213,8 @@ func (s *Server) clearGroupConfig(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// allowGroup loads a group and checks the caller may change it.
+// allowGroup loads a group and checks the caller may change it, either
+// through project-level or group-level operator access.
 func (s *Server) allowGroup(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*targeting.Group, bool) {
 	grp, err := s.Groups.Get(r.Context(), id)
 	if errors.Is(err, targeting.ErrGroupNotFound) {
@@ -223,5 +225,120 @@ func (s *Server) allowGroup(w http.ResponseWriter, r *http.Request, id uuid.UUID
 		s.internal(w, r, err)
 		return nil, false
 	}
-	return grp, s.allow(w, r, grp.ProjectID, auth.RoleOperator)
+	scope := scopeOf(r.Context())
+	if scope.CanGroup(id, grp.ProjectID, auth.RoleOperator) {
+		return grp, true
+	}
+	if scope.CanGroup(id, grp.ProjectID, auth.RoleViewer) {
+		writeError(w, http.StatusForbidden, "your role does not allow this")
+		return nil, false
+	}
+	writeError(w, http.StatusNotFound, "not found")
+	return nil, false
+}
+
+// viewGroup loads a group and checks the caller may at least view it.
+func (s *Server) viewGroup(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*targeting.Group, bool) {
+	grp, err := s.Groups.Get(r.Context(), id)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return nil, false
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return nil, false
+	}
+	scope := scopeOf(r.Context())
+	if scope.CanGroup(id, grp.ProjectID, auth.RoleViewer) {
+		return grp, true
+	}
+	writeError(w, http.StatusNotFound, "not found")
+	return nil, false
+}
+
+func (s *Server) listGroupMembers(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	if _, ok := s.viewGroup(w, r, id); !ok {
+		return
+	}
+	members, err := s.Projects.GroupMembers(r.Context(), id)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": nonNil(members)})
+}
+
+func (s *Server) setGroupMember(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		Subject string    `json:"subject"`
+		Role    auth.Role `json:"role"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	req.Subject = strings.TrimSpace(req.Subject)
+	switch {
+	case req.Subject == "" || strings.HasPrefix(req.Subject, "token:"):
+		writeError(w, http.StatusBadRequest, "subject must be a person's sign-in name")
+		return
+	case req.Role != auth.RoleViewer && req.Role != auth.RoleOperator:
+		writeError(w, http.StatusBadRequest, "role must be viewer or operator")
+		return
+	}
+	grp, err := s.Groups.Get(r.Context(), id)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if !s.allow(w, r, grp.ProjectID, auth.RoleOperator) {
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	if err := s.Projects.SetGroupMember(r.Context(), id, req.Subject, req.Role, u.Subject); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	s.audit(r.Context(), u.Subject, u.Provider, "group.member.set", "group", id.String(),
+		map[string]any{"subject": strings.ToLower(req.Subject), "role": req.Role})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	grp, err := s.Groups.Get(r.Context(), id)
+	if errors.Is(err, targeting.ErrGroupNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	if !s.allow(w, r, grp.ProjectID, auth.RoleOperator) {
+		return
+	}
+	subject := chi.URLParam(r, "subject")
+	if err := s.Projects.RemoveGroupMember(r.Context(), id, subject); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	u, _ := auth.UserFrom(r.Context())
+	s.audit(r.Context(), u.Subject, u.Provider, "group.member.remove", "group", id.String(),
+		map[string]any{"subject": strings.ToLower(subject)})
+	w.WriteHeader(http.StatusNoContent)
 }

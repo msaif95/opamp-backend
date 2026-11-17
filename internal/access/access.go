@@ -22,6 +22,12 @@ import (
 	"github.com/msaif95/opamp-backend/internal/auth"
 )
 
+// GroupAccess records a user's role on a specific group and which project owns it.
+type GroupAccess struct {
+	Role      auth.Role
+	ProjectID *uuid.UUID
+}
+
 // Scope is what one request may reach.
 type Scope struct {
 	// Admin may reach everything.
@@ -30,6 +36,8 @@ type Scope struct {
 	Global auth.Role
 	// Projects holds the user's role in each project they belong to.
 	Projects map[uuid.UUID]auth.Role
+	// Groups holds group-level roles that supplement project-level roles.
+	Groups map[uuid.UUID]GroupAccess
 }
 
 // Can reports whether the scope grants at least the needed role on a
@@ -44,6 +52,22 @@ func (s Scope) Can(project *uuid.UUID, need auth.Role) bool {
 	return s.Projects[*project].Allows(need)
 }
 
+// CanGroup reports whether the scope grants at least the needed role on
+// the given group, either through project-level access or a direct
+// group membership.
+func (s Scope) CanGroup(groupID uuid.UUID, projectID *uuid.UUID, need auth.Role) bool {
+	if s.Admin {
+		return true
+	}
+	if s.Can(projectID, need) {
+		return true
+	}
+	if ga, ok := s.Groups[groupID]; ok {
+		return ga.Role.Allows(need)
+	}
+	return false
+}
+
 // CanAnywhere reports whether the scope grants the role on anything at all.
 func (s Scope) CanAnywhere(need auth.Role) bool {
 	if s.Admin || s.Global.Allows(need) {
@@ -51,6 +75,11 @@ func (s Scope) CanAnywhere(need auth.Role) bool {
 	}
 	for _, role := range s.Projects {
 		if role.Allows(need) {
+			return true
+		}
+	}
+	for _, ga := range s.Groups {
+		if ga.Role.Allows(need) {
 			return true
 		}
 	}
@@ -67,11 +96,42 @@ func (s Scope) Where(column string, firstParam int) (string, []any) {
 	for id := range s.Projects {
 		ids = append(ids, id)
 	}
+	for _, ga := range s.Groups {
+		if ga.ProjectID != nil {
+			ids = append(ids, *ga.ProjectID)
+		}
+	}
 	cond := fmt.Sprintf("%s = ANY($%d)", column, firstParam)
 	if s.Global.Allows(auth.RoleViewer) {
 		cond = fmt.Sprintf("(%s IS NULL OR %s)", column, cond)
 	}
 	return cond, []any{ids}
+}
+
+// WhereGroup returns a SQL condition for group list queries, including
+// groups the caller has direct membership in. groupIDColumn is the
+// column holding the group's own ID.
+func (s Scope) WhereGroup(projectColumn, groupIDColumn string, firstParam int) (string, []any) {
+	if s.Admin {
+		return "TRUE", nil
+	}
+	projectIDs := make([]uuid.UUID, 0, len(s.Projects))
+	for id := range s.Projects {
+		projectIDs = append(projectIDs, id)
+	}
+	groupIDs := make([]uuid.UUID, 0, len(s.Groups))
+	for id := range s.Groups {
+		groupIDs = append(groupIDs, id)
+	}
+	cond := fmt.Sprintf("%s = ANY($%d)", projectColumn, firstParam)
+	if s.Global.Allows(auth.RoleViewer) {
+		cond = fmt.Sprintf("(%s IS NULL OR %s)", projectColumn, cond)
+	}
+	if len(groupIDs) > 0 {
+		cond = fmt.Sprintf("(%s OR %s = ANY($%d))", cond, groupIDColumn, firstParam+1)
+		return cond, []any{projectIDs, groupIDs}
+	}
+	return cond, []any{projectIDs}
 }
 
 // All is the scope of internal jobs and global admins.
@@ -137,13 +197,14 @@ func (p *Projects) Resolve(ctx context.Context, u auth.User) (Scope, error) {
 	if u.TokenProject != nil {
 		return Scope{Projects: map[uuid.UUID]auth.Role{*u.TokenProject: u.Role}}, nil
 	}
-	s := Scope{Global: u.Role, Projects: map[uuid.UUID]auth.Role{}}
+	s := Scope{Global: u.Role, Projects: map[uuid.UUID]auth.Role{}, Groups: map[uuid.UUID]GroupAccess{}}
 	if u.Provider == "token" {
 		return s, nil // a token is not a person and has no memberships
 	}
+	sub := normalize(u.Subject)
 	rows, err := p.db.Query(ctx, `
 SELECT m.project_id, m.role::text FROM project_members m JOIN projects p ON p.id = m.project_id
-WHERE m.subject = $1 AND p.deleted_at IS NULL`, normalize(u.Subject))
+WHERE m.subject = $1 AND p.deleted_at IS NULL`, sub)
 	if err != nil {
 		return Scope{}, err
 	}
@@ -158,7 +219,31 @@ WHERE m.subject = $1 AND p.deleted_at IS NULL`, normalize(u.Subject))
 		}
 		s.Projects[id] = role
 	}
-	return s, rows.Err()
+	if err := rows.Err(); err != nil {
+		return Scope{}, err
+	}
+	grows, err := p.db.Query(ctx, `
+SELECT gm.group_id, gm.role::text, g.project_id
+FROM group_members gm
+JOIN agent_groups g ON g.id = gm.group_id
+LEFT JOIN projects p ON p.id = g.project_id
+WHERE gm.subject = $1 AND (g.project_id IS NULL OR p.deleted_at IS NULL)`, sub)
+	if err != nil {
+		return Scope{}, err
+	}
+	defer grows.Close()
+	for grows.Next() {
+		var (
+			groupID   uuid.UUID
+			role      auth.Role
+			projectID *uuid.UUID
+		)
+		if err := grows.Scan(&groupID, &role, &projectID); err != nil {
+			return Scope{}, err
+		}
+		s.Groups[groupID] = GroupAccess{Role: role, ProjectID: projectID}
+	}
+	return s, grows.Err()
 }
 
 // IsMember reports whether the subject belongs to any project.
@@ -357,6 +442,62 @@ SELECT m.subject, p.id, p.name, m.role::text FROM project_members m JOIN project
 		}
 	}
 	return people, rows.Err()
+}
+
+// GroupMembers lists a group's members by name.
+func (p *Projects) GroupMembers(ctx context.Context, groupID uuid.UUID) ([]Member, error) {
+	rows, err := p.db.Query(ctx, `SELECT subject, role::text, added_by, added_at FROM group_members WHERE group_id = $1 ORDER BY subject`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Member, error) {
+		var m Member
+		err := row.Scan(&m.Subject, &m.Role, &m.AddedBy, &m.AddedAt)
+		return m, err
+	})
+}
+
+// SetGroupMember adds a person to a group or changes their role there.
+func (p *Projects) SetGroupMember(ctx context.Context, groupID uuid.UUID, subject string, role auth.Role, by string) error {
+	_, err := p.db.Exec(ctx, `
+INSERT INTO group_members (group_id, subject, role, added_by) VALUES ($1, $2, $3::rbac_role, $4)
+ON CONFLICT (group_id, subject) DO UPDATE SET role = EXCLUDED.role, added_by = EXCLUDED.added_by, added_at = now()`,
+		groupID, normalize(subject), string(role), by)
+	return err
+}
+
+// RemoveGroupMember takes a person out of a group.
+func (p *Projects) RemoveGroupMember(ctx context.Context, groupID uuid.UUID, subject string) error {
+	_, err := p.db.Exec(ctx, `DELETE FROM group_members WHERE group_id = $1 AND subject = $2`, groupID, normalize(subject))
+	return err
+}
+
+// GroupMemberships returns every group the subject has a direct role in,
+// for the /me endpoint.
+func (p *Projects) GroupMemberships(ctx context.Context, subject string) ([]GroupMembership, error) {
+	rows, err := p.db.Query(ctx, `
+SELECT g.id, g.name, g.project_id, gm.role::text
+FROM group_members gm
+JOIN agent_groups g ON g.id = gm.group_id
+LEFT JOIN projects p ON p.id = g.project_id
+WHERE gm.subject = $1 AND (g.project_id IS NULL OR p.deleted_at IS NULL)
+ORDER BY g.name`, normalize(subject))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (GroupMembership, error) {
+		var gm GroupMembership
+		err := row.Scan(&gm.ID, &gm.Name, &gm.ProjectID, &gm.Role)
+		return gm, err
+	})
+}
+
+// GroupMembership is a group a person belongs to with a direct role.
+type GroupMembership struct {
+	ID        uuid.UUID  `json:"id"`
+	Name      string     `json:"name"`
+	ProjectID *uuid.UUID `json:"project_id"`
+	Role      auth.Role  `json:"role"`
 }
 
 // RecordSignIn notes a sign-in so the person appears on the Users page.

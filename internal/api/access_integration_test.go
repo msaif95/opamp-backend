@@ -597,6 +597,48 @@ func TestProjectAccess(t *testing.T) {
 		t.Errorf("secret list = %s", raw)
 	}
 
+	// --- Per-group RBAC: a person with no project role but a direct group role can manage that group.
+	eve := h.session("eve@example.com", auth.RoleNone)
+	h.expect("eve cannot see A's agents (no project role)", first(h.call(eve, "GET", "/agents/"+a1, nil)), 404)
+	h.expect("eve cannot create a group (no project operator)", first(h.call(eve, "POST", "/groups", map[string]any{"name": "eve-g", "project_id": A, "selector": map[string][]string{"env": {"prod"}}})), 403)
+	grpID := grp["id"].(string)
+	// Admin adds eve as group-level operator.
+	h.expect("admin lists group members (empty)", first(h.call(admin, "GET", "/groups/"+grpID+"/members", nil)), 200)
+	h.expect("admin adds eve to the group", first(h.call(admin, "PUT", "/groups/"+grpID+"/members", map[string]any{"subject": "eve@example.com", "role": "operator"})), 204)
+	_, gMembers := h.call(admin, "GET", "/groups/"+grpID+"/members", nil)
+	if mems := gMembers["members"].([]any); len(mems) != 1 || mems[0].(map[string]any)["subject"] != "eve@example.com" {
+		t.Errorf("group members = %v, want [eve]", gMembers)
+	}
+	// Eve should now see the group in the list and be able to edit it.
+	_, eveGroups := h.call(eve, "GET", "/groups", nil)
+	if gl := eveGroups["groups"].([]any); len(gl) != 1 || gl[0].(map[string]any)["name"] != "prod" {
+		t.Errorf("eve sees groups %v, want [prod]", eveGroups)
+	}
+	h.expect("eve updates the group she has operator on", first(h.call(eve, "PUT", "/groups/"+grpID, map[string]any{"name": "prod", "description": "eve was here", "selector": map[string][]string{"env": {"prod"}}})), 200)
+	h.expect("eve sets group config", first(h.call(eve, "PUT", "/groups/"+grpID+"/config", map[string]any{"config_version_id": vA})), 200)
+	h.expect("eve clears group config", first(h.call(eve, "DELETE", "/groups/"+grpID+"/config", nil)), 204)
+	// Eve cannot manage group members (requires project-level operator).
+	h.expect("eve cannot add members to her group", first(h.call(eve, "PUT", "/groups/"+grpID+"/members", map[string]any{"subject": "carol@example.com", "role": "viewer"})), 404)
+	// Eve can view agents filtered by her group.
+	_, eveAgents := h.call(eve, "GET", "/agents?group_id="+grpID, nil)
+	if got := names(eveAgents, "agents", "host"); !equal(got, []string{"a1"}) {
+		t.Errorf("eve sees agents %v via group, want [a1]", got)
+	}
+	// Eve's /me response should include group memberships.
+	_, eveMe := h.call(eve, "GET", "/auth/me", nil)
+	if gs, ok := eveMe["groups"].([]any); !ok || len(gs) != 1 || gs[0].(map[string]any)["role"] != "operator" {
+		t.Errorf("eve /me groups = %v, want 1 group with operator", eveMe["groups"])
+	}
+	// Add a viewer-only group member and verify they cannot edit.
+	frank := h.session("frank@example.com", auth.RoleNone)
+	h.expect("admin adds frank as viewer", first(h.call(admin, "PUT", "/groups/"+grpID+"/members", map[string]any{"subject": "frank@example.com", "role": "viewer"})), 204)
+	h.expect("frank can list groups", first(h.call(frank, "GET", "/groups", nil)), 200)
+	h.expect("frank cannot update the group (viewer)", first(h.call(frank, "PUT", "/groups/"+grpID, map[string]any{"name": "prod", "description": "frank", "selector": map[string][]string{"env": {"prod"}}})), 403)
+	h.expect("frank can list group members", first(h.call(frank, "GET", "/groups/"+grpID+"/members", nil)), 200)
+	// Admin removes eve, she loses access immediately.
+	h.expect("admin removes eve from the group", first(h.call(admin, "DELETE", "/groups/"+grpID+"/members/eve@example.com", nil)), 204)
+	h.expect("eve can no longer edit the group", first(h.call(eve, "PUT", "/groups/"+grpID, map[string]any{"name": "prod", "description": "gone", "selector": map[string][]string{"env": {"prod"}}})), 404)
+
 	// --- Signing out ends the session on the server; an admin can end someone else's.
 	dave := h.session("dave@example.com", auth.RoleViewer)
 	h.expect("dave before sign-out", first(h.call(dave, "GET", "/auth/me", nil)), 200)
