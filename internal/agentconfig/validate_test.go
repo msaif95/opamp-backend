@@ -63,7 +63,7 @@ func TestValidate(t *testing.T) {
 		"unknown section":    {body: validConfig + "\nrecievers: {}\n", wantWarn: `unknown top-level section "recievers"`},
 		"no service section": {body: "receivers:\n  otlp:\n", wantWarn: "no service section"},
 	} {
-		issues := Validate(tc.body)
+		issues := Validate(tc.body, nil)
 		if got := find(issues, SeverityError, tc.wantError); !got {
 			t.Errorf("%s: want error containing %q, got %+v", name, tc.wantError, issues)
 		}

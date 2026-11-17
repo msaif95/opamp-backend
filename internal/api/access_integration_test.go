@@ -110,7 +110,7 @@ func TestProjectAccess(t *testing.T) {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := registry.New(db, rdb, "replica-a", time.Minute)
-	configs := agentconfig.NewService(db)
+	configs := agentconfig.NewService(db, nil)
 	agents := auth.NewAgentAuthenticator(db)
 	projects := access.NewProjects(db)
 	tokens := auth.NewTokens(db)

@@ -38,8 +38,8 @@ var knownTopLevel = map[string]bool{
 // Validate lints a collector config. It checks YAML syntax and the
 // structural rules the collector itself enforces at startup: every
 // component referenced by a pipeline or service.extensions must be defined.
-// It does not validate component-specific settings.
-func Validate(body string) []Issue {
+// When policy is non-nil it also enforces the component allowlist.
+func Validate(body string, policy *ComponentPolicy) []Issue {
 	if strings.TrimSpace(body) == "" {
 		return []Issue{{Severity: SeverityError, Message: "config is empty"}}
 	}
@@ -62,6 +62,11 @@ func Validate(body string) []Issue {
 		} else if _, ok := root[k].(map[string]any); !ok && root[k] != nil {
 			add(SeverityError, k, "%q must be a mapping", k)
 		}
+	}
+
+	issues = append(issues, policy.Check(root)...)
+	if HasErrors(issues) {
+		return issues
 	}
 
 	service, _ := root["service"].(map[string]any)

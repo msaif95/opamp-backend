@@ -45,13 +45,13 @@ WHERE v.template_id = $1 ORDER BY v.version DESC LIMIT 1`, templateID).Scan(&b.i
 }
 
 // build merges overrides over a base version and validates the result.
-func build(b *baseVersion, overrides string) (string, []Issue) {
+func build(b *baseVersion, overrides string, policy *ComponentPolicy) (string, []Issue) {
 	body, err := Merge(b.body, overrides)
 	if err != nil {
 		return "", []Issue{{Severity: SeverityError, Path: "overrides", Message: err.Error()}}
 	}
 	body = withHeader(b.name, body)
-	return body, Validate(body)
+	return body, Validate(body, policy)
 }
 
 // PreviewDerived returns what a config derived from the base's latest
@@ -61,7 +61,7 @@ func (s *Service) PreviewDerived(ctx context.Context, baseID uuid.UUID, override
 	if err != nil {
 		return "", 0, nil, err
 	}
-	body, issues = build(b, overrides)
+	body, issues = build(b, overrides, s.Policy)
 	return body, b.version, issues, nil
 }
 
@@ -93,7 +93,7 @@ func (s *Service) CreateDerived(ctx context.Context, project *uuid.UUID, name, d
 	if err != nil {
 		return nil, nil, err
 	}
-	body, issues := build(b, overrides)
+	body, issues := build(b, overrides, s.Policy)
 	if HasErrors(issues) {
 		return nil, nil, &InvalidError{Issues: issues}
 	}
@@ -169,7 +169,7 @@ SELECT version, body_hash, COALESCE(overrides, '') FROM config_versions WHERE te
 	if err != nil {
 		return nil, err
 	}
-	body, issues := build(b, *overrides)
+	body, issues := build(b, *overrides, s.Policy)
 	if HasErrors(issues) {
 		return nil, &InvalidError{Issues: issues}
 	}
@@ -220,7 +220,7 @@ WHERE t.base_template_id = $1 ORDER BY t.name`, baseID)
 	for i, c := range children {
 		// Up to date means rebuilding would give the body it already has; a
 		// base change that does not touch what this config keeps counts as up to date.
-		if body, issues := build(b, c.overrides); !HasErrors(issues) {
+		if body, issues := build(b, c.overrides, s.Policy); !HasErrors(issues) {
 			sum := sha256.Sum256([]byte(body))
 			c.UpToDate = bytes.Equal(sum[:], c.hash)
 		}

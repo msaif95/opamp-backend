@@ -183,7 +183,7 @@ func run() error {
 
 	reg := registry.New(db, rdb, cfg.ReplicaID, cfg.AgentOfflineAfter)
 	agentAuth := auth.NewAgentAuthenticator(db)
-	configs := agentconfig.NewService(db)
+	configs := agentconfig.NewService(db, buildComponentPolicy(cfg))
 	tput := throughput.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
 	handler := protocol.NewHandler(reg, configs, log)
 	collectorLogs := ownlogs.New(rdb, cfg.JWTSigningKey, cfg.AgentEndpointURL)
@@ -555,4 +555,25 @@ func run() error {
 	_ = reg.WithdrawReplica(shutdownCtx)
 	// Agents first, so they move to other replicas while this one drains its API requests.
 	return errors.Join(conns.Stop(shutdownCtx), apiSrv.Shutdown(shutdownCtx))
+}
+
+func buildComponentPolicy(cfg *config.Config) *agentconfig.ComponentPolicy {
+	receivers, processors, exporters := pipeline.CatalogComponents()
+	mergeSet(receivers, cfg.AllowedReceivers)
+	mergeSet(processors, cfg.AllowedProcessors)
+	mergeSet(exporters, cfg.AllowedExporters)
+	return &agentconfig.ComponentPolicy{
+		Receivers:  receivers,
+		Processors: processors,
+		Exporters:  exporters,
+		Extensions: mergeSet(map[string]bool{}, cfg.AllowedExtensions),
+		Blocked:    map[string]bool{"exec": true, "script": true},
+	}
+}
+
+func mergeSet(base map[string]bool, extra []string) map[string]bool {
+	for _, name := range extra {
+		base[name] = true
+	}
+	return base
 }

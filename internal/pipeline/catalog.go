@@ -58,6 +58,26 @@ var allSignals = []string{"logs", "metrics", "traces"}
 // before adding one.
 func Catalog() []Type { return catalog }
 
+// CatalogComponents returns the OTel Collector component names the builder
+// uses, grouped by section. These form the default allowlist for raw YAML
+// config validation.
+func CatalogComponents() (receivers, processors, exporters map[string]bool) {
+	receivers = make(map[string]bool)
+	processors = make(map[string]bool)
+	exporters = make(map[string]bool)
+	for _, t := range catalog {
+		switch t.Kind {
+		case KindSource:
+			receivers[t.component] = true
+		case KindProcessor:
+			processors[t.component] = true
+		case KindDestination:
+			exporters[t.component] = true
+		}
+	}
+	return
+}
+
 var catalog = []Type{
 	// Sources -----------------------------------------------------------
 	{

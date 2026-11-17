@@ -80,7 +80,7 @@ service:
 	if got != want {
 		t.Errorf("merged:\n%s\nwant:\n%s", got, want)
 	}
-	if issues := Validate(got); HasErrors(issues) {
+	if issues := Validate(got, nil); HasErrors(issues) {
 		t.Errorf("merged config does not validate: %v", issues)
 	}
 }

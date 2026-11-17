@@ -35,7 +35,7 @@ func (s *Server) validateConfig(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"issues": nonNil(agentconfig.Validate(req.Body))})
+	writeJSON(w, http.StatusOK, map[string]any{"issues": nonNil(agentconfig.Validate(req.Body, s.Configs.Policy))})
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {

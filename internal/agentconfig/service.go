@@ -111,21 +111,22 @@ type Version struct {
 
 // Service is the config management service.
 type Service struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	Policy *ComponentPolicy
 
 	mu    sync.Mutex
 	cache map[uuid.UUID]*Version
 }
 
 // NewService creates a Service.
-func NewService(db *pgxpool.Pool) *Service {
-	return &Service{db: db, cache: make(map[uuid.UUID]*Version)}
+func NewService(db *pgxpool.Pool, policy *ComponentPolicy) *Service {
+	return &Service{db: db, Policy: policy, cache: make(map[uuid.UUID]*Version)}
 }
 
 // Create creates a UI-authored template with its first version.
 // builderSpec is the builder pipeline the body was rendered from, or nil for hand-written YAML.
 func (s *Service) Create(ctx context.Context, project *uuid.UUID, name, description, body, author string, builderSpec json.RawMessage) (*Template, *Version, error) {
-	if issues := Validate(body); HasErrors(issues) {
+	if issues := Validate(body, s.Policy); HasErrors(issues) {
 		return nil, nil, &InvalidError{Issues: issues}
 	}
 	tx, err := s.db.Begin(ctx)
@@ -154,7 +155,7 @@ RETURNING id, created_at, updated_at`, name, description, project).Scan(&t.ID, &
 
 // AddVersion appends a new version to a UI-authored template.
 func (s *Service) AddVersion(ctx context.Context, templateID uuid.UUID, body, description, author string, builderSpec json.RawMessage) (*Version, error) {
-	if issues := Validate(body); HasErrors(issues) {
+	if issues := Validate(body, s.Policy); HasErrors(issues) {
 		return nil, &InvalidError{Issues: issues}
 	}
 	tx, err := s.db.Begin(ctx)

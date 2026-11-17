@@ -67,7 +67,7 @@ func newEnv(t *testing.T) *env {
 	e.svc = NewService(db, e.push, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	e.svc.OnOutcome = func(_ context.Context, outcome string, _ *Rollout) { e.outcomes = append(e.outcomes, outcome) }
 
-	configs := agentconfig.NewService(db)
+	configs := agentconfig.NewService(db, nil)
 	tmpl, v1, err := configs.Create(ctx, nil, "cfg", "", bodyV1, "tester", nil)
 	if err != nil {
 		t.Fatal(err)

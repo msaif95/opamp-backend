@@ -16,7 +16,7 @@ const body = "receivers:\n  otlp:\nexporters:\n  debug:\nservice:\n  pipelines:\
 
 func TestConfigVersioning(t *testing.T) {
 	db, _ := testdb.Open(t)
-	s := agentconfig.NewService(db)
+	s := agentconfig.NewService(db, nil)
 	ctx := context.Background()
 
 	tmpl, v1, err := s.Create(ctx, nil, "prod", "", body, "alice", nil)
@@ -57,7 +57,7 @@ func TestConfigVersioning(t *testing.T) {
 
 func TestDeleteRefusedWhileAssigned(t *testing.T) {
 	db, _ := testdb.Open(t)
-	s := agentconfig.NewService(db)
+	s := agentconfig.NewService(db, nil)
 	ctx := context.Background()
 	tmpl, v1, err := s.Create(ctx, nil, "prod", "", body, "alice", nil)
 	if err != nil {
@@ -83,7 +83,7 @@ func TestDeleteRefusedWhileAssigned(t *testing.T) {
 
 func TestBuilderSpecIsStoredWithTheVersion(t *testing.T) {
 	db, _ := testdb.Open(t)
-	s := agentconfig.NewService(db)
+	s := agentconfig.NewService(db, nil)
 	ctx := context.Background()
 	spec := []byte(`{"sources": [{"type": "otlp"}]}`)
 	tmpl, v1, err := s.Create(ctx, nil, "built", "", body, "alice", spec)
@@ -114,7 +114,7 @@ const baseBody = "receivers:\n  otlp:\nprocessors:\n  batch:\n    timeout: 5s\ne
 
 func TestDerivedConfigs(t *testing.T) {
 	db, _ := testdb.Open(t)
-	s := agentconfig.NewService(db)
+	s := agentconfig.NewService(db, nil)
 	ctx := context.Background()
 	var project uuid.UUID
 	if err := db.QueryRow(ctx, `INSERT INTO projects (name, created_by) VALUES ('A', 'root') RETURNING id`).Scan(&project); err != nil {

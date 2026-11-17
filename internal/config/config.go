@@ -117,6 +117,14 @@ type Config struct {
 	// Writes is the budget for requests that change something.
 	APIRateLimit, APIRateLimitWrites int
 
+	// AllowedReceivers extends the default component allowlist (the builder
+	// catalog) with additional OTel Collector receiver types that raw YAML
+	// configs may use. Empty means catalog defaults only.
+	AllowedReceivers  []string
+	AllowedProcessors []string
+	AllowedExporters  []string
+	AllowedExtensions []string
+
 	MigrationsDir string
 	// CLIDir holds the opampctl binaries the console offers for download.
 	CLIDir   string
@@ -159,6 +167,10 @@ func Load() (*Config, error) {
 		TrustProxyHeaders:      env("TRUST_PROXY_HEADERS", "false") == "true",
 		DevMode:                env("DEV_MODE", "false") == "true",
 		AgentTLSUpstream:       env("AGENT_TLS_TERMINATED_UPSTREAM", "false") == "true",
+		AllowedReceivers:       list(env("CONFIG_ALLOWED_RECEIVERS", "")),
+		AllowedProcessors:      list(env("CONFIG_ALLOWED_PROCESSORS", "")),
+		AllowedExporters:       list(env("CONFIG_ALLOWED_EXPORTERS", "")),
+		AllowedExtensions:      list(env("CONFIG_ALLOWED_EXTENSIONS", "")),
 		MigrationsDir:          env("MIGRATIONS_DIR", "migrations"),
 		CLIDir:                 env("OPAMPCTL_DIR", "bin/dist"),
 		LogLevel:               env("LOG_LEVEL", "info"),
